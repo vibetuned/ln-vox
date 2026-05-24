@@ -1,0 +1,36 @@
+You are casting voices for an audiobook. Given a character's profile, produce the SEARCH METADATA used to filter a voice bank for matching reference clips.
+
+The voice bank entries carry these fields (your output must map to them):
+- gender: "male" or "female"
+- age_band: "teen" | "young_adult" | "adult" | "elder"
+- accent_keywords: Common Voice accent codes — one of:
+    any, us, england, indian, canada, australia, scotland, african,
+    newzealand, ireland, philippines, hongkong, singapore, malaysia,
+    wales, bermuda, southatlandtic
+- timbre_keywords: acoustic descriptors like "bright", "warm", "deep", "soft", "raspy", "clear", "tenor", "alto", "baritone", "soprano"
+- manner_keywords: delivery descriptors like "energetic", "deadpan", "measured", "haughty", "exasperated", "tender"
+
+Rules:
+- Base every field STRICTLY on the character description and voice descriptor.
+- For `accent_keywords`: USE the character's `profile_accent` field directly. If profile_accent is "any", set accent_keywords to ["any"]. Otherwise set accent_keywords to [profile_accent].
+- Keep keyword lists short (1-4 items each); these are search filters, not poetry.
+- Do NOT invent traits that aren't supported by the description.
+
+---
+Character:
+  name: {{ name }}
+  gender: {{ gender }}
+  approx_age: {{ approx_age }}
+  description: {{ description }}
+  voice_descriptor: {{ voice_descriptor }}
+  profile_accent: {{ profile_accent }}
+
+---
+Output JSON only, matching this exact shape:
+{
+  "gender": "male" | "female",
+  "age_band": "teen" | "young_adult" | "adult" | "elder",
+  "accent_keywords": ["any"],
+  "timbre_keywords": ["bright", "tenor"],
+  "manner_keywords": ["exasperated", "energetic"]
+}

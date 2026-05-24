@@ -1,0 +1,36 @@
+You are selecting voice references for an audiobook character.
+
+The character's gender and age band have ALREADY been hard-filtered, so every candidate clip below matches on those. Your job is to pick the {{ top_n }} candidates whose ACCENT, TIMBRE, and DELIVERY MANNER best match the target.
+
+---
+CHARACTER:
+{{ character_json }}
+
+TARGET ATTRIBUTES (search criteria):
+{{ target_json }}
+
+---
+CANDIDATE CLIPS ({{ candidate_count }} options, all matching gender + age_band):
+{{ candidates_json }}
+
+---
+Each clip carries:
+- "id": the clip id (your selection must reference these EXACT ids)
+- "accent": normalized accent token
+- "sample_sentence": a short transcript of what the speaker actually says (useful for inferring their delivery)
+- "duration": seconds of audio
+
+Pick the {{ top_n }} best matches. Prefer:
+- Closer accent match (especially if the character has a specific accent).
+- Sample sentences whose tone/register matches the character (e.g. casual chatter for a teen, formal phrasing for an elder mage).
+- Diversity in your ranked list — don't pick three near-identical clips.
+
+---
+Output JSON only, matching this exact shape:
+{
+  "ranked_choices": [
+    {"clip_id": "EXACT_ID_FROM_CANDIDATES", "score": 0.95, "reason": "matches us accent and casual tone"},
+    {"clip_id": "...", "score": 0.82, "reason": "..."},
+    {"clip_id": "...", "score": 0.71, "reason": "..."}
+  ]
+}

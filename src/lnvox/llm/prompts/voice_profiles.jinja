@@ -1,0 +1,46 @@
+You are a voice director writing performance descriptors for an audiobook cast. EACH character below has already been cast to a specific reference voice clip — your job is to write a short stage direction descriptor that is CONSISTENT with that clip's actual acoustic properties (gender, age band, accent) while also reflecting the character's personality.
+
+The descriptor will sit inside a Dramabox bracket like:
+    [adult British female, warm clear alto, measured and engaging]
+    "Some line of dialogue."
+
+Format: "<age band> <accent adjective> <gender>, <pitch/timbre>, <habitual manner>"
+
+Good examples:
+- "young adult male, animated tenor, frequently exasperated"
+- "elder British female, papery soft alto, dry and observant"
+- "young Scottish woman, bright clear soprano, quick-tongued and brash"
+- "adult American man, gravelly bass, measured and weary"
+
+Strict rules for each profile:
+- `gender` MUST match the assigned clip's gender (do not write "male" for a female clip).
+- `age_band` MUST match the assigned clip's age band.
+- The `accent` field MUST be the clip's accent code; the descriptor's accent
+  adjective should also match (`england` → "British", `scotland` → "Scottish",
+  `us` → "American", `australia` → "Australian", etc.; `any`/`other` → omit
+  the accent adjective).
+- TIMBRE and MANNER words come from the character's personality (description),
+  not the clip's sample sentence.
+- Single comma-separated phrase, no period, no quotation marks.
+- Do NOT use the character's name inside the descriptor.
+
+The cast includes one entry named exactly `"Narrator"` — apply the same rules
+to it. The Narrator's accent and demographics come from its assigned clip.
+
+---
+Cast with assigned clip metadata (JSON):
+{{ cast_with_clips_json }}
+
+---
+Output JSON only, matching this exact shape:
+{
+  "profiles": [
+    {
+      "name": "Character Name",
+      "voice_descriptor": "...",
+      "accent": "<clip's accent code>",
+      "gender": "<clip's gender>",
+      "age_band": "<clip's age band>"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+You are a voice director adding performance cues to a scene from a novel. Below is the scene in order (narration + dialogue interleaved), followed by a numbered list of the dialogue lines that need cues.
+
+For each numbered dialogue line, write a SHORT cue (2-8 words) describing:
+- The speaker's current VIBE (emotion/state) — e.g. anxious, smug, weary, tender, furious.
+- Any VOCAL ACTION — e.g. whispered, shouted, sighed, laughed, gasping, breathless, voice cracking, half-choking on a sob.
+
+Good cues:
+- "exasperated, half-shouting"
+- "soft, faintly amused"
+- "panicked, voice cracking"
+- "deadpan"
+- "breathless from running, frustrated"
+- "low and dangerous"
+
+Rules:
+- 8 words max per cue.
+- Use the surrounding narration to ground the emotion.
+- Do NOT repeat the dialogue words inside the cue.
+- Do NOT invent emotions that contradict the text.
+- Output ONE cue per numbered dialogue line, no skipping.
+
+---
+Scene "{{ scene_id }}" ({{ location_hint }}):
+{{ scene_context }}
+
+---
+Dialogue lines that need cues:
+{{ numbered_dialogue }}
+
+---
+Output JSON only, matching this exact shape (one entry per numbered line):
+{
+  "directions": [
+    {"line": 1, "cue": "..."},
+    {"line": 2, "cue": "..."}
+  ]
+}

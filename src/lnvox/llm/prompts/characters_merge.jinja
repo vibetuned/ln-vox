@@ -1,0 +1,31 @@
+You are consolidating per-chapter character lists into a single unified CAST for an entire book.
+
+Multiple chapters have been analyzed separately. The same character may appear under different names or with different descriptions across chapters. Merge them into one entry per real person.
+
+{% if prior_volume_casts %}
+**IMPORTANT — this is volume {{ current_volume }} of a series.** The cast list(s) from the PRIOR volume(s) are appended below as additional inputs. Treat them as MORE authoritative than the per-chapter lists for established traits:
+
+- A character who appears in BOTH prior and current must keep their established affiliation, origin, voice traits, and personality from the prior volume(s). Add NEW information from the current volume; do NOT contradict prior facts.
+- Use the SAME canonical `name` and `gender` / `approx_age` that the prior volume established (don't rename Index → "Index Librorum" if vol 1 used "Index").
+- Aliases accumulate across volumes (union, deduplicated).
+- A character who appears only in the prior volume(s) and NOT in this volume should NOT be in the output (no point voice-casting them for a book they're absent from).
+{% endif %}
+
+Rules:
+- Match characters across inputs by context, role, and aliases — not just by literal name.
+- The merged `name` is the MOST-USED canonical form. Use Title Case (e.g. "Frog-faced Doctor", not "doctor"). Move other forms into `aliases` (deduplicated).
+- The merged `description` MUST combine the strongest evidence across ALL inputs into 2-4 sentences. *Critically*, preserve any AFFILIATION (church, faction, organization, school, kingdom) and ORIGIN (nationality, birthplace, cultural heritage) cues from ANY chapter or prior volume — these are needed for downstream voice-casting and are easy to lose during summarization. Do not invent traits.
+- Keep the strongest 2-3 pieces of evidence overall (prefer the most distinctive quotes, and quotes that justify affiliation/origin if such claims appear).
+- Drop characters who appear in only ONE chapter AND have no spoken dialogue AND perform no significant action.
+
+Return JSON only.
+
+---
+Per-chapter character lists for the CURRENT volume (JSON array):
+{{ chapter_lists_json }}
+
+{% if prior_volume_casts %}
+---
+PRIOR-VOLUME cast lists (JSON array, oldest → newest):
+{{ prior_volume_casts }}
+{% endif %}

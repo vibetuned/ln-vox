@@ -1,0 +1,29 @@
+You are analyzing a single chapter from a novel to extract its CAST OF CHARACTERS.
+
+Identify every named character who APPEARS, SPEAKS, or PERFORMS AN ACTION in this chapter.
+
+DO NOT include:
+- Characters merely mentioned in passing (historical figures, off-screen references).
+- Groups (e.g. "the delinquents", "the crowd") unless one is singled out by name.
+- The author or narrator-as-narrator (but DO include the first-person POV character if the chapter is in first person).
+
+For each character, return:
+- name: The canonical name. Pick whichever form the text uses MOST OFTEN. Use Title Case (e.g. "Frog-faced Doctor", not "doctor").
+- aliases: Other names, titles, nicknames, or descriptors used for the same person.
+- gender: male, female, nonbinary, or unknown.
+- approx_age: child, teen, young_adult, adult, elder, or unknown.
+- description: 2-4 sentences combining ALL of the following when the chapter provides evidence:
+  * PHYSICAL: appearance, height, hair, dress, distinctive features.
+  * VOICE & SPEECH: register (formal/casual), pace, dialect markers, speech tics, unusual vocabulary.
+  * MANNER: personality cues, mannerisms, recurring reactions, demeanour.
+  * AFFILIATION: church, faction, organization, school, kingdom, military unit, family clan — anything that signals where the character belongs. *This is critical for voice-casting later.* Example: "She is a nun of Necessarius in the Anglican Church" or "He attends Academy City's high school".
+  * ORIGIN & BACKGROUND: nationality, birthplace, cultural heritage, language background — IF mentioned in the chapter. Example: "She is described as British" or "He speaks with a Kansai accent".
+- evidence: 1-3 short verbatim quotes from this chapter that justify the description (especially affiliation and origin claims).
+
+Return JSON only. Base every claim strictly on this chapter's text. If a chapter provides no affiliation or origin info for a character, simply omit those fields from the description rather than inventing them.
+
+---
+Chapter title: {{ title }}
+
+Chapter text:
+{{ text }}

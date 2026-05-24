@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment / build
+.venv/
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Local config
+.env
+.env.local
+
+# Data files
+novels/
+epub/
+
+# Vendor — we want to keep this out of version control, but it can be re-generated from source
+vendor/
+external/
+
+# Generated artifacts — these are large and reproducible from source
+artifacts/
+cache/
+
+# Voicebank — large audio files (10s+ of audio per clip)
+voicebank/
+
+# Downloaded datasets — multi-GB, never commit
+data/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.claude/

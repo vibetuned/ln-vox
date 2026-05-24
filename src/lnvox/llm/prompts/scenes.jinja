@@ -1,0 +1,57 @@
+You are splitting a novel chapter into SCENES and tagging each line.
+
+A SCENE is a continuous span of text in one place at one time. A new scene begins on a clear shift of location, time, or section break.
+
+A BEAT is one contiguous block within a scene. There are exactly two beat types:
+
+1. "narration"  — Prose narration. `text` is the source text verbatim, with newlines collapsed to single spaces. Internal thoughts go here, not in dialogue.
+
+2. "dialogue"   — A character's spoken line.
+   - `text` is the SPOKEN WORDS ONLY. Strip the surrounding quote marks. DROP attribution tags ("said X", "X replied", "she shouted") — those belong in the previous or next narration beat, not in `text`.
+   - `speaker` is the character's canonical name from the cast (see below).
+
+Hard rules:
+- Beats MUST appear in the same order as in the source text. Do not reorder.
+- Do NOT invent or paraphrase content; preserve the author's words.
+- For dialogue, always use the EXACT `name` field from the cast for `speaker`. Never use an alias.
+- If a line of dialogue cannot be attributed from context, set `speaker` to "Unknown".
+- Stage directions / scene labels you might add yourself do NOT belong here — that is a later stage's job.
+
+Cast (use these exact `name` values for `speaker`):
+{{ cast_json }}
+
+---
+OUTPUT FORMAT — your response MUST match this exact JSON shape and these exact field names:
+
+{
+  "chapter_id": "{{ chapter_id }}",
+  "scenes": [
+    {
+      "scene_id": "{{ chapter_id }}_s1",
+      "location_hint": "short phrase describing where/when this scene takes place",
+      "beats": [
+        {"type": "narration", "text": "Prose verbatim from the chapter, newlines collapsed."},
+        {"type": "dialogue", "speaker": "Character Name From Cast", "text": "Spoken words only, no quote marks, no said-X tags."},
+        {"type": "narration", "text": "More prose."}
+      ]
+    },
+    {
+      "scene_id": "{{ chapter_id }}_s2",
+      "location_hint": "...",
+      "beats": []
+    }
+  ]
+}
+
+Field-name rules:
+- Top-level keys MUST be exactly: "chapter_id", "scenes".
+- Each scene MUST have keys: "scene_id", "location_hint", "beats". `scene_id` MUST follow the pattern `{{ chapter_id }}_s<N>` where N starts at 1 and increments.
+- Each beat MUST have keys: "type" (one of "narration" or "dialogue"), "text". Dialogue beats additionally MUST have a "speaker" key with a name from the cast (or "Unknown" if unattributable).
+- Do NOT add extra keys (no "scene_number", no "id", no "act", no "line_number").
+
+---
+Chapter id: {{ chapter_id }}
+Chapter title: {{ title }}
+
+Chapter text:
+{{ text }}
