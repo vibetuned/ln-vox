@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 Gender = Literal["male", "female", "nonbinary", "unknown"]
@@ -33,7 +33,13 @@ class Character(BaseModel):
 
 
 class CharacterList(BaseModel):
-    characters: list[Character]
+    # Gemma occasionally wraps the list under `cast_of_characters` or `cast`
+    # instead of `characters` — `guided_json` doesn't always enforce field
+    # names strictly enough on larger models. Accept all three.
+    model_config = ConfigDict(populate_by_name=True)
+    characters: list[Character] = Field(
+        validation_alias=AliasChoices("characters", "cast_of_characters", "cast"),
+    )
 
 
 BeatType = Literal["narration", "dialogue"]

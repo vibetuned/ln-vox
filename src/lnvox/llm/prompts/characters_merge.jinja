@@ -20,6 +20,21 @@ Rules:
 
 Return JSON only.
 
+OUTPUT FORMAT — top-level key MUST be exactly `"characters"` (NOT `"cast_of_characters"`, `"cast"`, `"merged_cast"`, etc.). Same per-character shape as the per-chapter inputs:
+
+{
+  "characters": [
+    {
+      "name": "...",
+      "aliases": [...],
+      "gender": "male|female|nonbinary|unknown",
+      "approx_age": "child|teen|young_adult|adult|elder|unknown",
+      "description": "...",
+      "evidence": ["..."]
+    }
+  ]
+}
+
 ---
 Per-chapter character lists for the CURRENT volume (JSON array):
 {{ chapter_lists_json }}

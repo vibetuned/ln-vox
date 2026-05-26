@@ -24,11 +24,7 @@
 # waits for it to be ready, runs the LLM-phase stages, then stops it
 # (freeing GPU memory for Dramabox). Pass --vllm-url to skip this if you
 # already have a vLLM server elsewhere (or running externally on a second
-# GPU).
-#
-# Set LNVOX_NO_PROMPT=1 to suppress the interactive press-enter prompts
-# (useful for non-interactive / overnight runs). With auto-managed vLLM
-# the only prompt left is the GPU-idle confirmation before Dramabox.
+# GPU). The full pipeline is non-interactive; safe for overnight runs.
 
 set -uo pipefail
 
@@ -48,7 +44,7 @@ VLLM_PID=""
 VLLM_LOG=""
 
 usage() {
-    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -98,16 +94,6 @@ fi
 if [ -n "$MAX_MODEL_LEN" ]; then
     export LNVOX_LLM_MAX_LEN="$MAX_MODEL_LEN"
 fi
-
-prompt() {
-    [ "${LNVOX_NO_PROMPT:-0}" = "1" ] && return 0
-    echo ""
-    echo "============================================================"
-    echo ">>> $1"
-    echo "    Press ENTER when ready, or Ctrl-C to abort."
-    echo "============================================================"
-    read -r
-}
 
 banner() {
     echo ""

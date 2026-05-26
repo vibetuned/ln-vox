@@ -104,8 +104,6 @@ The launcher manages vLLM and Dramabox transparently:
 3. **Stops vLLM** to free the GPU.
 4. Runs s4 (Dramabox, with auto-retry) → s5 (mix to .m4b).
 
-Set `LNVOX_NO_PROMPT=1` for fully non-interactive runs.
-
 If you already have a vLLM serving (e.g. on a separate GPU), pass
 `--vllm-url http://host:8000/v1` to skip auto-start..gitignore
 often OOMs.** The 31B path is best for:

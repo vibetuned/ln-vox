@@ -23,6 +23,24 @@ For each character, return:
 Return JSON only. Base every claim strictly on this chapter's text. If a chapter provides no affiliation or origin info for a character, simply omit those fields from the description rather than inventing them.
 
 ---
+OUTPUT FORMAT — your response MUST match this exact JSON shape and these exact top-level field names:
+
+{
+  "characters": [
+    {
+      "name": "Lord Vex",
+      "aliases": ["the duke", "Vex"],
+      "gender": "male",
+      "approx_age": "elder",
+      "description": "Tall foreign-looking magician affiliated with the Anglican Church. Speaks formally with a slow measured cadence; carries himself with detached authority.",
+      "evidence": ["\"You're late,\" he said, his voice colder than the room."]
+    }
+  ]
+}
+
+Top-level key MUST be exactly `"characters"` (NOT `"cast_of_characters"`, `"cast"`, `"people"`, or anything else).
+
+---
 Chapter title: {{ title }}
 
 Chapter text:
