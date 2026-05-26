@@ -15,7 +15,7 @@ from lnvox.llm.schemas import (
     VoiceProfileList,
 )
 from lnvox.series import find_prior_volumes, latest_prior_volume
-from lnvox.stages import s1_characters, s2_scenes, s3_director, s4_tts, s5_mix
+from lnvox.stages import s1_characters, s2_scenes, s3_director, s4_tts, s5_mix, s6_sync
 from lnvox.voices import manifest as voice_manifest
 from lnvox.voices import matcher as voice_matcher
 from lnvox.voices.schema import BookCasting
@@ -551,6 +551,84 @@ def stage5(
         progress=lambda m: console.print(f"[dim]{m}[/]"),
     )
     console.print(f"[green]✓[/] {output_m4b}")
+
+
+@app.command(name="s6")
+def stage6(
+    book_id: str,
+    epub: Optional[Path] = typer.Option(
+        None,
+        "--epub",
+        help=(
+            "Path to the source EPUB. Defaults to epubs/<book_id>.epub "
+            "(e.g. epubs/level99/volume-01.epub)."
+        ),
+    ),
+    novels_root: Path = typer.Option(
+        Path("novels"),
+        "--novels-root",
+        help="Where the novels/<book_id>/.epub_meta.json lives.",
+    ),
+    intra: float = typer.Option(0.25, help="Intra-scene silence (must match Stage 5)."),
+    inter_scene: float = typer.Option(1.0, help="Inter-scene silence (must match Stage 5)."),
+    inter_chapter: float = typer.Option(2.0, help="Inter-chapter silence (must match Stage 5)."),
+):
+    """Stage 6: Wrap original EPUB XHTML with beat spans + sync_manifest.json.
+
+    Lets a custom audiobook player highlight the active beat by querying
+    `[data-beat-id="…"]` in the EPUB and looking up start_seconds/end_seconds
+    in `sync_manifest.json`. The silence flags MUST match what was used at
+    Stage 5 — otherwise the in-m4b timings drift.
+    """
+    out_dir = _book_dir(book_id)
+    directed_dir = out_dir / "03_directed"
+    audio_dir = out_dir / "05_audio"
+    if not directed_dir.exists():
+        console.print(f"[red]Missing {directed_dir}. Run `lnvox s3` first.[/]")
+        raise typer.Exit(1)
+    if not audio_dir.exists():
+        console.print(f"[red]Missing {audio_dir}. Run `lnvox s4` first.[/]")
+        raise typer.Exit(1)
+
+    epub_path = epub or Path("epubs") / f"{book_id}.epub"
+    if not epub_path.exists():
+        console.print(f"[red]EPUB not found at {epub_path}. Pass --epub <path>.[/]")
+        raise typer.Exit(1)
+
+    novel_dir = novels_root / book_id
+    sync_dir = out_dir / "07_sync"
+
+    console.print(
+        f"Syncing [bold]{book_id}[/]:\n"
+        f"  epub      = {epub_path}\n"
+        f"  novel_dir = {novel_dir}\n"
+        f"  audio_dir = {audio_dir}\n"
+        f"  output    = {sync_dir}"
+    )
+
+    manifest = s6_sync.run(
+        book_id=book_id,
+        book_dir=out_dir,
+        epub_path=epub_path,
+        novel_dir=novel_dir,
+        output_dir=sync_dir,
+        intra_silence=intra,
+        inter_scene_silence=inter_scene,
+        inter_chapter_silence=inter_chapter,
+        progress=lambda m: console.print(f"[dim]{m}[/]"),
+    )
+
+    pct = 100.0 * manifest["matched"] / max(1, manifest["total_beats"])
+    style = "green" if manifest["unmatched"] == 0 else "yellow"
+    console.print(
+        f"[{style}]Matched {manifest['matched']}/{manifest['total_beats']} "
+        f"beats ({pct:.1f}%).[/]"
+    )
+    if manifest["unmatched"]:
+        console.print(
+            f"[yellow]See {sync_dir / 'unmatched.json'} for the {manifest['unmatched']} "
+            f"unmatched beats.[/]"
+        )
 
 
 audio_app = typer.Typer(help="Rendered-audio management (purge, inspect)", no_args_is_help=True)

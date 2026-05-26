@@ -15,20 +15,24 @@ runnable on a single workstation with one or two consumer GPUs.
 ## 1. Pipeline overview
 
 ```
-                              ┌────────────┐
-                              │ Voicebank  │ (seeded once from Common Voice 25)
-                              └──────┬─────┘
-                                     │ ref clips with gender / age / accent
-                                     ▼
-  ┌────────┐  ┌──────────────┐  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────┐  ┌──────┐
-  │ Ingest │→ │ 1. Characters │→│ 2. Scenes & │→ │ V. Voice cast│→ │ 3. Director│→ │ 4. TTS   │→ │ 5.   │
+   ┌──────────────┐
+   │ 0a. ingest-  │           ┌────────────┐
+   │   epub (opt.)│           │ Voicebank  │ (seeded once from Common Voice 25)
+   └──────┬───────┘           └──────┬─────┘
+          │ .txt + images          │ ref clips with gender / age / accent
+          ▼                        ▼
+  ┌────────┐  ┌───────────────┐  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────┐  ┌──────┐
+  │ Ingest │→ │ 1. Characters │→ │ 2. Scenes & │→ │ V. Voice cast│→ │ 3. Director│→ │ 4. TTS   │→ │ 5.   │→ .m4b
   │ (text) │  │  (Gemma 4)    │  │  speakers   │  │  (Gemma 4    │  │  (stage    │  │ (Drama-  │  │ Mix  │
-  │        │  │  + merge w/   │  │  (Gemma 4)  │  │   match)     │  │  directions)│ │  box)    │  │      │
-  │        │  │  prev volume) │  │             │  │              │  │             │ │          │  │      │
-  └────────┘  └───────────────┘  └─────────────┘  └──────────────┘  └────────────┘  └──────────┘  └──────┘
-                                                          ▲
-                                                          │ optional --narrator-clip override
-                                                          │ + auto-reuse of prior volume's casting
+  │        │  │  + merge w/   │  │  (Gemma 4)  │  │   match)     │  │ directions)│  │  box)    │  │      │
+  │        │  │  prev volume) │  │             │  │              │  │            │  │          │  │      │
+  └────────┘  └───────────────┘  └─────────────┘  └──────────────┘  └────────────┘  └──────────┘  └──┬───┘
+                     │                                  ▲                                            │
+                     │                                  │ optional --narrator-clip override          ▼
+                     │                                  │ + auto-reuse of prior volume's casting    ┌─────────────┐
+                     ▼                                                                              │ 6. Sync     │
+              (cumulative cast)                                                                     │  epub→spans │
+                                                                                                    └─────────────┘
 ```
 
 **Critical ordering**: voice casting is **stage V**, after scene segmentation
@@ -48,13 +52,48 @@ debugging / partial re-runs trivial.
 
 ## 2. Stage contracts
 
+### 2.0 Stage 0a — EPUB extraction (optional pre-ingest)
+
+When the source is a publisher EPUB rather than a `novels/<series>/<vol>/`
+folder of `.txt` files, `lnvox ingest-epub <epub> <output_dir>` converts it
+to the layout Stage 0 expects.
+
+Implementation: [`src/lnvox/ingest/epub.py`](src/lnvox/ingest/epub.py).
+
+Pipeline inside the extractor:
+
+1. Read `META-INF/container.xml` → locate the OPF rootfile.
+2. Parse the OPF for `<dc:title>`, `<dc:creator>`, `<dc:publisher>`,
+   `<dc:language>`, the `<manifest>` (id → href / media-type / properties),
+   and the `<spine>` (ordered itemrefs).
+3. Resolve every `image/*` manifest entry → copy to
+   `<output_dir>/images/<basename>`. Cover is identified by
+   `properties="cover-image"` (EPUB 3) OR `<meta name="cover"…>` (EPUB 2) OR
+   filename stem `cover`.
+4. Walk the spine in order. Skip front/back-matter stems matching
+   `cover/toc/tocimg/copyright/signup/insert\d+/bonus\d+/color\d+`. For each
+   remaining XHTML, extract `<h1>`/`<h2>` as title and concatenate `<p>`
+   text. Group multi-part chapters (`chapter1.xhtml` + `chapter1_1.xhtml` +
+   `chapter1_2.xhtml`) by stripping the trailing `_N` suffix.
+5. Write `NN-<slug>.txt` per chapter group (NN = group order in the spine,
+   first line = title, blank-line-separated paragraphs as body).
+6. Write `.epub_meta.json` capturing title / authors / publisher / language /
+   cover-image / images list / chapter map (with `source_parts` for each
+   chapter so Stage 6 can re-align back to the original XHTML).
+
+Stage 0 (`lnvox ingest`) detects `.epub_meta.json` and propagates the cover
+image path into `00_book_meta.json` for Stage 5 to embed in the final m4b.
+
 ### 2.1 Ingest
 
-- Input: a file path.
+- Input: a folder of `.txt` files (typically the output of Stage 0a, or
+  manually-prepared).
 - Output: `artifacts/<book>/00_text.jsonl` — one record per chapter:
   `{chapter_id, title, text}`.
-- Parsers: `.txt` (heuristic chapter split on `Chapter N` regex), `.epub`
-  (ebooklib), `.md` (split on H1/H2).
+- Parsers: `.txt` (filename-prefix ordering, first line = title), `.epub`
+  (deferred to Stage 0a), `.md` (split on H1/H2).
+- If `.epub_meta.json` is present, the EPUB cover path is copied into
+  `00_book_meta.json` so Stage 5 can embed it.
 
 ### 2.2 Stage 1 — Character extraction (Gemma 4)
 
@@ -234,6 +273,94 @@ Pipeline per chapter, then per book:
 Output: `06_final/<title>.m4b` with chapter markers + a
 `<title>.timings.json` sidecar (chapter offsets for debugging / re-encodes).
 
+### 2.8 Stage 6 — Sync layer (optional)
+
+Players that highlight the current beat in sync with playback (WebKit reader,
+Audiobookshelf, Plex Audiobooks, a custom front-end) need a mapping from
+audio time → highlighted text span in the source. Stage 6 produces that
+mapping by re-aligning the Stage-3 beats onto the original EPUB's XHTML.
+
+Implementation: [`src/lnvox/stages/s6_sync.py`](src/lnvox/stages/s6_sync.py),
+CLI `lnvox s6 <book> [--epub PATH]`.
+
+Inputs: `03_directed/*.json` (beat texts) + `05_audio/<chapter>/manifest.json`
+(per-beat durations) + original EPUB from `epubs/<series>/<vol>.epub` (the
+`source_parts` field in `.epub_meta.json` maps each `chapter_id` to the
+originating XHTML stems).
+
+Outputs under `artifacts/<book>/07_sync/`:
+
+- `<book>.epub` — a copy of the original EPUB with every matched beat's text
+  wrapped in `<span class="lnvox-beat" data-beat-id="<beat_id>">…</span>`. A
+  beat that straddles multiple text nodes gets one span per node, all sharing
+  the same `data-beat-id`. Structure / styling / metadata otherwise
+  byte-identical (mimetype stays STORED, etc.).
+- `sync_manifest.json` — `beats[]` (per matched beat `{beat_id,
+  data_beat_id, chapter_id, xhtml, type, speaker, start_seconds, end_seconds,
+  match_confidence}`), `images[]`, and a top-level `match_confidence`
+  histogram. Timings are cumulative through the Stage-5 silence layout
+  (intra/inter-scene/inter-chapter), so the silence flags passed to
+  `lnvox s6` MUST match Stage 5's.
+- `images[]` (in the same manifest) — one entry per embedded illustration:
+  `{src, xhtml, spine_page, after_chapter, before_chapter, after_beat_id,
+  before_beat_id, trigger_seconds}`. Light-novel inserts/color/bonus pages
+  are their own image-only spine items (skipped from text by Stage 0a); we
+  walk the OPF **spine order** to place each between the preceding XHTML
+  part's last beat and the following part's first beat — per-PART, so an
+  insert between `chapterN.xhtml` and `chapterN_1.xhtml` triggers at the
+  right mid-chapter beat. `before_beat_id: null` ⇒ end-matter shown after
+  the final beat; `after_beat_id: null` ⇒ front matter (cover/TOC) at 0 s.
+- `unmatched.json` — beats the matcher couldn't anchor (usually genuine
+  Stage-2 paraphrases / hallucinations).
+
+**Algorithm.** Per chapter, all of its `source_parts` XHTML are concatenated
+into one normalized "master shadow" string with a parallel
+`[char_index → (text_node, original_offset)]` map. Matching is then **two
+passes**:
+
+1. **Shadow + DOM index.** Walk text nodes; build the normalized shadow and
+   the offset map. Normalization (search-side only — original casing kept in
+   the map): lowercase, smart→straight quotes, em/en dash→`-`, collapse
+   whitespace runs to a single space. (Ligatures / `…` deliberately left as-is
+   so the normalized↔original char-offset mapping stays 1:1.)
+
+2. **Pass 1 — strict, forward.** Only `exact` (short beats) and `anchored`
+   (head + tail both found) matches, advancing a cursor. A per-match
+   **forward-jump cap** (`_MAX_FORWARD_JUMP = 8000`) bounds how far ahead a
+   match may start — without it, one false-positive anchored match leaping to
+   the chapter's end strands every later beat (observed dropping volume-02
+   chapters from ~95% → ~35%). Lenient fallbacks are off in Pass 1 precisely
+   because they false-positive on recurring phrases and poison the cursor.
+
+3. **Pass 2 — lenient gap-fill.** For each unmatched beat, search only the
+   gap between its bracketing matches (plus `_PASS2_BACKWARD_SLACK = 2000`
+   chars of backward slack, because Stage 2 sometimes reorders dialogue
+   attribution — source `"Patrick admitted, '…'"` becomes a dialogue beat then
+   a `"Patrick admitted"` narration beat that's *earlier* in the source).
+   Fallback ladder: `head-only`, `tail-only`, `backtrack`, then fuzzy
+   `SequenceMatcher` (≥`_FUZZY_MIN_RATIO=0.20` of the beat). Lenient matches
+   claim ONLY the verified anchor/substring, never `cursor→anchor`, so an
+   imprecise match can't swallow text the next beat needs. Repeated up to 3
+   rounds.
+
+4. **DOM wrapping.** Group matches by node; split each node into
+   text/span/text/… parts in one pass so multiple beats per node work.
+   Repack into a new EPUB, overlaying only the modified XHTML.
+
+**Real-data failure modes handled**: dropped attribution tags (anchor gap
+tolerance); paraphrased head OR tail (`head-only`/`tail-only`); reordered
+attribution (Pass 2 backward slack); sentence-split narration
+(`_split_long_text`) and same-speaker merge (`_merge_same_speaker`) staying
+ordered via the cursor.
+
+**Measured**: level99/volume-01 → 98.9%, level99/volume-02 → 95.7%. The
+unmatched remainder are genuine Stage-2 hallucinations (independent per-beat
+ceiling 92–94%; two-pass + fuzzy recovers reordered attribution to exceed it).
+
+**Tuning knobs** (top of `s6_sync.py`): `_MAX_FORWARD_JUMP` (8000),
+`HEAD_ANCHOR_LEN`/`TAIL_ANCHOR_LEN` (30/30), `_FUZZY_MIN_RATIO` (0.20),
+`_BACKTRACK_WINDOW` (1500), `_PASS2_BACKWARD_SLACK` (2000).
+
 ## 3. Module layout
 
 ```
@@ -246,14 +373,19 @@ ln-vox/
 │   │   ├── client.py         ← vLLM OpenAI-compatible client
 │   │   ├── prompts/          ← jinja templates, one per stage
 │   │   └── schemas.py        ← pydantic models for stage outputs
+│   ├── ingest/
+│   │   ├── text.py           ← folder-of-.txt parser (Stage 0)
+│   │   └── epub.py           ← EPUB → novels/ layout (Stage 0a)
 │   ├── stages/
 │   │   ├── s1_characters.py
 │   │   ├── s2_scenes.py
 │   │   ├── s3_director.py
 │   │   ├── s4_tts.py
-│   │   └── s5_mix.py
+│   │   ├── s5_mix.py
+│   │   └── s6_sync.py        ← EPUB beat-span re-alignment (Stage 6)
 │   ├── voices/               ← voice casting subsystem (§6)
-│   └── cli.py                ← `lnvox run <book.txt>` + per-stage subcommands
+│   ├── series.py             ← hierarchical book-id / prior-volume helpers
+│   └── cli.py                ← per-stage subcommands (ingest, ingest-epub, s1…s6, voice, audio)
 ├── artifacts/                ← gitignored; per-book working dir
 └── voicebank/                ← gitignored; ref clips + metadata
 ```

@@ -20,7 +20,7 @@ dist/
 
 # Data files
 novels/
-epub/
+epubs/
 
 # Vendor — we want to keep this out of version control, but it can be re-generated from source
 vendor/
