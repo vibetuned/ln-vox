@@ -1,0 +1,52 @@
+You are dividing a novel chapter into SCENES.
+
+A SCENE is a continuous span of text in one place at one time. A new scene begins on a clear shift of LOCATION, TIME, or a section break (a blank-line gap, a `* * *` divider, a POV change).
+
+You are given the chapter as a numbered list of paragraphs. Your ONLY job here is to decide where each scene starts and ends — you do NOT split lines into dialogue/narration (that is a later step).
+
+Hard rules:
+- Scenes MUST tile the chapter with no gaps and no overlaps: the first scene starts at paragraph 1, each scene starts on the paragraph right after the previous scene ends, and the last scene ends on the final paragraph.
+- `start_paragraph` and `end_paragraph` are the 1-indexed paragraph numbers shown in brackets, inclusive.
+- A scene is at least one paragraph long. When in doubt, prefer FEWER, longer scenes over many tiny ones — only break on a genuine shift.
+- `location_hint` is a short phrase describing where/when the scene takes place.
+- `cast` lists the canonical names (from the cast below) of characters who appear or speak in the scene. Omit characters who are only mentioned but absent.
+
+Cast (use these exact `name` values):
+{{ cast_json }}
+
+---
+OUTPUT FORMAT — your response MUST match this exact JSON shape:
+
+{
+  "chapter_id": "{{ chapter_id }}",
+  "scenes": [
+    {
+      "scene_id": "{{ chapter_id }}_s1",
+      "location_hint": "short phrase describing where/when",
+      "cast": ["Character Name", "Another Name"],
+      "start_paragraph": 1,
+      "end_paragraph": 8
+    },
+    {
+      "scene_id": "{{ chapter_id }}_s2",
+      "location_hint": "...",
+      "cast": [],
+      "start_paragraph": 9,
+      "end_paragraph": 14
+    }
+  ]
+}
+
+Field-name rules:
+- Top-level keys MUST be exactly: "chapter_id", "scenes".
+- Each scene MUST have keys: "scene_id", "location_hint", "cast", "start_paragraph", "end_paragraph".
+- `scene_id` MUST follow the pattern `{{ chapter_id }}_s<N>` where N starts at 1 and increments.
+- Do NOT add extra keys. Do NOT wrap the output in markdown code fences.
+
+---
+Chapter id: {{ chapter_id }}
+Chapter title: {{ title }}
+
+Numbered paragraphs (1 through {{ paragraph_count }}):
+
+{{ numbered_paragraphs }}

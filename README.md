@@ -442,5 +442,3 @@ data/<cv-corpus-…>/                      Raw Common Voice extraction
 ./scripts/run_pipeline.sh level99/volume-03 --llm-model "nvidia/Gemma-4-26B-A4B-NVFP4" --max-model-len 65536 --book-title "Villainess Level 99 — Act 3"
 
 
-A pea-sized black flame appeared from the tip of my finger and shot straight out toward the target.
-“What was that?” Oswald chortled.

@@ -11,6 +11,18 @@ class LLMConfig(BaseModel):
     api_key: str = "EMPTY"
     temperature: float = 0.2
     max_tokens: int = 8192
+    # Sent to vLLM as a sampling param. >1.0 discourages token repetition —
+    # the lever for a weak/quantized model that loops under guided JSON
+    # (emitting endless duplicate array items until it hits max_tokens). 1.0 is
+    # a no-op (default, no behaviour change for well-behaved models); 1.1 is a
+    # gentle, commonly-safe value to try when extraction runs away.
+    repetition_penalty: float = 1.0
+    # The served model's context window (vLLM `--max-model-len`). Used to clamp
+    # per-call output budgets so prompt + output never exceeds it — both an
+    # over-large output request (input+output > context → 400) and an
+    # over-small one (output truncated mid-JSON → parse error) come from
+    # ignoring this. Set `LNVOX_LLM_MAX_MODEL_LEN` to match the serve script.
+    max_model_len: int = 65536
     # HTTP request timeout. Computed per-call as:
     #   timeout = base_seconds + max_tokens * seconds_per_token
     # Defaults are tuned for the slow case (Gemma 4 31B on DGX Spark at
@@ -46,3 +58,17 @@ class Settings(BaseSettings):
             value = os.environ.get(shorthand)
             if value and getattr(self.llm, attr) == LLMConfig.model_fields[attr].default:
                 setattr(self.llm, attr, value)
+
+        max_len = os.environ.get("LNVOX_LLM_MAX_MODEL_LEN")
+        if max_len and self.llm.max_model_len == LLMConfig.model_fields["max_model_len"].default:
+            try:
+                self.llm.max_model_len = int(max_len)
+            except ValueError:
+                pass
+
+        rep = os.environ.get("LNVOX_LLM_REPETITION_PENALTY")
+        if rep and self.llm.repetition_penalty == LLMConfig.model_fields["repetition_penalty"].default:
+            try:
+                self.llm.repetition_penalty = float(rep)
+            except ValueError:
+                pass

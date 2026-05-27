@@ -14,8 +14,10 @@ Outputs:
 Algorithm — see §2.8 of DESIGN.md. Briefly:
     1. Per chapter XHTML: BeautifulSoup walk → shadow string + index from
        normalized-shadow-pos → (text node, original offset).
-    2. Anchor-based sequential match: first/last ~30 chars per beat, with the
-       "always start at previous match end" rule.
+    2. Sequential match, cursor-advancing: each beat's verbatim Stage-2
+       `source_span` is exact-matched first (the common path); beats whose span
+       is missing or drifted fall back to the head/tail (~30 char) + fuzzy
+       ladder, with the "always start at previous match end" rule.
     3. DOM wrap: group matches by node, split the node into
        text/span/text/span/… parts in one pass so multiple beats per node work
        correctly.
@@ -289,6 +291,29 @@ def _find_beat(
 
     # 6. Last resort: fuzzy longest-common substring.
     return _fuzzy_match(shadow, norm, cursor)
+
+
+def _find_source_span(
+    shadow: str, span: str, cursor: int, max_forward: int
+) -> tuple[int, int, str] | None:
+    """Exact-match a Stage-2 `source_span` in `shadow` at/after `cursor`.
+
+    `source_span` is the verbatim, lossless source slice the beat was grounded
+    in (quote marks + attribution kept), so after the same normalization it is
+    expected to be an exact substring of the source — no head/tail anchoring
+    needed. This is the primary, unambiguous match path; the head/tail/fuzzy
+    ladder in `_find_beat` is only the fallback for beats whose span drifted.
+
+    The forward-jump cap guards against the rare case where a short span recurs
+    later in the chapter. Returns ``(start, end, "span-exact")`` or None.
+    """
+    norm, _ = _normalize_with_map(span)
+    if not norm:
+        return None
+    idx = shadow.find(norm, cursor, cursor + max_forward)
+    if idx == -1:
+        return None
+    return idx, idx + len(norm), "span-exact"
 
 
 def _fuzzy_match(
@@ -603,6 +628,7 @@ def run(
     # image placement.
     chapter_first_last: dict[str, tuple[str, str]] = {}
     confidence_counts: dict[str, int] = {
+        "span-exact": 0,
         "exact": 0,
         "anchored": 0,
         "head-only": 0,
@@ -674,13 +700,23 @@ def run(
             pass1: list[tuple[str, dict, _Match | None, str]] = []
             cursor = 0
             for beat_id, beat in beats_in_order:
-                result = _find_beat(
-                    master_shadow,
-                    beat["text"],
-                    cursor,
-                    strict=True,
-                    max_forward=_MAX_FORWARD_JUMP,
-                )
+                # Primary: exact match on the verbatim source_span from Stage 2.
+                result = None
+                span = beat.get("source_span") or ""
+                if span:
+                    result = _find_source_span(
+                        master_shadow, span, cursor, _MAX_FORWARD_JUMP
+                    )
+                # Fallback: the lossy-text head/tail ladder for beats whose
+                # span is missing (legacy data / split remainders) or drifted.
+                if result is None:
+                    result = _find_beat(
+                        master_shadow,
+                        beat["text"],
+                        cursor,
+                        strict=True,
+                        max_forward=_MAX_FORWARD_JUMP,
+                    )
                 if result is None:
                     pass1.append((beat_id, beat, None, ""))
                     continue
@@ -719,9 +755,19 @@ def run(
                     search_start = max(0, prev_end - _PASS2_BACKWARD_SLACK)
                     if next_start <= search_start:
                         continue
-                    result = _find_beat_in_range(
-                        master_shadow, beat["text"], search_start, next_start
-                    )
+                    # Try the verbatim span first within the gap, then the
+                    # lenient text ladder.
+                    result = None
+                    span = beat.get("source_span") or ""
+                    if span:
+                        result = _find_source_span(
+                            master_shadow, span, search_start,
+                            next_start - search_start,
+                        )
+                    if result is None:
+                        result = _find_beat_in_range(
+                            master_shadow, beat["text"], search_start, next_start
+                        )
                     if result is None:
                         continue
                     s, e, conf = result

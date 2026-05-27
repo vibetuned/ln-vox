@@ -53,6 +53,43 @@ MAX_MERGED_BEAT_CHARS = 500
 # ---------------- voice profiles ----------------
 
 
+def _salvage_voice_profiles(raw: str) -> VoiceProfileList | None:
+    """Recover complete voice profiles from a truncated/runaway response.
+
+    Mirrors s1's character salvage: walk the `profiles` array, decode objects
+    until the first incomplete one, keep the valid entries. Characters missing
+    from a partial result degrade gracefully downstream (the director falls back
+    to a default descriptor), so a partial list beats a hard crash.
+    """
+    m = re.search(r'"profiles"\s*:\s*\[', raw)
+    if not m:
+        return None
+    pos = m.end()
+    decoder = json.JSONDecoder()
+    profiles: list[VoiceProfile] = []
+    while pos < len(raw):
+        while pos < len(raw) and raw[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(raw) or raw[pos] == "]":
+            break
+        try:
+            obj, pos = decoder.raw_decode(raw, pos)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict):
+            try:
+                profiles.append(VoiceProfile.model_validate(obj))
+            except Exception:
+                continue
+    if not profiles:
+        return None
+    print(
+        f"  [salvage] recovered {len(profiles)} voice profile(s) from a "
+        f"truncated response"
+    )
+    return VoiceProfileList(profiles=profiles)
+
+
 def generate_voice_profiles(
     client: LLMClient,
     cast: CharacterList,
@@ -139,11 +176,22 @@ def generate_voice_profiles(
             "voice_profiles.jinja",
             cast_with_clips_json=cast_with_clips_json,
         )
+        # Budget scales with the number of characters needing a profile (~400
+        # tokens each is ample for a short descriptor) instead of a fixed cap
+        # that truncated mid-JSON on large casts. Clamped to the context window,
+        # and salvageable if the model still runs long.
+        budget = client.budget_for(
+            system=VOICE_SYSTEM,
+            user=user,
+            desired=max(4096, 400 * len(cast_for_llm) + 1024),
+            floor=4096,
+        )
         llm_result = client.structured(
             system=VOICE_SYSTEM,
             user=user,
             schema=VoiceProfileList,
-            max_tokens=2048,
+            max_tokens=budget,
+            salvage=_salvage_voice_profiles,
         )
     else:
         llm_result = VoiceProfileList(profiles=[])
@@ -278,20 +326,36 @@ def _merge_same_speaker(beats: list[Beat]) -> list[Beat]:
                 ):
                     can_merge = True
         if can_merge:
+            # Concatenate source_spans too — adjacent beats are contiguous in
+            # the source, so the joined span stays a (near-)contiguous slice
+            # the sync stage can match exactly.
+            spans = [s for s in (merged[-1].source_span, beat.source_span) if s]
             merged[-1] = merged[-1].model_copy(
-                update={"text": f"{merged[-1].text} {beat.text}".strip()}
+                update={
+                    "text": f"{merged[-1].text} {beat.text}".strip(),
+                    "source_span": " ".join(spans),
+                }
             )
         else:
             merged.append(beat.model_copy(deep=True))
 
-    # Final pass: split any beat still over the cap.
+    # Final pass: split any beat still over the cap. Split source_span in
+    # parallel so each sub-beat keeps its own grounding; when the span splits
+    # into a different count than the text (rare — dialogue with attribution),
+    # only the chunks we can pair keep a span, the rest fall back to text-based
+    # matching in the sync stage.
     final: list[Beat] = []
     for beat in merged:
         if len(beat.text) <= MAX_MERGED_BEAT_CHARS:
             final.append(beat)
             continue
-        for chunk in _split_long_text(beat.text):
-            final.append(beat.model_copy(update={"text": chunk}, deep=True))
+        text_chunks = _split_long_text(beat.text)
+        span_chunks = _split_long_text(beat.source_span) if beat.source_span else []
+        for i, chunk in enumerate(text_chunks):
+            span = span_chunks[i] if i < len(span_chunks) else ""
+            final.append(
+                beat.model_copy(update={"text": chunk, "source_span": span}, deep=True)
+            )
     return final
 
 
@@ -338,8 +402,14 @@ def direct_scene(
             scene_context=scene_context,
             numbered_dialogue=numbered_dialogue,
         )
-        # Cue output is small: ~30 tokens per line × line count + JSON overhead.
-        budget = max(2048, min(16000, 40 * len(dialogue_indices) + 512))
+        # Cue output is ~40 tokens per dialogue line + JSON overhead; clamp to
+        # the context window so a long scene doesn't truncate and lose all cues.
+        budget = client.budget_for(
+            system=DIRECTION_SYSTEM,
+            user=user,
+            desired=max(2048, 40 * len(dialogue_indices) + 512),
+            floor=2048,
+        )
         try:
             directions = client.structured(
                 system=DIRECTION_SYSTEM,
@@ -373,6 +443,7 @@ def direct_scene(
                 speaker=speaker,
                 direction=direction,
                 prompt=prompt,
+                source_span=b.source_span,
             )
         )
 
@@ -421,10 +492,22 @@ def run(
     directed_dir.mkdir(exist_ok=True)
     results: list[ChapterDirected] = []
     for cs in chapters_scenes:
-        result = direct_chapter(client, cs, profiles)
-        (directed_dir / f"{cs.chapter_id}.json").write_text(
-            result.model_dump_json(indent=2), encoding="utf-8"
-        )
+        # Idempotent: a chapter already directed on a prior run is reloaded from
+        # disk instead of re-calling the LLM (voice profiles are cached above).
+        cached_path = directed_dir / f"{cs.chapter_id}.json"
+        result: ChapterDirected | None = None
+        if cached_path.exists():
+            try:
+                result = ChapterDirected.model_validate_json(
+                    cached_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                result = None  # malformed / truncated — re-direct
+        if result is None:
+            result = direct_chapter(client, cs, profiles)
+            cached_path.write_text(
+                result.model_dump_json(indent=2), encoding="utf-8"
+            )
         results.append(result)
         if on_chapter_done:
             on_chapter_done(cs, result)

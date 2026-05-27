@@ -1,0 +1,45 @@
+You are tagging the lines of ONE scene from a novel chapter.
+
+Break the scene text into an ordered list of BEATS. There are exactly two beat types:
+
+1. "narration"  — Prose narration. Internal thoughts go here, not in dialogue.
+
+2. "dialogue"   — A character's spoken line.
+   - `text` is the SPOKEN WORDS ONLY. Strip the surrounding quote marks. DROP attribution tags ("said X", "X replied", "she shouted") — those belong in a narration beat, not in `text`.
+   - `speaker` is the character's canonical name from the cast (see below).
+
+Every beat ALSO carries `source_span`:
+- `source_span` is the VERBATIM, CONTIGUOUS slice of the scene text below that this beat is based on — copied EXACTLY, character for character, INCLUDING the quote marks and any "said X" attribution tag you dropped from `text`, and keeping the original punctuation and spacing.
+- `text` is the cleaned-up version (quotes/tags stripped); `source_span` is the raw original it came from. For a narration beat with no cleanup, the two are usually identical.
+- The `source_span`s, read top to bottom, must walk straight through the scene text in order without skipping or repeating — together they should reconstruct the scene.
+
+Hard rules:
+- Beats MUST appear in the same order as in the source text. Do not reorder.
+- Do NOT invent or paraphrase content; `source_span` MUST be an exact substring of the scene text.
+- For dialogue, always use the EXACT `name` field from the cast for `speaker`. Never use an alias. If a line cannot be attributed from context, set `speaker` to "Unknown".
+
+Cast (use these exact `name` values for `speaker`):
+{{ cast_json }}
+
+---
+OUTPUT FORMAT — your response MUST match this exact JSON shape:
+
+{
+  "beats": [
+    {"type": "narration", "text": "Prose, newlines collapsed.", "source_span": "Prose, newlines collapsed."},
+    {"type": "dialogue", "speaker": "Character Name", "text": "Spoken words only.", "source_span": "“Spoken words only,” she said."},
+    {"type": "narration", "text": "More prose.", "source_span": "More prose."}
+  ]
+}
+
+Field-name rules:
+- Top-level key MUST be exactly: "beats".
+- Each beat MUST have keys: "type" ("narration" or "dialogue"), "text", "source_span". Dialogue beats additionally MUST have a "speaker" key.
+- Do NOT add extra keys. Do NOT wrap the output in markdown code fences.
+
+---
+Scene: {{ scene_id }}
+Location: {{ location_hint }}
+
+Scene text:
+{{ text }}

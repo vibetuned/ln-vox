@@ -19,6 +19,7 @@
 #     --skip-tts               Skip s4 (assume already rendered).
 #     --skip-mix               Skip s5 (skip the m4b assembly).
 #     --max-retries N          Auto-retry budget for s4 (default 30).
+#     --step-retries N         Auto-retry budget per non-TTS step (default 3).
 #
 # vLLM lifecycle: by default the launcher starts vLLM in the background,
 # waits for it to be ready, runs the LLM-phase stages, then stops it
@@ -39,6 +40,8 @@ SKIP_LLM=0
 SKIP_TTS=0
 SKIP_MIX=0
 MAX_RETRIES="${MAX_RETRIES:-30}"
+STEP_RETRIES="${STEP_RETRIES:-3}"
+RETRY_DELAY="${RETRY_DELAY:-5}"
 
 VLLM_PID=""
 VLLM_LOG=""
@@ -61,6 +64,7 @@ while [ $# -gt 0 ]; do
         --skip-tts)      SKIP_TTS=1;        shift   ;;
         --skip-mix)      SKIP_MIX=1;        shift   ;;
         --max-retries)   MAX_RETRIES="$2";  shift 2 ;;
+        --step-retries)  STEP_RETRIES="$2"; shift 2 ;;
         -*)              echo "Unknown option: $1" >&2; usage 2 ;;
         *)               if [ -z "$BOOK_ID" ]; then BOOK_ID="$1"; shift; else echo "Extra positional: $1" >&2; usage 2; fi ;;
     esac
@@ -100,6 +104,41 @@ banner() {
     echo "############################################################"
     echo "## $1"
     echo "############################################################"
+}
+
+# Run a command, retrying up to STEP_RETRIES times on failure. The pipeline
+# stages are idempotent (completed chapters/beats are cached), so a retry
+# resumes from the failure instead of redoing finished work. Aborts the whole
+# pipeline if the step still fails after the budget, or immediately on a
+# signal (Ctrl-C / kill) so retries can't swallow an intentional stop.
+#
+#   run_step <hook|-> "<description>" <command> [args...]
+#
+# <hook> is a function name run BEFORE each retry (or "-" for none) — LLM steps
+# pass `ensure_vllm` so a server that died mid-step is relaunched before the
+# next attempt; the most common multi-retry failure is a crashed vLLM.
+run_step() {
+    local hook="$1"; shift
+    local desc="$1"; shift
+    local attempt=1
+    while true; do
+        "$@" && return 0
+        local rc=$?
+        if [ "$rc" -ge 128 ]; then
+            echo "ERROR: '$desc' terminated by signal (exit $rc); aborting." >&2
+            exit "$rc"
+        fi
+        if [ "$attempt" -ge "$STEP_RETRIES" ]; then
+            echo "ERROR: '$desc' failed after $STEP_RETRIES attempt(s) (exit $rc); aborting." >&2
+            exit "$rc"
+        fi
+        echo "WARN: '$desc' failed (exit $rc). Retry $attempt/$((STEP_RETRIES - 1)) in ${RETRY_DELAY}s…" >&2
+        sleep "$RETRY_DELAY"
+        if [ "$hook" != "-" ]; then
+            "$hook"
+        fi
+        attempt=$((attempt + 1))
+    done
 }
 
 # ----- Dependency phase management -------------------------------------------
@@ -261,6 +300,23 @@ stop_vllm() {
     echo "vLLM stopped."
 }
 
+# Pre-retry hook for LLM steps: make sure a vLLM we manage is up before the
+# next attempt. No-op for an external --vllm-url (we can't relaunch someone
+# else's server) or when it's already healthy. `start_vllm` hard-exits if a
+# fresh launch never becomes ready, which is the right call — a server that
+# won't start is unrecoverable.
+ensure_vllm() {
+    if [ -n "$VLLM_URL" ]; then
+        return 0
+    fi
+    if vllm_ready; then
+        return 0
+    fi
+    echo "vLLM not responding before retry — relaunching…" >&2
+    VLLM_PID=""  # old process is gone; let start_vllm launch a fresh one
+    start_vllm
+}
+
 cleanup() {
     stop_vllm
 }
@@ -278,13 +334,13 @@ else
     start_vllm
 
     banner "Stage 0: ingest"
-    uv run lnvox ingest "$NOVEL_DIR" --book-id "$BOOK_ID"
+    run_step - "Stage 0 (ingest)" uv run lnvox ingest "$NOVEL_DIR" --book-id "$BOOK_ID"
 
     banner "Stage 1: cast extraction (with cross-volume merge if applicable)"
-    uv run lnvox s1 "$BOOK_ID"
+    run_step ensure_vllm "Stage 1 (cast extraction)" uv run lnvox s1 "$BOOK_ID"
 
     banner "Stage 2: scene segmentation"
-    uv run lnvox s2 "$BOOK_ID"
+    run_step ensure_vllm "Stage 2 (scene segmentation)" uv run lnvox s2 "$BOOK_ID"
 
     banner "Stage V: voice cast"
     # Narrator handling:
@@ -292,13 +348,13 @@ else
     #   - Not given AND prior volume      → matcher inherits prior Narrator clip.
     #   - Not given AND no prior volume   → matcher auto-casts the Narrator.
     if [ -n "$NARRATOR_CLIP" ]; then
-        uv run lnvox voice cast "$BOOK_ID" --narrator-clip "$NARRATOR_CLIP"
+        run_step ensure_vllm "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID" --narrator-clip "$NARRATOR_CLIP"
     else
-        uv run lnvox voice cast "$BOOK_ID"
+        run_step ensure_vllm "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID"
     fi
 
     banner "Stage 3: director (uses voice cast metadata)"
-    uv run lnvox s3 "$BOOK_ID" --regen-profiles
+    run_step ensure_vllm "Stage 3 (director)" uv run lnvox s3 "$BOOK_ID" --regen-profiles
 
     banner "LLM phase complete — stopping vLLM to free GPU for Dramabox"
     stop_vllm
@@ -326,7 +382,7 @@ if [ "$SKIP_MIX" -eq 1 ]; then
     banner "Skipping mix phase (--skip-mix)"
 else
     banner "Stage 5: mix → m4b"
-    uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE"
+    run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE"
 fi
 
 banner "Pipeline complete."

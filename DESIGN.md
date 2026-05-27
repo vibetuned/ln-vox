@@ -129,9 +129,32 @@ mention her grimoire memory.
 }
 ```
 
-**Global merge** is a second Gemma 4 call that receives the concatenated
-per-chapter lists and outputs a single deduplicated cast. Output:
-`01_characters.json`.
+**Global merge** runs in two phases, because feeding every per-chapter list
+(full descriptions + evidence) straight to the LLM blows the context window —
+a character recurring across N chapters costs ~N× its JSON, and a long volume
+exceeds the model's input budget (observed: ~36K input tokens on a 25-chapter
+volume, over the 64K ceiling once the output budget is added).
+
+1. **Deterministic clustering** (`cluster_characters`): union-find over the
+   per-chapter entries, fusing any that share a normalized name/alias key, plus
+   a fuzzy name pass (`difflib` ratio ≥ 0.9, min length 4) for transliteration
+   / typo variants ("Gunther"/"Gunter"). Enumerated names whose digit runs
+   differ ("Knight 1"/"Knight 2") are never fuzzy-fused. Each cluster combines
+   its members' fields by rule (canonical = most-frequent name form, alias =
+   union, gender/age = majority vote, description = longest, evidence = union).
+2. **LLM refine** (`merge_clusters`): a Gemma 4 call receives only a COMPACT
+   per-cluster summary (capped description, ≤2 evidence quotes, a `chapters`
+   occurrence count) — bounded by distinct-character count, not chapter count
+   (~91× smaller on the 25-chapter case). It does the judgment clustering
+   can't: fusing the same person under unrelated names, polishing descriptions,
+   and dropping trivial one-chapter background characters. A hard input-size
+   guard (`_MERGE_INPUT_CHAR_BUDGET`) falls back to the deterministic merge
+   rather than risk a context-length error.
+
+Outputs: `01_characters.json` (the merged cast) and
+`01_characters_merge_log.json` — provenance recording what merged into each
+cluster, which clusters are "lone" (single chapter), and each one's final
+disposition (kept / dropped / new-in-final).
 
 > **Model choice.** Use **Gemma 4 E4B** for dev/iteration (fits in ~10 GB
 > VRAM, ~2× faster) and **Gemma 4 31B Dense** for production runs. Both via
@@ -140,7 +163,36 @@ per-chapter lists and outputs a single deduplicated cast. Output:
 ### 2.3 Stage 2 — Scene & speaker segmentation (Gemma 4)
 
 Input: chapter text + global cast list. Output per chapter:
-`02_scenes/<chapter_id>.json`:
+`02_scenes/<chapter_id>.json`.
+
+**Two passes, not one.** A single call previously did three different jobs —
+find scene boundaries, tag every line as narration/dialogue, and reproduce the
+text — in one large output. Splitting them raises fidelity (which §2.8 shows is
+the hard ceiling on sync match rate) because each prompt is simpler, and keeps
+each call small enough to afford the `source_span` field below.
+
+**Pass 2a — Scene boundaries.** Input: the chapter text with chapter-global
+paragraph numbers. Output: scenes with `scene_id`, `location_hint`, the `cast`
+present, and `start_paragraph` / `end_paragraph` — **no
+beats**. This is a bounded task (pick boundaries among numbered paragraphs),
+the same kind the chunker already does reliably
+([`chunker.py`](src/lnvox/llm/chunker.py)), so the model is dependable here.
+(The `cast` list is 2a metadata used to prime/debug 2b; it is not persisted on
+the final merged `Scene`, which keeps only the paragraph range + beats — see
+the JSON below.)
+
+**Pass 2b — Beat tagging, per scene.** Input: *only* that scene's paragraphs
+(sliced from the source by 2a's range) + cast. Output: the scene's `beats`,
+each with `type` / `text` / `speaker` **plus `source_span`**. The small,
+single-scene context is what makes both the higher fidelity and the extra
+`source_span` output affordable.
+
+`source_span` — the **verbatim, contiguous slice of the source text the beat is
+grounded in**. It is lossless, in deliberate contrast to `text`, which is lossy
+(quote marks stripped, `"she said"` attribution dropped, whitespace collapsed).
+`source_span` is the sync key consumed by §2.8; `text` remains what is sent to
+TTS. The two differ exactly where the lossy transform happened, which is why
+`source_span` — not `text` — is the reliable anchor back to the original.
 
 ```json
 {
@@ -149,23 +201,43 @@ Input: chapter text + global cast list. Output per chapter:
     {
       "scene_id": "ch03_s1",
       "location_hint": "Vex's study at dusk",
+      "start_paragraph": 12,
+      "end_paragraph": 19,
       "beats": [
-        {"type": "narration", "text": "The duke turned from the window."},
-        {"type": "dialogue", "speaker": "Lord Vex", "text": "You're late."},
-        {"type": "dialogue", "speaker": "Mira", "text": "I came as soon as I could."}
+        {"type": "narration", "text": "The duke turned from the window.",
+         "source_span": "The duke turned from the window."},
+        {"type": "dialogue", "speaker": "Lord Vex", "text": "You're late.",
+         "source_span": "“You're late,” Vex said without turning."},
+        {"type": "dialogue", "speaker": "Mira", "text": "I came as soon as I could.",
+         "source_span": "“I came as soon as I could.”"}
       ]
     }
   ]
 }
 ```
 
+Note the second beat: `text` drops the `"Vex said without turning"` tag, but
+`source_span` keeps it — so the span matches the source exactly even though
+`text` no longer does.
+
+**Paragraph numbering — chapter-global.** The chapter text is split on `\n\n`
+into a paragraph list *once*; chunking (§2.3 chunker) accumulates whole
+paragraphs so each chunk carries its base paragraph index, and Pass 2a emits
+chapter-global paragraph numbers. Scene ranges are therefore directly usable by
+s6 with no per-chunk offset bookkeeping. (This replaces the char-based chunker
+splitting that returns opaque strings.)
+
 `narration` is voiced by a fixed Narrator character (auto-added to cast).
 Quoted speech inside narration is attributed when the LLM can infer it,
 otherwise stays as narration.
 
-**Failure mode to watch.** Long passages with `"…," she said` style — the LLM
-must split the dialogue from the tag. Prompt explicitly instructs to drop the
-`"she said"` tag once `speaker` is assigned.
+**Failure modes to watch.**
+- Long passages with `"…," she said` style — the LLM must split the dialogue
+  from the tag in `text`. The `source_span` for that beat should *keep* the tag.
+- `source_span` drift: if the model paraphrases the span instead of copying it,
+  the exact match in §2.8 fails and the beat falls back to fuzzy matching. The
+  rate of exact `source_span` hits is therefore a direct s2-fidelity metric
+  (see §2.8).
 
 ### 2.4 Stage V — Voice cast (Gemma 4)
 
@@ -313,49 +385,73 @@ Outputs under `artifacts/<book>/07_sync/`:
 - `unmatched.json` — beats the matcher couldn't anchor (usually genuine
   Stage-2 paraphrases / hallucinations).
 
+**Anchor from Stage 2.** Each beat now carries `source_span` — the verbatim
+source slice it was grounded in — used as the **exact** match key. Because it
+is lossless it matches the original directly, where the lossy `text` could not.
+The per-scene `start_paragraph` / `end_paragraph` fields are also carried
+through (s2 → s3), but they index the *chapter `.txt`* paragraph list, which is
+a **different coordinate space** from the EPUB-XHTML shadow s6 matches against
+(ingest reflows the text). Mapping paragraph index → shadow offset reliably is
+itself an alignment problem, and exact `source_span` matching removes the
+false-positive pressure that a hard scene window was meant to relieve — so s6
+keeps the cheaper cursor + `_MAX_FORWARD_JUMP` forward cap rather than building
+that mapping. The paragraph ranges remain available as scene metadata for a
+future reader UI / debugging.
+
 **Algorithm.** Per chapter, all of its `source_parts` XHTML are concatenated
 into one normalized "master shadow" string with a parallel
-`[char_index → (text_node, original_offset)]` map. Matching is then **two
-passes**:
+`[char_index → (text_node, original_offset)]` map. Matching then proceeds:
 
 1. **Shadow + DOM index.** Walk text nodes; build the normalized shadow and
    the offset map. Normalization (search-side only — original casing kept in
    the map): lowercase, smart→straight quotes, em/en dash→`-`, collapse
    whitespace runs to a single space. (Ligatures / `…` deliberately left as-is
-   so the normalized↔original char-offset mapping stays 1:1.)
+   so the normalized↔original char-offset mapping stays 1:1.) The same
+   normalization is applied to each `source_span` before matching.
 
-2. **Pass 1 — strict, forward.** Only `exact` (short beats) and `anchored`
-   (head + tail both found) matches, advancing a cursor. A per-match
-   **forward-jump cap** (`_MAX_FORWARD_JUMP = 8000`) bounds how far ahead a
-   match may start — without it, one false-positive anchored match leaping to
-   the chapter's end strands every later beat (observed dropping volume-02
-   chapters from ~95% → ~35%). Lenient fallbacks are off in Pass 1 precisely
-   because they false-positive on recurring phrases and poison the cursor.
+2. **Primary — exact `source_span`.** Forward from the cursor (bounded by
+   `_MAX_FORWARD_JUMP`), search for the normalized `source_span`; on a hit,
+   claim exactly that span (confidence `span-exact`) and advance the cursor.
+   This is the common path and is unambiguous.
 
-3. **Pass 2 — lenient gap-fill.** For each unmatched beat, search only the
-   gap between its bracketing matches (plus `_PASS2_BACKWARD_SLACK = 2000`
-   chars of backward slack, because Stage 2 sometimes reorders dialogue
-   attribution — source `"Patrick admitted, '…'"` becomes a dialogue beat then
-   a `"Patrick admitted"` narration beat that's *earlier* in the source).
-   Fallback ladder: `head-only`, `tail-only`, `backtrack`, then fuzzy
-   `SequenceMatcher` (≥`_FUZZY_MIN_RATIO=0.20` of the beat). Lenient matches
-   claim ONLY the verified anchor/substring, never `cursor→anchor`, so an
-   imprecise match can't swallow text the next beat needs. Repeated up to 3
-   rounds.
+3. **Fallback — the legacy fuzzy ladder**, used only for beats whose
+   `source_span` is missing (legacy data / split remainders) or did not match
+   exactly (drift / hallucination):
+   - **Strict, forward (Pass 1).** `exact` (short beats) and `anchored`
+     (head + tail of `text` both found), advancing the cursor. The
+     `_MAX_FORWARD_JUMP = 8000` cap bounds how far ahead a match may start.
+   - **Lenient gap-fill (Pass 2).** For each still-unmatched beat, search only
+     the gap between its bracketing matches (plus `_PASS2_BACKWARD_SLACK = 2000`
+     chars backward slack, because Stage 2 sometimes reorders dialogue
+     attribution). The beat's `source_span` is retried exactly within the gap
+     first, then the ladder: `head-only`, `tail-only`, `backtrack`, then fuzzy
+     `SequenceMatcher` (≥`_FUZZY_MIN_RATIO=0.20`). Lenient matches claim ONLY
+     the verified anchor/substring, never `cursor→anchor`. Repeated up to 3
+     rounds.
 
 4. **DOM wrapping.** Group matches by node; split each node into
    text/span/text/… parts in one pass so multiple beats per node work.
    Repack into a new EPUB, overlaying only the modified XHTML.
 
-**Real-data failure modes handled**: dropped attribution tags (anchor gap
-tolerance); paraphrased head OR tail (`head-only`/`tail-only`); reordered
-attribution (Pass 2 backward slack); sentence-split narration
-(`_split_long_text`) and same-speaker merge (`_merge_same_speaker`) staying
-ordered via the cursor.
+**Fidelity metric (free).** The fraction of beats resolved by step 2 (exact
+`source_span`) vs. forced into the step-3 fallback is a direct measure of
+Stage-2 grounding fidelity — surfaced in the `match_confidence` histogram (the
+`span-exact` bucket). Contiguity gaps between consecutive `source_span`s within
+a scene also flag text the model *omitted*, a stronger omission detector than
+`unmatched.json`.
 
-**Measured**: level99/volume-01 → 98.9%, level99/volume-02 → 95.7%. The
-unmatched remainder are genuine Stage-2 hallucinations (independent per-beat
-ceiling 92–94%; two-pass + fuzzy recovers reordered attribution to exceed it).
+**Real-data failure modes handled**: dropped attribution tags (kept in
+`source_span`, or anchor gap tolerance in fallback); paraphrased `source_span`
+(falls back to `head-only`/`tail-only`); reordered attribution (fallback
+backward slack); sentence-split narration (`_split_long_text`) and same-speaker
+merge (`_merge_same_speaker`) staying ordered via the cursor.
+
+**Measured (pre-`source_span` baseline)**: level99/volume-01 → 98.9%,
+level99/volume-02 → 95.7% using the fuzzy ladder alone. The unmatched remainder
+were genuine Stage-2 hallucinations (independent per-beat ceiling 92–94%). The
+`source_span` anchor is expected to lift the exact-match share
+well above this and shrink the fuzzy-fallback population; re-measure after
+implementation.
 
 **Tuning knobs** (top of `s6_sync.py`): `_MAX_FORWARD_JUMP` (8000),
 `HEAD_ANCHOR_LEN`/`TAIL_ANCHOR_LEN` (30/30), `_FUZZY_MIN_RATIO` (0.20),

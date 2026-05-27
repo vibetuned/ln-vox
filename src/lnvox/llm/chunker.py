@@ -78,25 +78,47 @@ def _ask_llm_for_break(client: LLMClient, paragraphs: list[str]) -> int:
     return len(paragraphs) // 2
 
 
+class Chunk(BaseModel):
+    """One chunk of a chapter, addressed by chapter-global paragraph index.
+
+    `base_paragraph` is the 0-indexed position of `paragraphs[0]` within the
+    chapter's full paragraph list. Stage 2a numbers paragraphs chapter-globally
+    as ``base_paragraph + local_index + 1`` (1-indexed for the prompt), so the
+    scene ranges it emits are chapter-global and need no per-chunk offset
+    bookkeeping downstream.
+    """
+
+    base_paragraph: int
+    paragraphs: list[str]
+
+
+def split_paragraphs(text: str) -> list[str]:
+    """Split a chapter into paragraphs on blank-line boundaries.
+
+    The single source of truth for paragraph numbering: Stage 2a's boundary
+    indices, Stage 2b's per-scene slices, and the chunker all index into the
+    list this returns.
+    """
+    return [p for p in text.split("\n\n") if p.strip()]
+
+
 def chunk_text(
     client: LLMClient,
     text: str,
     *,
     target_chars: int = DEFAULT_TARGET_CHARS,
     candidate_count: int = DEFAULT_CANDIDATE_COUNT,
-) -> list[str]:
-    """Split `text` into chunks at LLM-chosen paragraph boundaries.
+) -> list[Chunk]:
+    """Split `text` into paragraph-aligned chunks at LLM-chosen boundaries.
 
-    Each chunk targets `target_chars` characters. For each cut point the LLM
-    sees `candidate_count` paragraphs centred on the ideal position and picks
-    the cleanest one.
+    Each chunk targets `target_chars` characters and contains whole paragraphs.
+    For each cut point the LLM sees `candidate_count` paragraphs centred on the
+    ideal position and picks the cleanest one. Every chunk carries the
+    chapter-global index of its first paragraph.
     """
-    if len(text) <= target_chars:
-        return [text]
-
-    paragraphs = text.split("\n\n")
-    if len(paragraphs) <= 1:
-        return [text]
+    paragraphs = split_paragraphs(text)
+    if len(paragraphs) <= 1 or len(text) <= target_chars:
+        return [Chunk(base_paragraph=0, paragraphs=paragraphs or [text])]
 
     # Cumulative end-char offset per paragraph (inclusive of the \n\n separator).
     ends: list[int] = []
@@ -105,7 +127,7 @@ def chunk_text(
         pos += len(p) + 2
         ends.append(pos)
 
-    chunks: list[str] = []
+    chunks: list[Chunk] = []
     start_para = 0
     start_char = 0
 
@@ -113,7 +135,9 @@ def chunk_text(
         remaining_chars = ends[-1] - start_char
         # If what's left is comfortably within one chunk, take all of it.
         if remaining_chars <= int(target_chars * 1.3):
-            chunks.append(text[start_char:].strip())
+            chunks.append(
+                Chunk(base_paragraph=start_para, paragraphs=paragraphs[start_para:])
+            )
             break
 
         ideal_end_char = start_char + target_chars
@@ -139,9 +163,13 @@ def chunk_text(
             )
             chosen_para_idx = candidate_indices[chosen_local]
 
-        chunk_end = ends[chosen_para_idx]
-        chunks.append(text[start_char:chunk_end].strip())
+        chunks.append(
+            Chunk(
+                base_paragraph=start_para,
+                paragraphs=paragraphs[start_para : chosen_para_idx + 1],
+            )
+        )
         start_para = chosen_para_idx + 1
-        start_char = chunk_end
+        start_char = ends[chosen_para_idx]
 
     return chunks
