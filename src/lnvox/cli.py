@@ -334,6 +334,24 @@ def stage3(
     console.print(table)
 
 
+def _default_tts_device() -> str:
+    """Pick a torch device for Dramabox when the CLI flag isn't passed.
+
+    Returns "mps" on Apple Silicon when torch reports MPS available; "cuda"
+    everywhere else (matches the historical default on Linux). Torch is
+    imported lazily so the rest of the CLI doesn't pay the import cost when
+    s4 isn't being run. See DESIGN.md §11.3.
+    """
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cuda"
+
+
 @app.command(name="s4")
 def stage4(
     book_id: str,
@@ -342,7 +360,13 @@ def stage4(
         None,
         help="Render at most N beats overall (smoke-test mode).",
     ),
-    device: str = typer.Option("cuda", help="Torch device for Dramabox."),
+    device: Optional[str] = typer.Option(
+        None,
+        help=(
+            "Torch device for Dramabox. Defaults to 'mps' on Apple Silicon "
+            "when available, else 'cuda'. Pass 'cpu' to force CPU."
+        ),
+    ),
 ):
     """Stage 4: Render directed beats to audio via Dramabox.
 
@@ -386,6 +410,10 @@ def stage4(
     if not chapters_loaded:
         console.print(f"[red]No directed chapters matched filter '{chapters}'.[/]")
         raise typer.Exit(1)
+
+    if device is None:
+        device = _default_tts_device()
+        console.print(f"[dim]Auto-detected device: {device}[/]")
 
     audio_dir = out_dir / "05_audio"
     cache_dir = Path("cache") / "tts"

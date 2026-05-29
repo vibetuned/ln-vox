@@ -501,6 +501,10 @@ and skips stages whose outputs are newer than inputs.
 - **No queue/broker in v1.** Stages are local function calls. If we later need
   parallel chapter rendering, drop in `concurrent.futures.ProcessPoolExecutor`
   for stage 4.
+- **Apple Silicon variant.** vLLM is swapped for Apple `mlx_lm.server` (same
+  OpenAI endpoint contract, so `LLMClient` is unchanged) and Dramabox runs on
+  the MPS device with quantization + `torch.compile` disabled. Full details
+  and known limitations live in §11.
 
 ## 5. Storage & idempotency
 
@@ -613,7 +617,7 @@ llm:
   dev_model: "google/gemma-4-E4B-it"
 tts:
   model: "ResembleAI/Dramabox"
-  device: "cuda:0"
+  device: "cuda:0"                 # or "mps" on Apple Silicon — see §11
   cfg_scale: 3.0
 mix:
   intra_scene_silence_ms: 250
@@ -661,13 +665,23 @@ The launcher prints clear "STOP vLLM NOW" / "STOP Dramabox NOW" prompts at
 each handoff. It can be re-run safely: each stage is idempotent and skips
 work whose inputs haven't changed.
 
+On Apple Silicon the same launcher runs `scripts/serve_mlx.sh` instead of
+`scripts/serve_vllm.sh` for the LLM phase and passes `--device mps` to s4 —
+no other orchestration changes (see §11).
+
 ## 10. Dependencies (actual)
 
 Core (`pyproject.toml`):
 - `openai`, `pydantic`, `pydantic-settings`, `typer`, `rich`, `jinja2`
 
-`serve` extra (vLLM phase):
-- `vllm>=0.19.0`, `torch` (cu130 wheels via `[tool.uv.sources]`)
+`serve` extra (vLLM phase, Linux/CUDA):
+- `vllm>=0.19.0`, `torch` (cu130 wheels via `[tool.uv.sources]`, marker-gated
+  to `sys_platform == 'linux'` so `uv sync` doesn't try to fetch CUDA wheels
+  on macOS — see §11).
+
+`mlx` extra (Apple Silicon LLM phase):
+- `mlx-lm` (provides `mlx_lm.server`, OpenAI-compatible). Marker-gated to
+  `sys_platform == 'darwin'`. See §11 for the serving topology.
 
 `voice` extra (voicebank seeding):
 - `soundfile`, `librosa`, `tqdm`
@@ -679,3 +693,149 @@ Core (`pyproject.toml`):
   `scripts/setup_dramabox.sh`)
 
 System for stage 5: `ffmpeg` (concat / loudnorm / AAC mux).
+
+## 11. Apple Silicon path (secondary target)
+
+Linux + CUDA stays the primary supported topology. Apple Silicon is a
+second target: the design must keep CUDA working unchanged, while also
+producing an `.m4b` end-to-end on an M-series Mac. This section is the
+contract for what differs and what stays the same.
+
+### 11.1 Topology
+
+```
+                        ┌──────────────────────────┐
+   LLM phase            │ scripts/serve_mlx.sh     │   (Apple Silicon)
+                        │   → mlx_lm.server :8000  │
+                        └────────────┬─────────────┘
+                                     │  same OpenAI endpoint contract
+   (or, on Linux/CUDA)               ▼
+                        ┌──────────────────────────┐
+                        │ scripts/serve_vllm.sh    │   (Linux + CUDA)
+                        │   → vllm OpenAI :8000    │
+                        └────────────┬─────────────┘
+                                     │
+                          ┌──────────▼──────────┐
+                          │   LLMClient         │  unchanged on either path
+                          └──────────┬──────────┘
+                                     │
+                       s1 / s2 / voice / s3 (all stages)
+                                     │
+                                     ▼
+   TTS phase            ┌──────────────────────────┐
+                        │ DramaboxClient(          │   device picked from
+                        │   device="cuda" | "mps") │   config / CLI flag
+                        └──────────────────────────┘
+```
+
+The only stage that has a device of its own is s4. Every other stage is
+either pure-Python (ingest, mix, sync) or talks to the LLM over HTTP — so
+the *only* code that knows whether we're on CUDA or MPS is the s4 client
+factory.
+
+### 11.2 LLM side — `mlx_lm.server`
+
+- `mlx_lm.server` ships an OpenAI-compatible `/v1/chat/completions`
+  endpoint. `LLMClient` ([client.py:57-60](src/lnvox/llm/client.py#L57-L60))
+  doesn't care which backend is behind that URL, so the only artifact
+  needed on the MPS path is a new launcher: `scripts/serve_mlx.sh`
+  (model + port + max-tokens — much smaller surface than the vLLM script).
+- Models are pulled from `mlx-community/*` (pre-converted MLX weights). The
+  closest matches to the primary Gemma 4 picks are tracked in the script's
+  comments; once Gemma 4 MLX checkpoints are routinely available they
+  become the default. Until then the dev/E4B path runs against the
+  best-available MLX-quantized Gemma.
+
+**Known limitations** of this path that the design accepts rather than
+papers over:
+
+1. **No `guided_json` enforcement.** vLLM honours
+   `extra_body={"guided_json": schema}` (used in
+   [client.py:118](src/lnvox/llm/client.py#L118)) so the model's output is
+   constrained to the pydantic schema server-side. `mlx_lm.server` ignores
+   this field today. The client already validates + retries via
+   `structured()`, so behaviour degrades from "guaranteed structural match"
+   to "validate-and-retry"; expect a higher first-attempt parse-fail rate
+   on Mac. Track upstream MLX structured-output work and revisit.
+2. **No `repetition_penalty` knob.** The vLLM-specific
+   `extra_body["repetition_penalty"]` lever
+   ([client.py:119-120](src/lnvox/llm/client.py#L119-L120)) isn't honoured
+   either. The runaway-loop escape hatch documented in
+   [config.py:16-19](src/lnvox/config.py#L16-L19) goes away; the
+   workaround on MPS is to bump temperature or switch to a less
+   loop-prone checkpoint.
+3. **No prefix caching across calls.** vLLM's `--enable-prefix-caching`
+   amortises shared system+user prompt prefixes across the many
+   per-chapter/per-scene LLM calls; mlx-lm has no equivalent today. Stage
+   1 (per-chapter) and stage 3 (per-scene) make many calls with shared
+   system prompts, so the wall-clock penalty on Mac is real but bounded —
+   the prompts aren't huge.
+
+These are explicitly *acceptable* losses for v1; we don't add a fallback
+guided-decoding layer (e.g. outlines) to the client just yet. The bar is
+"design parity is preserved at the contract level; performance and
+fidelity may differ."
+
+### 11.3 TTS side — Dramabox on MPS (best-effort)
+
+Goal: pass `device="mps"` through to DramaBox **without touching
+DramaBox's source**. Anything beyond what `DramaboxClient` already wraps
+([dramabox_client.py](src/lnvox/tts/dramabox_client.py)) is out of scope
+for v1.
+
+What `DramaboxClient` needs to do on MPS (small wrapper changes, no
+DramaBox patches):
+
+| Knob              | CUDA default   | MPS override       | Why                                                                                                                                |
+|-------------------|----------------|--------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| `device`          | `"cuda"`       | `"mps"`            | CLI / config flag, already supported by the wrapper constructor.                                                                   |
+| `dtype`           | `"bf16"`       | `"fp16"`           | MPS has materially worse bfloat16 coverage than fp16; forcing fp16 sidesteps the worst of it.                                      |
+| `bnb_4bit`        | `True`         | `False`            | bitsandbytes is CUDA-only. No MPS 4-bit path exists in DramaBox.                                                                   |
+| `compile_model`   | `True`         | `False`            | `torch.compile` is flaky on MPS for diffusion models; the default eager path is the safer baseline.                                |
+
+These defaults are picked in `DramaboxClient.__init__` based on the
+`device` argument; the CUDA path is byte-identical to today's behaviour.
+
+**Known limitations** the design accepts:
+
+1. **No DramaBox source patches.** `torch.cuda.empty_cache()` and
+   `torch.cuda.memory_allocated()` are called unconditionally inside
+   DramaBox ([blocks.py:433,486](external/DramaBox/ltx2/ltx_pipelines/utils/blocks.py)).
+   On MPS these raise / return zero. If a particular call site errors,
+   the TTS run dies — we surface the trace rather than monkey-patch from
+   our wrapper. Upstreaming or forking DramaBox is explicitly out of
+   scope for v1.
+2. **2× Gemma-encoder memory.** With `bnb_4bit=False` the prompt-encoder
+   Gemma (3 12B) loads in fp16 instead of 4-bit. Budget ≈ 24 GB unified
+   memory for the encoder alone. The pipeline needs a 36 GB+ Mac to fit
+   transformer + encoder + KV-cache + activations.
+3. **Throughput.** DramaBox is diffusion-based and unoptimised for MPS.
+   Expect 5–10× real-time render (vs. ~1–2× on a 4090). A 9 h audiobook
+   becomes a 2-day render on Mac. The s4 cache and `s4_retry.sh` resume
+   semantics are unchanged and remain the right primitives.
+
+### 11.4 Code surface affected (design-only listing — no code yet)
+
+| Area                                          | Change                                                                                                                                                       |
+|-----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `pyproject.toml`                              | Make `[tool.uv.sources].torch` Linux-only via a `sys_platform` marker; add an `mlx` optional extra with `mlx-lm; sys_platform == 'darwin'`.                  |
+| `scripts/serve_mlx.sh` (new)                  | Apple Silicon analog to `serve_vllm.sh`. Picks an `mlx-community/*` Gemma checkpoint by `LNVOX_LLM_MODEL`; launches `python -m mlx_lm server --port …`.      |
+| `src/lnvox/tts/dramabox_client.py`            | `DramaboxClient.__init__` reads `device`, applies the per-device defaults table above. CUDA default behaviour preserved exactly.                             |
+| `src/lnvox/cli.py` (`stage4 --device`)        | Default flips from hard-coded `"cuda"` to an auto-detect helper (`mps` if `torch.backends.mps.is_available()`, else `cuda`). The flag stays a manual override.|
+| `scripts/run_pipeline.sh`                     | Pick `serve_mlx.sh` when `uname -s == Darwin`. Pass `--device mps` to `lnvox s4` on the same condition. No stage ordering changes.                            |
+
+Nothing about the stage contracts (§2), the artifact layout (§5), the
+voice subsystem (§6), or any prompts (`src/lnvox/llm/prompts/`) changes.
+
+### 11.5 What's explicitly **not** in this design
+
+- Mac CI. Nothing is automated; the Mac path is dev-grade in v1.
+- Replacing `bitsandbytes` with an MPS-side quant alternative (e.g.
+  per-channel int8 via `torch.ao.quantization`).
+- Outlines/LMFE-style guided decoding to recover the lost
+  `guided_json` enforcement.
+- Multi-device parallelism (CUDA box doing LLM while Mac does TTS, or
+  vice versa). The pipeline launcher remains single-host.
+
+Each of those is a sensible v2 thread; they're called out so we don't
+accidentally drift into them while wiring up v1's Mac path.

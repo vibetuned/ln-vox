@@ -15,8 +15,15 @@ dependencies = [
 
 [project.optional-dependencies]
 serve = [
-    "vllm>=0.19.0",
-    "torch",
+    # Linux/CUDA LLM phase. vLLM has no macOS wheels, so the whole extra
+    # is marker-gated. The Apple Silicon equivalent is the `mlx` extra.
+    "vllm>=0.19.0 ; sys_platform == 'linux'",
+    "torch ; sys_platform == 'linux'",
+]
+mlx = [
+    # Apple Silicon LLM phase: mlx_lm.server exposes an OpenAI-compatible
+    # endpoint so LLMClient works unchanged. See DESIGN.md §11.
+    "mlx-lm>=0.20 ; sys_platform == 'darwin'",
 ]
 voice = [
     "soundfile>=0.12",
@@ -50,7 +57,12 @@ packages = ["src/lnvox"]
 package = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+# Linux-only: pull torch from the cu130 wheel index. macOS picks up the
+# default PyPI wheel (MPS-capable), so leaving this unconditional would
+# break `uv sync` on Apple Silicon. See DESIGN.md §11.
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

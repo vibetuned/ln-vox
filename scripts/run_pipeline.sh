@@ -26,8 +26,15 @@
 # (freeing GPU memory for Dramabox). Pass --vllm-url to skip this if you
 # already have a vLLM server elsewhere (or running externally on a second
 # GPU). The full pipeline is non-interactive; safe for overnight runs.
+#
+# Apple Silicon (Darwin): the launcher swaps serve_vllm.sh for
+# scripts/serve_mlx.sh (Apple's mlx_lm.server, same OpenAI endpoint) and
+# uses --device mps for Dramabox. See DESIGN.md §11. `--vllm-url` is reused
+# as the "external LLM endpoint already running" knob on either platform.
 
 set -uo pipefail
+
+OS="$(uname -s)"
 
 BOOK_ID=""
 NARRATOR_CLIP=""
@@ -150,6 +157,18 @@ run_step() {
 # overhead is minimal when the state is already correct.
 
 prepare_llm_env() {
+    if [ "$OS" = "Darwin" ]; then
+        banner "Preparing venv for LLM phase (mlx-lm on Apple Silicon)"
+        # The mlx-lm path is much lighter than the vLLM one — mlx_lm pulls
+        # its own MLX runtime and there's no torch ABI minefield to navigate.
+        if [ -d .venv ] && ! uv run python -c "import mlx_lm" >/dev/null 2>&1; then
+            echo "Detected broken venv (mlx_lm import fails). Recreating from scratch…"
+            rm -rf .venv
+        fi
+        uv sync --extra mlx --extra voice --extra tts
+        return 0
+    fi
+
     banner "Preparing venv for LLM phase (vLLM-compatible torch)"
     # If torch can't even import (libcudnn / NCCL ABI mismatch after a prior
     # botched install), uv sync won't rescue us because the lockfile thinks
@@ -175,6 +194,23 @@ install_dramabox_reqs() {
     fi
     local arch
     arch="$(uname -m)"
+
+    # Darwin must be handled BEFORE the arm64 leg of the arch case — Apple
+    # Silicon also reports arm64, but its needs are different (MPS torch +
+    # no bitsandbytes). Mirrors setup_dramabox.sh's Darwin branch.
+    if [ "$OS" = "Darwin" ]; then
+        local filtered
+        filtered="$(mktemp)"
+        # Strip torch* AND bitsandbytes (no macOS wheel; DramaboxClient
+        # disables bnb_4bit on MPS so it isn't needed).
+        grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision|bitsandbytes)([[:space:]]|=|<|>|~|!|$)' \
+            "$req_file" > "$filtered"
+        uv pip install -r "$filtered"
+        rm -f "$filtered"
+        uv pip install "torch>=2.10,<2.12" "torchaudio>=2.10,<2.12"
+        return 0
+    fi
+
     case "$arch" in
         x86_64)
             uv pip install -r "$req_file"
@@ -207,19 +243,27 @@ prepare_tts_env() {
     uv sync --extra voice --extra tts
     install_dramabox_reqs
 
-    # Sanity: refuse to proceed to Dramabox if torch.cuda isn't actually
-    # available. Same check setup_dramabox.sh runs after a fresh install —
-    # catches the case where a prior LLM-phase sync put a CPU-only wheel
-    # back in place.
-    if ! uv run python - <<'PY' >/dev/null 2>&1
+    # Sanity: refuse to proceed to Dramabox unless the expected torch
+    # backend is actually available. Same check setup_dramabox.sh runs
+    # after a fresh install — catches the case where a prior LLM-phase
+    # sync put a CPU-only wheel back in place. Backend is MPS on Darwin,
+    # CUDA elsewhere.
+    local backend="cuda"
+    if [ "$OS" = "Darwin" ]; then
+        backend="mps"
+    fi
+    if ! uv run python - "$backend" <<'PY' >/dev/null 2>&1
 import sys, torch
+backend = sys.argv[1]
+if backend == "mps":
+    sys.exit(0 if torch.backends.mps.is_available() else 1)
 sys.exit(0 if torch.cuda.is_available() else 1)
 PY
     then
         echo "" >&2
-        echo "ERROR: torch.cuda is not available after TTS env preparation." >&2
-        echo "  uname -m: $(uname -m)" >&2
-        uv run python -c "import torch; print(f'  torch={torch.__version__}  cuda_available={torch.cuda.is_available()}')" >&2 || true
+        echo "ERROR: torch.$backend is not available after TTS env preparation." >&2
+        echo "  uname -s: $OS  uname -m: $(uname -m)" >&2
+        uv run python -c "import torch; print(f'  torch={torch.__version__}  cuda={torch.cuda.is_available()}  mps={torch.backends.mps.is_available()}')" >&2 || true
         echo "" >&2
         echo "Run ./scripts/setup_dramabox.sh manually and inspect its output." >&2
         exit 1
@@ -247,11 +291,17 @@ start_vllm() {
         return 0
     fi
 
+    local serve_script="./scripts/serve_vllm.sh"
+    local backend_name="vLLM"
+    if [ "$OS" = "Darwin" ]; then
+        serve_script="./scripts/serve_mlx.sh"
+        backend_name="mlx_lm.server"
+    fi
     VLLM_LOG="$(mktemp -t lnvox_vllm.XXXXXX.log)"
-    echo "Starting vLLM in background (log: $VLLM_LOG)…"
-    nohup ./scripts/serve_vllm.sh > "$VLLM_LOG" 2>&1 &
+    echo "Starting $backend_name in background (log: $VLLM_LOG)…"
+    nohup "$serve_script" > "$VLLM_LOG" 2>&1 &
     VLLM_PID=$!
-    echo "vLLM PID: $VLLM_PID"
+    echo "$backend_name PID: $VLLM_PID"
 
     local timeout=600
     local elapsed=0
