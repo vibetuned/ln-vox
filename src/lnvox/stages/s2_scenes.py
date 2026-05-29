@@ -92,16 +92,18 @@ def _detect_boundaries(
     )
     # Boundaries are tiny: a handful of scenes, each a short metadata record.
     budget = max(1024, min(8192, 80 * len(chunk.paragraphs) + 512))
-    try:
-        result = client.structured(
-            system=BOUNDARY_SYSTEM,
-            user=user,
-            schema=ChapterBoundaries,
-            max_tokens=budget,
-        )
-        boundaries = result.scenes
-    except Exception:
-        boundaries = []
+    # Exceptions from `structured` (dead vLLM, persistent truncation) propagate
+    # so the pipeline-level retry + `ensure_vllm` can restart the server. The
+    # *only* in-band fallback below is "the LLM successfully returned an empty
+    # scene list" — a different, recoverable case (model legitimately found no
+    # break, treat the chunk as one scene).
+    result = client.structured(
+        system=BOUNDARY_SYSTEM,
+        user=user,
+        schema=ChapterBoundaries,
+        max_tokens=budget,
+    )
+    boundaries = result.scenes
 
     n = len(chunk.paragraphs)
     cleaned: list[SceneBoundary] = []
@@ -112,7 +114,7 @@ def _detect_boundaries(
         b.end_paragraph = chunk.base_paragraph + end
         cleaned.append(b)
     if not cleaned:
-        # Fallback: treat the whole chunk as a single scene.
+        # LLM returned an empty scene list — treat the whole chunk as one scene.
         cleaned = [
             SceneBoundary(
                 scene_id=f"{chapter.chapter_id}_s1",
@@ -141,14 +143,14 @@ def _tag_scene_beats(
         text=scene_text,
     )
     # source_span roughly duplicates the source, so budget ~1.4x the scene
-    # text; capped well inside the context window.
+    # text; capped well inside the context window. Exceptions propagate (a dead
+    # vLLM here used to be silently swallowed into empty beats, which cached as
+    # a degenerate "1 scene, 0 beats" result and corrupted every subsequent
+    # chapter until the cache was wiped).
     budget = max(4096, min(32000, int(len(scene_text) * 1.4) + 1024))
-    try:
-        return client.structured(
-            system=BEATS_SYSTEM, user=user, schema=SceneBeats, max_tokens=budget
-        )
-    except Exception:
-        return SceneBeats(beats=[])
+    return client.structured(
+        system=BEATS_SYSTEM, user=user, schema=SceneBeats, max_tokens=budget
+    )
 
 
 def segment_chapter(
@@ -187,6 +189,16 @@ def segment_chapter(
         beats = _tag_scene_beats(
             client, b, scene_text, cast_json=cast_json
         ).beats
+        # Backstop for the silent-failure variant: the LLM returned valid JSON
+        # with an empty beats list for a non-empty scene. This used to silently
+        # cache as a degenerate chapter and corrupt every subsequent one.
+        # Raise so the pipeline retry can restart vLLM and re-segment.
+        if not beats:
+            raise RuntimeError(
+                f"s2: scene {scene_id} returned 0 beats from "
+                f"{len(scene_text)} chars of source — likely a stalled LLM. "
+                f"Aborting chapter so retry can restart vLLM."
+            )
         all_scenes.append(
             Scene(
                 scene_id=scene_id,
@@ -200,6 +212,19 @@ def segment_chapter(
     chapter_scenes = ChapterScenes(chapter_id=chapter.chapter_id, scenes=all_scenes)
     _normalize_speakers(chapter_scenes, alias_map)
     return chapter_scenes
+
+
+def _looks_broken(result: ChapterScenes) -> bool:
+    """Detect a degenerate cached result from an earlier silent-failure run.
+
+    The bug pattern: vLLM dies mid-volume, the old broad excepts swallow it,
+    a chapter caches as ``[scene(beats=[])]``. Any scene with zero beats is
+    invalid — non-empty scenes are filtered out in `segment_chapter` before
+    beat tagging — so this safely flags only the degenerate cache.
+    """
+    if not result.scenes:
+        return True
+    return any(not s.beats for s in result.scenes)
 
 
 def run(
@@ -224,6 +249,12 @@ def run(
                 result = ChapterScenes.model_validate_json(
                     cached_path.read_text(encoding="utf-8")
                 )
+                if _looks_broken(result):
+                    print(
+                        f"  [s2] cached {ch.chapter_id} has empty beats "
+                        f"(silent-failure carryover) — re-segmenting"
+                    )
+                    result = None
             except Exception:
                 result = None  # malformed / truncated — re-segment
         if result is None:
