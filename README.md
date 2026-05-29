@@ -302,8 +302,8 @@ Real-data failure modes the algorithm handles:
 
 | Book | Match rate | Notes |
 |---|---|---|
-| level99/volume-01 | 98.9% | mostly exact + anchored |
-| level99/volume-02 | 95.7% | more tail-only/fuzzy (heavier Stage-2 paraphrasing) |
+| title/volume-01 | 98.9% | mostly exact + anchored |
+| title/volume-02 | 95.7% | more tail-only/fuzzy (heavier Stage-2 paraphrasing) |
 
 The unmatched remainder are genuine Stage-2 hallucinations (independent
 per-beat ceiling measured at 92–94%; two-pass + fuzzy recovers reordered
@@ -328,7 +328,7 @@ Drop volume-02 next to volume-01 and re-run the launcher:
 
 ```bash
 ./scripts/run_pipeline.sh novel-name/volume-02 \
-    --book-title "A Certain Magical Index — Volume 2"
+    --book-title "A Certain Novel — Volume 2"
 ```
 
 The pipeline auto-detects `artifacts/novel-name/volume-01/` and:
@@ -439,6 +439,6 @@ cache/tts/<sha256>.wav                   Content-addressed TTS cache (survives b
 external/DramaBox/                       Cloned Dramabox repo (sys.path-injected)
 data/<cv-corpus-…>/                      Raw Common Voice extraction
 ```
-./scripts/run_pipeline.sh level99/volume-03 --llm-model "nvidia/Gemma-4-26B-A4B-NVFP4" --max-model-len 65536 --book-title "Villainess Level 99 — Act 3"
+
 
 
