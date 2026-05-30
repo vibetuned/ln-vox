@@ -1,4 +1,14 @@
-# ln-vox
+# Lectures and Narrations
+
+Lectures and Narrations (LN) This project was born out of a small AI experiment in book understanding and knowledge presentation. By using language models to analyze narrative structures, identify character traits, and map scene dynamics, it quickly became clear that this deep-text comprehension could be repurposed. The experiment naturally evolved into a complete, end-to-end pipeline for creating highly immersive, multi-voice audiobooks.
+
+Today, the Lectures and Narrations ecosystem consists of two halves:
+
+> ln-vox (The Creator): An offline, self-hosted AI pipeline that ingests raw text or EPUBs. It orchestrates LLMs to cast characters and direct emotional delivery, then uses local TTS to generate a fully acted, multi-voice .m4b audiobook complete with text-to-audio sync markers.
+
+> ln-reader (The Consumer): A custom Android application built specifically to play these enhanced audiobooks. It features chapter-relative scrubbing, sleep timers, and an EPUB companion reader that automatically highlights the text in sync with the audio.
+
+## ln-vox in a nutshell
 
 A self-hosted pipeline that turns a text novel into a multi-voice audiobook
 (`.m4b`) with character-appropriate voices, emotionally-acted delivery, and
