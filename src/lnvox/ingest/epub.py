@@ -185,7 +185,8 @@ def extract_epub(
                 if idref:
                     spine.append(idref)
 
-        # 3. Extract every image referenced in the manifest.
+        # 3a. Extract every image referenced in the manifest (raw files).
+        image_rel_by_iid: dict[str, str] = {}
         for iid, (href, mt, props) in manifest.items():
             if not mt.startswith("image/"):
                 continue
@@ -194,7 +195,7 @@ def extract_epub(
             dst = images_dir / Path(href).name
             dst.write_bytes(data)
             rel = f"images/{dst.name}"
-            meta.images.append(rel)
+            image_rel_by_iid[iid] = rel
 
             is_cover = (
                 "cover-image" in props
@@ -203,6 +204,90 @@ def extract_epub(
             )
             if is_cover and not meta.cover_image:
                 meta.cover_image = rel
+
+        # 3b. Walk the spine in document-flow order so `meta.images` reflects
+        # how the reader encounters them — not manifest declaration order
+        # (which gives e.g. `Insert10.jpg` before `Insert2.jpg` after the
+        # alphabetic sort that s5_mix used to do). For each spine page that
+        # hosts <img> elements, append the referenced images in source order.
+        # Non-spine images (rare; usually just background-only manifest items)
+        # land at the end so nothing is silently lost.
+        ordered_image_rels: list[str] = []
+        seen_images: set[str] = set()
+
+        def _emit(rel: str) -> None:
+            if rel and rel not in seen_images:
+                seen_images.add(rel)
+                ordered_image_rels.append(rel)
+
+        # If the OPF flags a cover image, it almost always belongs first even
+        # when its spine page (`cover.xhtml`) is later in the file order.
+        if meta.cover_image:
+            _emit(meta.cover_image)
+
+        # Build href → rel for quick lookup of image refs from XHTML spine pages.
+        href_to_rel: dict[str, str] = {
+            href: image_rel_by_iid[iid]
+            for iid, (href, mt, _props) in manifest.items()
+            if iid in image_rel_by_iid
+        }
+
+        for iid in spine:
+            if iid not in manifest:
+                continue
+            href, mt, _props = manifest[iid]
+            if "html" not in mt and "xml" not in mt:
+                continue
+            src = (opf_dir + "/" if opf_dir else "") + href
+            try:
+                page_bytes = zf.read(unquote(src))
+            except KeyError:
+                continue
+            from bs4 import BeautifulSoup as _BS
+
+            soup_page = _BS(page_bytes, "html.parser")
+            page_dir = Path(href).parent.as_posix()
+            for img in soup_page.find_all(["img", "image"]):
+                raw_src = (
+                    img.get("src")
+                    or img.get("xlink:href")
+                    or img.get("href")
+                    or ""
+                )
+                if not raw_src:
+                    continue
+                # Resolve relative to the page's directory, then to opf_dir.
+                resolved = (
+                    f"{page_dir}/{raw_src}" if page_dir and not raw_src.startswith("/") else raw_src
+                )
+                # Normalize "./foo", "bar/../baz", etc.
+                resolved = Path(resolved).as_posix()
+                rel = href_to_rel.get(resolved)
+                if rel is None:
+                    # Try a stripped lookup (some EPUBs use ../Images/foo.jpg
+                    # while the manifest href is Images/foo.jpg).
+                    candidate = resolved.replace("../", "")
+                    rel = href_to_rel.get(candidate)
+                if rel is None:
+                    # Last resort: match by basename. Loses precision when two
+                    # images share a basename in different folders, but covers
+                    # the common case of href-resolution drift.
+                    base = Path(raw_src).name
+                    for h, r in href_to_rel.items():
+                        if Path(h).name == base:
+                            rel = r
+                            break
+                if rel:
+                    _emit(rel)
+
+        # 3c. Any images that were in the manifest but appear in no spine
+        # page (back-cover-only assets, etc.) go at the end so they're not lost.
+        for iid in manifest:
+            rel = image_rel_by_iid.get(iid)
+            if rel:
+                _emit(rel)
+
+        meta.images = ordered_image_rels
 
         # 4. Walk the spine, collecting chapter parts grouped by base name.
         chapter_groups: dict[str, list[tuple[int, str, str, str]]] = {}

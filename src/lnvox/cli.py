@@ -546,10 +546,31 @@ def stage5(
 
     # Resolve images directory: explicit flag wins, otherwise check
     # <novels_root>/<book_id>/images/.
-    resolved_images_dir = images_dir if images_dir else (novels_root / book_id / "images")
+    novel_dir = novels_root / book_id
+    resolved_images_dir = images_dir if images_dir else (novel_dir / "images")
     extra_images: list[Path] = []
     if resolved_images_dir.exists():
-        extra_images = s5_mix.collect_images(resolved_images_dir)
+        # Prefer the spine-ordered image list from `.epub_meta.json` when
+        # available — that's how a reader encounters the illustrations
+        # (`Insert1, Insert2, …, Insert10`) rather than alphabetical
+        # (`Insert1, Insert10, Insert2, …`) which is what a raw directory
+        # listing produces.
+        meta_path = novel_dir / ".epub_meta.json"
+        ordered_paths: list[Path] = []
+        if images_dir is None and meta_path.exists():
+            import json as _json
+
+            meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+            for rel in meta.get("images", []) or []:
+                p = novel_dir / rel
+                if p.exists():
+                    ordered_paths.append(p)
+            if ordered_paths:
+                console.print(
+                    f"[dim]Using spine-ordered image list from {meta_path.name} "
+                    f"({len(ordered_paths)} image(s))[/]"
+                )
+        extra_images = ordered_paths or s5_mix.collect_images(resolved_images_dir)
         if extra_images:
             # If we have a `cover.*` in the images dir AND no --cover override,
             # promote it to the cover slot so it's the primary attached_pic.

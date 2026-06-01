@@ -839,3 +839,73 @@ voice subsystem (§6), or any prompts (`src/lnvox/llm/prompts/`) changes.
 
 Each of those is a sensible v2 thread; they're called out so we don't
 accidentally drift into them while wiring up v1's Mac path.
+
+## 12. Voicebank Studio (curation GUI)
+
+A standalone PySide6 desktop tool for curating the voicebank by ear. The
+auto-seeder (`seed_from_common_voice`, §6.1) gets you a bulk voicebank
+quickly, but picking *good* reference voices — and especially the narrator
+(§6.3) — is a listening task the CLI can't do. The Studio is that listening
+surface.
+
+### 12.1 Scope
+
+Operations 1–4 act on `voicebank/manifest.json` + `voicebank/clips/`;
+operation 5 acts on a book's `04_voice_assignments.json`:
+
+1. **Listen** — play any voicebank clip; see its full metadata.
+2. **Import from Common Voice** — browse the raw `data/…/en` corpus by
+   *speaker*, preview their individual mp3 utterances, preview the merged
+   reference clip, and **promote** a speaker into the voicebank. Promotion
+   reuses `build_speaker_clip()` verbatim, so a Studio-added clip is
+   byte-for-byte the kind of clip the seeder would have produced (mono 24 kHz,
+   top-voted utterances concatenated with 0.25 s gaps, demographics + up to 3
+   sample sentences preserved).
+3. **Add manual** — import an arbitrary wav/mp3 from disk (transcoded to mono
+   24 kHz wav) and hand-enter its taxonomies (`gender`, `age_band`, `accent`,
+   sentences, license, notes).
+4. **Erase** — delete a clip from the manifest and remove its wav.
+5. **Cast** (Casting tab) — open a `04_voice_assignments.json` (`BookCasting`,
+   §6.2), see every character with its LLM `target` and top-3 `ranked`
+   candidates, audition candidates *and* any clip in the voicebank, and
+   reassign `assigned_clip_id` for any character by ear. Save writes the
+   `BookCasting` back via `model_dump_json` — `target`, `ranked`,
+   `candidates_considered`, and `voice_descriptor` are round-tripped untouched;
+   only `assigned_clip_id` changes. This is the by-ear counterpart to the
+   automated Stage-V match and the manual-narrator flow (§6.2–6.3).
+
+Explicitly **out of scope**: editing existing clips' audio, multi-corpus
+import (only the local CV layout is wired), and any pipeline invocation. The
+Studio only reads/writes the voicebank and casting JSON; it never re-runs the
+LLM matcher (a cross-gender/age cast just prompts a confirmation).
+
+### 12.2 Packaging
+
+Standalone — `scripts/voicebank_studio.py`, run with
+`uv run python scripts/voicebank_studio.py` after `uv pip install PySide6`.
+Not wired into the `lnvox` CLI and not added as a project dependency; PySide6
+is a dev-machine-only concern and the pipeline never imports it. The script
+*does* import `lnvox.voices` (schema, manifest I/O, `build_speaker_clip`) so
+curation logic stays single-sourced with the seeder.
+
+### 12.3 Common Voice browsing without loading 600 MB
+
+`validated.tsv` is ~600 MB / 2.5 M rows; the GUI must not block on it. A
+`QThread` worker streams the TSV with `csv.DictReader`, applies the same
+`_eligible()` gate as the seeder (≥2 up-votes, 0 down-votes, mappable
+age+gender), groups eligible rows by `client_id`, and emits each speaker the
+moment it accumulates `min_utts` eligible rows *and* matches the active
+attribute filters (gender / age / accent substring). It **stops early** once
+`max_speakers` ready speakers are found, so a typical browse reads only the
+head of the file. This trades the seeder's deterministic `client_id` ordering
+for file order — fine for a browse tool, and called out here so nobody expects
+the Studio to surface the *same* speakers the seeder would at a given cap.
+
+### 12.4 Audio playback
+
+Playback goes through `QMediaPlayer` + `QAudioOutput`, but every non-wav input
+is first decoded (librosa) to a temp 24 kHz wav and that wav is played. This
+sidesteps per-platform mp3-codec availability in the Qt multimedia backend:
+the only format Qt is ever asked to play is wav. Merged-clip preview reuses
+`build_speaker_clip()` into a temp dir (no manifest mutation) and plays the
+result, guaranteeing the preview is exactly what promotion would write.

@@ -125,17 +125,26 @@ def _build_shadow(
 ) -> tuple[str, list[_NodeSegment], list[_ImageMark]]:
     """Concatenate every visible text node into a normalized shadow string.
 
-    Walks the DOM in document order (``descendants``) so interleaved ``<img>``
+    Walks the ``<body>`` subtree in document order so interleaved ``<img>``
     elements can be recorded at the shadow position where they fall — that's
     what lets Stage 6 emit "this image appears before beat X". A single space
     is inserted between adjacent text nodes so two nodes can't accidentally
     match across the boundary (e.g. ``</p><p>`` with no actual whitespace).
+
+    The walk is scoped to ``<body>`` (not the whole soup) because BS4's
+    ``html.parser`` exposes the ``<?xml … ?>`` declaration's content as a
+    document-level NavigableString. A whole-soup walk used to pick that text
+    up, the matcher could then wrap it in a ``<span>``, and the resulting
+    serialized XHTML had stray spans BEFORE ``<html>`` — well-formed in
+    permissive HTML viewers but rejected by strict XML parsers with
+    "junk after document element".
     """
+    body = soup.find("body") or soup
     parts: list[str] = []
     segments: list[_NodeSegment] = []
     images: list[_ImageMark] = []
     cursor = 0
-    for node in soup.descendants:
+    for node in body.descendants:
         if isinstance(node, NavigableString):
             if any(p.name in _SKIP_NODE_PARENTS for p in node.parents if p.name):
                 continue
