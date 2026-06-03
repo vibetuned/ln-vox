@@ -38,7 +38,7 @@ runnable on a single workstation with one or two consumer GPUs.
 **Critical ordering**: voice casting is **stage V**, after scene segmentation
 and **before** the Director. The Director composes voice descriptors that
 *match the assigned reference clip*, so a clip's actual gender / age / accent
-drives the bracket-prefix Dramabox sees.
+drives the descriptor prefix Dramabox sees.
 
 **Series & volumes**. Book IDs are hierarchical, `<series>/volume-NN`
 (e.g. `toaru/volume-02`). When processing a non-first volume, the pipeline
@@ -273,14 +273,17 @@ This guarantees voice continuity across a series.
 ### 2.5 Stage 3 — Director (stage directions)
 
 This is the stage that **aligns the pipeline to Dramabox's input format**.
-Dramabox expects screenplay-style prompts:
+Dramabox expects a voice/performance descriptor immediately followed by the
+quoted line — one beat per `prompt`:
 
 ```
-[Lord Vex, mid-50s, baritone, weary disappointment]
-"You're late."
-[Mira, breathless, defensive]
-"I came as soon as I could."
+Lord Vex, mid-50s, baritone, weary disappointment, "You're late."
+Mira, breathless, defensive, "I came as soon as I could."
 ```
+
+(The `prompt` field is built as `<direction>, "<text>"` — see
+[s3_director.py](src/lnvox/stages/s3_director.py). Lecture mode (§13) builds
+the same shape with the narrator descriptor and no performance cue.)
 
 The Director runs **after** voice cast (§2.4), so it knows each speaker's
 assigned reference clip and can generate a voice descriptor that's
@@ -909,3 +912,348 @@ sidesteps per-platform mp3-codec availability in the Qt multimedia backend:
 the only format Qt is ever asked to play is wav. Merged-clip preview reuses
 `build_speaker_clip()` into a temp dir (no manifest mutation) and plays the
 result, guaranteeing the preview is exactly what promotion would write.
+
+## 13. Lecture mode (single-voice, verbatim narration)
+
+### 13.0 Goal & what lecture mode is / isn't
+
+**Goal.** A second delivery mode for **non-fiction and technical books**: one
+narrator voice, read straight through, with **no dramatization**. The source
+text is used *as is* — the pipeline never invents scenes, never splits dialogue
+from attribution, never casts a multi-voice ensemble, and never writes
+emotional performance cues. It produces the same `.m4b` (+ optional synced
+EPUB) the narration mode does, just with a single steady reader.
+
+This is selected with a new `--mode lecture` flag (the existing multi-voice
+behaviour is `--mode narration`, the default).
+
+**What it deliberately drops vs. narration mode.** Stage 1 (character
+extraction), Stage 2 (scene/speaker segmentation), and the dramatizing half of
+Stage 3 (the Director: emotional state, performance cues, per-speaker
+descriptors) all exist *only* to find characters, segment scenes, attribute
+dialogue, and act it out. Every one of those is forbidden in lecture mode, so
+all three collapse into a single deterministic stage (§13.3). There is no
+character LLM, no scene LLM, no Director.
+
+**What it keeps.** The verbatim-anchoring design that already runs through the
+narration path. The `Beat`/`DirectedBeat` schema already separates `text` (the
+lossy string sent to TTS) from `source_span` (the verbatim source slice used as
+the §2.8 sync key). Lecture mode uses that exact split: `source_span` is the
+untouched original, `text` is the speech-normalized form (§13.6). Because
+`source_span` stays byte-faithful to the source, Stage 6 matching is
+near-perfect (a far higher `span-exact` share than narration — there are no
+paraphrasing scene/director passes to drift it).
+
+**Non-goals (inherited from §0 plus).** No per-section voice switching, no
+"read the code aloud" TTS of non-prose blocks (those are handled as *visual
+elements*, §13.2/§13.5), no summarization or restructuring of the text.
+
+### 13.1 Pipeline overview
+
+```
+   ┌──────────────────────┐        ┌────────────┐
+   │ 0a. ingest-epub       │        │ Voicebank  │
+   │  (classify · drop     │        └──────┬─────┘
+   │   boilerplate · render│               │ narrator ref clip
+   │   code/tables → PNG)  │               ▼
+              │ 00_text.jsonl       ┌──────────────┐
+              │ + Narrator-only     │ V. Voice cast│ (Narrator only)
+              │   01_characters.json│  (--narrator │
+              │ + non-prose blocks  │    -clip)    │
+              ▼                     └──────┬───────┘
+        ┌───────────────────────────┐     │ narrator descriptor
+        │ L. lecture                │◄────┘
+        │  (split + speech-normalize│
+        │   → 03_directed/*.json)   │
+        └──────────┬────────────────┘
+                   ▼
+            ┌──────────┐  ┌──────┐
+            │ 4. TTS   │→ │ 5.   │→ .m4b
+            │ (Dramabox│  │ Mix  │
+            │  1 voice)│  │      │
+            └──────────┘  └──┬───┘
+                            ▼
+                     ┌─────────────────────────┐
+                     │ 6. Sync epub→spans       │
+                     │  + non-prose visual      │
+                     │    elements (like images)│
+                     └─────────────────────────┘
+```
+
+Compared to narration mode (§1): **s1, s2, and the Director are replaced by the
+single `lecture` stage; everything from Stage V onward is unchanged code.** The
+only stage that knows which mode it's in is `lecture` (and a structure-aware
+branch in ingest); s4/s5/s6 receive identical artifacts.
+
+**Mode flag.** `scripts/run_pipeline.sh <book> --mode lecture
+[--narrator-clip cv_xxx]`. The launcher's LLM phase shrinks to *just the
+normalize pass* (§13.6) — no character/scene/director calls — then the same
+vLLM→Dramabox GPU handoff. With `--no-normalize` (§13.6) lecture mode has **no
+LLM phase at all**: the whole vLLM half of the launcher is skipped and the run
+is ingest → cast → split → TTS → mix.
+
+### 13.2 Ingest — block classification, drop list, and rendering
+
+Technical books are full of blocks that read terribly aloud: code listings,
+tables, math/equations, figure captions, footnotes — plus whole pages that
+shouldn't be read at all (TOC, copyright, index). Lecture-mode ingest does three
+things narration-mode ingest doesn't: **classify** every block, **drop** the
+boilerplate, and **render** the keep-but-don't-narrate blocks (code/tables) into
+images so they ride the *exact same path Stage 6 already uses for
+illustrations* (§2.0, §2.8 `images[]`) — surfaced to the reader at the right
+playback offset, never sent to TTS.
+
+Stage 0a (`ingest-epub`, [`epub.py`](src/lnvox/ingest/epub.py)) gains a
+`--mode lecture` branch implementing the steps below.
+
+**(a) Classification — deterministic first, LLM only for the tail.** An EPUB
+already encodes most of this; we lean on the markup and reach for the LLM only
+where the markup is silent. The ladder, per block:
+
+1. **Structural / semantic (free, deterministic).** `<pre>`/`<code>` → `code`;
+   `<table>` → `table`; `<figure>`/`<figcaption>` → `figure`; footnote
+   `<aside>` / `<*[epub:type=footnote|endnote]>` → `footnote`; MathML `<math>`
+   / display-equation blocks → `equation`. EPUB3 `epub:type` landmarks and the
+   NCX/nav document classify whole spine items: `toc`, `copyright-page`,
+   `titlepage`, `index`, `bibliography` → **drop** (see (b)). This reuses and
+   extends the stem regex Stage 0a already applies
+   (`cover/toc/copyright/signup/insert\d+/…`).
+2. **LLM fallback (only for untagged blocks).** Publishers vary wildly — some
+   render code as monospace-styled `<p>` and ship boilerplate with no
+   `epub:type`. Any block the rules can't classify gets a single cheap LLM call
+   returning `{prose | code | table | drop}` + a one-line reason. Bounded by an
+   input-size budget like the s1 merge (§2.2). Blocks the rules *did* classify
+   never hit the LLM, so most books make few or zero calls — and a book with
+   clean semantic markup makes **none**. (`--ingest-classifier none` forces
+   rules-only: untagged ⇒ treated as prose.)
+
+This is the same "deterministic clustering, LLM refine" division of labour as
+§2.2 — fast, reproducible, debuggable, LLM only for the judgment rules can't make.
+
+**(b) Drop list.** Dropped spine items / blocks are excised from
+`00_text.jsonl` entirely (not rendered, not narrated, not a visual element).
+Default drop set (configurable in `config.yaml`):
+
+- `toc` — table of contents (a list of page numbers; never narrate).
+- `copyright-page` / `titlepage` — copyright, ISBN/publisher boilerplate,
+  "also by this author" ad pages.
+- `index` / `bibliography` — back-of-book index and reference lists.
+
+**Kept and narrated:** the narrative body, plus `preface` / `foreword` /
+`introduction`, and — deliberately *not* in the default drop set —
+`dedication` / `acknowledgments` / `colophon` (short, and some listeners want
+them; flip them into `drop` per book if undesired).
+
+**(c) Render code/tables → PNG.** This is the core of "make images from the code
+and tables that are text." We already hold the verbatim block HTML, so:
+
+- **Code** → syntax-highlight with **Pygments** (lexer guessed from the
+  language class hint or content), wrap in a minimal HTML doc with a monospace
+  theme.
+- **Tables** → keep the `<table>` markup, apply a clean bordered CSS.
+- Rasterize that HTML → PNG with **Playwright (headless Chromium)** at a
+  reader-friendly width (~1080px) and 2× device-scale for crispness; tall
+  listings/tables produce tall images the reader scrolls. Playwright lives
+  behind an optional `render` extra (§13.7) — it downloads a browser, so it's
+  not a core dependency. Output PNGs land in `novels/<book>/images/` next to the
+  extracted illustrations, **content-hash-named** (§5 idempotency) so a re-run
+  doesn't re-rasterize unchanged blocks.
+
+`figure` / `footnote` / `equation` blocks are recorded as visual elements but
+**not rasterized** in v1 — figures already point at an extracted image,
+footnotes/equations carry their verbatim HTML for the reader to render
+(rasterizing those is a v2 thread, §13.9).
+
+**(d) Visual-element record.** Each kept-but-not-narrated block is recorded
+alongside the existing `images[]` with the anchoring fields s6 already uses:
+
+```json
+{
+  "kind": "code | table | figure | footnote | equation",
+  "src": "images/code_3a8f1c.png",     // rendered PNG (code/table) or extracted asset (figure)
+  "xhtml": "chapter3.xhtml",
+  "spine_page": "chapter3",
+  "after_paragraph": 41,                // chapter-global paragraph it follows
+  "html": "<pre>…</pre>"                // verbatim block markup (reader fallback / footnotes/equations)
+}
+```
+
+s6 later converts `after_paragraph` → `after_beat_id` / `before_beat_id` /
+`trigger_seconds` (§13.5), identical to how it places an inline image.
+
+For **`.txt`** sources there is no structure to detect, so everything is prose
+and nothing is dropped or rendered (literal read falls out naturally). For
+**`.md`** a best-effort pass treats fenced code blocks and `![]()` figures as
+non-prose; full table/footnote/landmark detection is markdown-flavour-dependent
+and is a v2 thread (§13.9). **EPUB is the realistic input for this mode** and
+gets the full ladder.
+
+Ingest in lecture mode also writes a **Narrator-only `01_characters.json`
+stub** (a single `Character` named `Narrator`), so `voice cast` (§13.4) runs
+completely unchanged — no s1 needed.
+
+### 13.3 Stage L — the lecture stage (s1+s2+s3 replacement)
+
+`lnvox lecture <book>` ([`src/lnvox/stages/lecture.py`](src/lnvox/stages/lecture.py),
+new). Input: `00_text.jsonl` + `04_voice_assignments.json` (for the narrator's
+voice descriptor). Output: `03_directed/<chapter_id>.json`
+(`ChapterDirected`, the **same schema s4 already consumes** — see
+[schemas.py:166](src/lnvox/llm/schemas.py#L166)). Two sub-steps, neither of
+which finds characters or scenes:
+
+1. **Deterministic beat split.** Split each chapter into paragraphs with
+   `split_paragraphs` ([chunker.py:95](src/lnvox/llm/chunker.py#L95)), then
+   sentence-group each paragraph into beats ≤ `MAX_MERGED_BEAT_CHARS` (~500
+   chars / ~40 s) by **reusing `_split_long_text`**
+   ([s3_director.py:269](src/lnvox/stages/s3_director.py#L269)) — the exact
+   length policy Dramabox wants (§2.6). Every beat is `type:"narration"`,
+   `speaker:"Narrator"`, and its `source_span` is the **verbatim** contiguous
+   source slice (whitespace-collapsed only). Scenes are a thin grouping (one
+   `DirectedScene` per chapter, or per heading section) carried only so the
+   downstream silence layout (§2.7) and `scene_id`-based beat ids stay valid.
+
+2. **LLM speech-normalize** (the *only* LLM call in lecture mode, §13.6). For
+   each beat, `text` = a speech-friendly rendering of `source_span` (numbers →
+   words, units/currency/percent verbalized, common abbreviations expanded,
+   symbols spoken). **`source_span` is never touched** — it remains the
+   verbatim sync anchor. The normalize call is per-paragraph-group (not
+   per-beat) for prompt efficiency, idempotent, and cached per chapter like
+   every other stage. `--no-normalize` sets `text = source_span` verbatim and
+   skips the LLM entirely.
+
+The `prompt` field is built as `<narrator descriptor>, "<text>"` — the same
+Dramabox shape s3 produces (§2.5) — where the narrator descriptor comes
+straight from the cast's `voice_descriptor` (`descriptor_from_clip` of the
+assigned narrator clip, or `DEFAULT_NARRATOR_DESCRIPTOR`). **Crucially it
+carries no performance cue** — lecture mode never adds a `whispered`/`weary`-style
+direction. Example directed beat:
+
+```json
+{
+  "type": "narration",
+  "speaker": "Narrator",
+  "direction": "adult, British, male, clear measured reading voice",
+  "text": "By nineteen seventy-three, ARPANET linked forty hosts, see Figure three.",
+  "prompt": "adult, British, male, clear measured reading voice, \"By nineteen seventy-three, ARPANET linked forty hosts, see Figure three.\"",
+  "source_span": "By 1973, ARPANET linked 40 hosts (see Fig. 3)."
+}
+```
+
+Note `text` (spoken) ≠ `source_span` (verbatim) exactly where normalization
+fired — and s6 anchors on `source_span`, so the synced EPUB still highlights
+the original `"By 1973, ARPANET linked 40 hosts (see Fig. 3)."`.
+
+### 13.4 Stage V — voice cast (Narrator only)
+
+Unchanged CLI ([`voice cast`](src/lnvox/cli.py)). With the Narrator-only stub
+cast from §13.2, it casts exactly one voice. `--narrator-clip <id>` is the
+expected path here (the narrator is 100% of a lecture audiobook — §6.3 applies
+even more strongly than in narration mode); auto-cast falls back to
+`DEFAULT_NARRATOR_*`. Cross-volume narrator reuse (§6.4) works as-is. Because
+casting runs *before* the lecture stage builds prompts, the narrator descriptor
+is available to step 1's `prompt` assembly — same "cast before you write the
+descriptor prefix" ordering rationale as §2.4.
+
+### 13.5 Stages 4 / 5 / 6 — unchanged code
+
+- **s4 (TTS)** and **s5 (Mix)**: byte-identical code paths. One speaker → the
+  content-hash cache (§2.6) and `s4_retry.sh` behave exactly as in narration
+  mode. (Throughput is the same per-beat; a lecture book is usually shorter
+  audio than a novel.)
+- **s6 (Sync)**: the matcher is unchanged and benefits — verbatim `source_span`
+  means the `span-exact` bucket (§2.8) should dominate, with the fuzzy ladder
+  almost idle. The one **extension**: the non-prose visual elements recorded at
+  §13.2 are placed between beats with `after_beat_id` / `before_beat_id` /
+  `trigger_seconds`, **reusing the exact image-placement logic** already in
+  [s6_sync.py](src/lnvox/stages/s6_sync.py) (the `chapter_images` /
+  `after_beat`/`before_beat` walk). They join the manifest as a generalized
+  `visual_elements[]` list (illustrations are `kind:"image"`; the new kinds are
+  `code` / `table` / `figure` / `footnote` / `equation`). Because code and
+  tables were **rendered to PNG at ingest** (§13.2c), those elements carry a
+  `src` PNG and are displayed by ln-reader through the *same image-flip code
+  that already exists* — zero new reader work; only `footnote`/`equation` carry
+  HTML to render. The element appears when playback reaches `trigger_seconds`,
+  exactly like an illustration today — precisely the "handle it in the reader"
+  behaviour this mode targets.
+
+### 13.6 The normalize pass — contract
+
+A single prompt (`src/lnvox/llm/prompts/lecture_normalize.jinja`, new),
+schema-guided like every other LLM stage (§4). Its contract is **respell for
+the ear, never rewrite**:
+
+**MUST**: expand numbers/dates/ordinals to spoken words; verbalize units,
+currency, percentages, math operators (`%`→"percent", `=`→"equals",
+`×`→"times"); expand standard abbreviations (`e.g.`→"for example", `Fig.`→
+"Figure", `et al.`→"and others", `cf.`→"compare"); render URLs/emails
+speakably or elide to a short spoken form; keep sentence order and every
+content word.
+
+**MUST NOT**: paraphrase, summarize, add, drop, reorder, or add any emotional /
+performance direction; touch `source_span`. Output the *same words*, only
+respelled.
+
+The client already validates + retries (`structured()`), and on failure the
+beat falls back to `text = source_span` (verbatim) — so a flaky normalize call
+degrades to literal reading, never to a dropped beat. On the Apple-Silicon path
+(§11.2) this is the *only* stage exposed to the "no `guided_json`" limitation,
+and it degrades the same graceful way.
+
+### 13.7 Code surface (implemented)
+
+| Area | Change |
+|------|--------|
+| `src/lnvox/ingest/epub.py` | `--mode lecture` branch: run the §13.2a classification ladder; apply the §13.2b drop list; emit `visual_elements` (code/table/figure/footnote/equation) into `.epub_meta.json` alongside `images`. Narration mode unchanged. |
+| `src/lnvox/ingest/blocks.py` (new) | Block classifier: deterministic rules (DOM tags + `epub:type`/NCX landmarks + stem regex) → `{prose,code,table,figure,footnote,equation,drop}`, with the LLM fallback for untagged blocks. |
+| `src/lnvox/ingest/render.py` (new) | HTML→PNG renderer. Pygments-highlights code / styles tables → minimal HTML → Playwright (headless Chromium) → content-hash-named PNG in `images/`. Imports Playwright lazily so core install works without the `render` extra. |
+| `src/lnvox/ingest/text.py` | Lecture-mode helper to write the Narrator-only `01_characters.json` stub. |
+| `src/lnvox/stages/lecture.py` (new) | The §13.3 stage: deterministic split (reusing `split_paragraphs` + `_split_long_text`) + normalize pass → `03_directed/*.json`. Idempotent/cached per chapter. |
+| `src/lnvox/llm/prompts/lecture_normalize.jinja` (new) | The §13.6 normalize prompt. |
+| `src/lnvox/llm/prompts/block_classify.jinja` (new) | The §13.2a LLM-fallback classifier prompt (untagged blocks only). |
+| `src/lnvox/llm/schemas.py` | Small `NormalizedBeats` + `BlockClass` schemas for the two new LLM calls. `DirectedBeat`/`ChapterDirected` reused unchanged. |
+| `src/lnvox/stages/s6_sync.py` | Generalize `images[]` → `visual_elements[]` (add `kind` + the non-prose kinds); reuse the existing after/before-beat placement walk. Back-compat: images keep `kind:"image"`. |
+| `src/lnvox/cli.py` | New `lnvox lecture <book>` command; `--mode` + `--ingest-classifier {fallback,none}` plumbed where ingest needs it. |
+| `scripts/run_pipeline.sh` | `--mode lecture`: route ingest → voice cast → `lecture` → s4 → s5 → s6, skipping s1/s2/s3. Shrink (or with `--no-normalize`, drop) the vLLM phase. |
+| `pyproject.toml` | New optional `render` extra: `pygments`, `playwright` (+ a `playwright install chromium` setup step). Lazily imported — only needed when rendering code/tables. |
+| `config.yaml` | Optional `mode: narration\|lecture`, `lecture: { normalize: true }`, and `ingest: { drop: [toc, copyright-page, titlepage, index, bibliography] }`. |
+
+Nothing about the voicebank subsystem (§6), the Voicebank Studio (§12), the
+TTS cache/idempotency (§5), or the s4/s5 stage contracts changes.
+
+### 13.8 Known limitations the design accepts
+
+1. **Normalize is best-effort, not exhaustive.** Domain math (LaTeX-dense
+   passages), chemistry, dense tabular prose left inline, etc. will read
+   imperfectly. The fallback is always literal `source_span`, so the worst case
+   is "TTS does its raw best", never a crash or a dropped beat.
+2. **Structure detection is EPUB-grade.** `.txt` carries no structure (all
+   prose); `.md` is best-effort. A figure caption that an EPUB inlined as a
+   plain `<p>` will be narrated as prose — we don't second-guess the markup.
+3. **One narrator, whole book.** No per-chapter or per-POV voice changes
+   (lecture mode is for non-fiction; the §8 POV question is narration-mode
+   territory).
+4. **The normalize pass weakens the strict "verbatim to TTS" reading** the user
+   may have first imagined — but it preserves verbatim *sync* (`source_span`)
+   and never dramatizes, which is the actual requirement. `--no-normalize`
+   restores byte-literal TTS for anyone who wants it.
+5. **Rendering needs the `render` extra (Chromium).** Without Playwright
+   installed, code/table blocks are recorded as visual elements with their
+   verbatim `html` but **no PNG** — the reader falls back to rendering the HTML
+   itself. The pipeline never fails on a missing renderer; it degrades to
+   HTML-only elements and logs which blocks weren't rasterized.
+6. **A code/table that's audio-only is silent.** A listener with no companion
+   reader open hears nothing where a rendered block sat (the audio just skips
+   to the next prose beat). That's the intended tradeoff of "show it, don't read
+   it" — flagged so it's a conscious choice, not a surprise.
+
+### 13.9 What's explicitly **not** in this design
+
+- Reading non-prose blocks aloud (code-to-speech, table linearization). They
+  are visual elements only in v1.
+- Rasterizing `figure` / `footnote` / `equation` blocks (only `code`/`table`
+  are rendered to PNG in v1; the rest carry HTML for the reader).
+- Full markdown table/footnote/landmark detection (EPUB gets the full ladder;
+  `.md` is best-effort).
+- A bespoke lecture player UI — ln-reader's existing image-flip mechanism is
+  the integration surface.
+- Mixing lecture and narration within one book.

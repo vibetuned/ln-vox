@@ -30,6 +30,15 @@ voice = [
     "librosa>=0.10",
     "tqdm>=4.65",
 ]
+render = [
+    # Lecture mode (DESIGN.md §13.2c): rasterize code/tables to PNG.
+    # Pygments highlights code; Playwright (headless Chromium) does HTML→PNG.
+    # After install, run `playwright install chromium` once to fetch the
+    # browser. Both are imported lazily — lecture ingest degrades to HTML-only
+    # visual elements when this extra is absent.
+    "pygments>=2.17",
+    "playwright>=1.40",
+]
 tts = [
     # Dramabox is git-cloned (see scripts/setup_dramabox.sh) — its
     # requirements.txt is installed by that script and pins torch==2.8.

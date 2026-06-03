@@ -5,6 +5,11 @@
 #     ./scripts/run_pipeline.sh <series>/<volume-XX> [options]
 #
 # Options:
+#     --mode <m>               narration (default, multi-voice novel) or
+#                              lecture (single-voice non-fiction: no s1/s2/s3,
+#                              one `lnvox lecture` stage instead). See §13.
+#     --no-normalize           Lecture mode: skip the LLM speech-normalize pass
+#                              (read text verbatim — no LLM phase at all).
 #     --narrator-clip <id>     Voicebank clip id for the Narrator. Optional when
 #                              a previous volume of the same series already has
 #                              one assigned — it'll be inherited automatically.
@@ -37,6 +42,8 @@ set -uo pipefail
 OS="$(uname -s)"
 
 BOOK_ID=""
+MODE="narration"
+NO_NORMALIZE=0
 NARRATOR_CLIP=""
 BOOK_TITLE=""
 NOVELS_ROOT="novels"
@@ -54,13 +61,15 @@ VLLM_PID=""
 VLLM_LOG=""
 
 usage() {
-    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage 0 ;;
+        --mode)          MODE="$2";          shift 2 ;;
+        --no-normalize)  NO_NORMALIZE=1;     shift   ;;
         --narrator-clip) NARRATOR_CLIP="$2"; shift 2 ;;
         --book-title)    BOOK_TITLE="$2";   shift 2 ;;
         --novels-root)   NOVELS_ROOT="$2";  shift 2 ;;
@@ -80,6 +89,20 @@ done
 if [ -z "$BOOK_ID" ]; then
     echo "ERROR: book id (e.g. 'toaru/volume-01') is required" >&2
     usage 2
+fi
+
+if [ "$MODE" != "narration" ] && [ "$MODE" != "lecture" ]; then
+    echo "ERROR: --mode must be 'narration' or 'lecture' (got '$MODE')" >&2
+    usage 2
+fi
+
+# Does the LLM phase need a server at all? Narration always does. Lecture needs
+# it for the speech-normalize pass and/or auto-casting the Narrator — but a
+# lecture run with --no-normalize AND an explicit --narrator-clip makes zero LLM
+# calls, so we can skip standing up vLLM entirely.
+NEED_LLM=1
+if [ "$MODE" = "lecture" ] && [ "$NO_NORMALIZE" -eq 1 ] && [ -n "$NARRATOR_CLIP" ]; then
+    NEED_LLM=0
 fi
 
 BOOK_TITLE="${BOOK_TITLE:-$BOOK_ID}"
@@ -377,20 +400,32 @@ trap cleanup EXIT INT TERM
 if [ "$SKIP_LLM" -eq 1 ]; then
     banner "Skipping LLM phase (--skip-llm)"
 else
-    banner "Starting LLM phase"
-    if [ -z "$VLLM_URL" ]; then
+    banner "Starting LLM phase (mode=$MODE)"
+    if [ "$NEED_LLM" -eq 1 ] && [ -z "$VLLM_URL" ]; then
         prepare_llm_env
     fi
-    start_vllm
+    if [ "$NEED_LLM" -eq 1 ]; then
+        start_vllm
+    else
+        banner "Lecture + --no-normalize + --narrator-clip: no LLM needed, skipping vLLM"
+    fi
 
-    banner "Stage 0: ingest"
-    run_step - "Stage 0 (ingest)" uv run lnvox ingest "$NOVEL_DIR" --book-id "$BOOK_ID"
+    # Pre-retry hooks relaunch a dead vLLM — only meaningful when we manage one.
+    VC_HOOK="-"; LEC_HOOK="-"
+    [ "$NEED_LLM" -eq 1 ] && { VC_HOOK="ensure_vllm"; LEC_HOOK="ensure_vllm"; }
 
-    banner "Stage 1: cast extraction (with cross-volume merge if applicable)"
-    run_step ensure_vllm "Stage 1 (cast extraction)" uv run lnvox s1 "$BOOK_ID"
+    banner "Stage 0: ingest (mode=$MODE)"
+    run_step - "Stage 0 (ingest)" uv run lnvox ingest "$NOVEL_DIR" --book-id "$BOOK_ID" --mode "$MODE"
 
-    banner "Stage 2: scene segmentation"
-    run_step ensure_vllm "Stage 2 (scene segmentation)" uv run lnvox s2 "$BOOK_ID"
+    if [ "$MODE" = "narration" ]; then
+        banner "Stage 1: cast extraction (with cross-volume merge if applicable)"
+        run_step ensure_vllm "Stage 1 (cast extraction)" uv run lnvox s1 "$BOOK_ID"
+
+        banner "Stage 2: scene segmentation"
+        run_step ensure_vllm "Stage 2 (scene segmentation)" uv run lnvox s2 "$BOOK_ID"
+    else
+        banner "Lecture mode: skipping s1 (characters) and s2 (scenes)"
+    fi
 
     banner "Stage V: voice cast"
     # Narrator handling:
@@ -398,16 +433,27 @@ else
     #   - Not given AND prior volume      → matcher inherits prior Narrator clip.
     #   - Not given AND no prior volume   → matcher auto-casts the Narrator.
     if [ -n "$NARRATOR_CLIP" ]; then
-        run_step ensure_vllm "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID" --narrator-clip "$NARRATOR_CLIP"
+        run_step "$VC_HOOK" "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID" --narrator-clip "$NARRATOR_CLIP"
     else
-        run_step ensure_vllm "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID"
+        run_step "$VC_HOOK" "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID"
     fi
 
-    banner "Stage 3: director (uses voice cast metadata)"
-    run_step ensure_vllm "Stage 3 (director)" uv run lnvox s3 "$BOOK_ID" --regen-profiles
+    if [ "$MODE" = "narration" ]; then
+        banner "Stage 3: director (uses voice cast metadata)"
+        run_step ensure_vllm "Stage 3 (director)" uv run lnvox s3 "$BOOK_ID" --regen-profiles
+    else
+        banner "Stage L: lecture (split + speech-normalize → directed beats)"
+        if [ "$NO_NORMALIZE" -eq 1 ]; then
+            run_step "$LEC_HOOK" "Stage L (lecture)" uv run lnvox lecture "$BOOK_ID" --no-normalize
+        else
+            run_step "$LEC_HOOK" "Stage L (lecture)" uv run lnvox lecture "$BOOK_ID"
+        fi
+    fi
 
-    banner "LLM phase complete — stopping vLLM to free GPU for Dramabox"
-    stop_vllm
+    if [ "$NEED_LLM" -eq 1 ]; then
+        banner "LLM phase complete — stopping vLLM to free GPU for Dramabox"
+        stop_vllm
+    fi
 fi
 
 # ----- TTS phase -------------------------------------------------------------

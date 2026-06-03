@@ -44,6 +44,14 @@ def _filter_chapters(chapters, selected: Optional[str]):
 def ingest(
     folder: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
     book_id: Optional[str] = typer.Option(None, help="Defaults to folder name."),
+    mode: str = typer.Option(
+        "narration",
+        "--mode",
+        help=(
+            "narration (default) or lecture. In lecture mode a Narrator-only "
+            "01_characters.json stub is written so `voice cast` runs without s1."
+        ),
+    ),
 ):
     """Stage 0: Parse a folder of chapter .txt files into JSONL.
 
@@ -63,6 +71,17 @@ def ingest(
     out_dir = _book_dir(book_id)
     output = out_dir / "00_text.jsonl"
     write_jsonl(chapters, output)
+
+    # Lecture mode has no Stage 1 (no characters). Write a minimal cast so
+    # `lnvox voice cast` runs unchanged — cast_book() synthesizes the Narrator
+    # from an empty list. Don't clobber an existing real cast.
+    if mode == "lecture":
+        cast_file = out_dir / "01_characters.json"
+        if not cast_file.exists():
+            cast_file.write_text('{"characters": []}', encoding="utf-8")
+            console.print(
+                f"[dim]Lecture mode: wrote Narrator-only cast stub → {cast_file}[/]"
+            )
 
     # If this folder was produced by `ingest-epub`, propagate its metadata
     # (title, authors, cover image path) to the artifacts dir for later stages.
@@ -93,6 +112,25 @@ def ingest(
 def ingest_epub(
     epub_path: Path = typer.Argument(..., exists=True, dir_okay=False, file_okay=True),
     output_dir: Path = typer.Argument(..., help="Destination folder (e.g. novels/level99/volume-01)"),
+    mode: str = typer.Option(
+        "narration",
+        "--mode",
+        help=(
+            "narration (multi-voice novel) or lecture (single-voice non-fiction: "
+            "classify blocks, drop boilerplate, render code/tables to images). "
+            "See DESIGN.md §13."
+        ),
+    ),
+    classifier: str = typer.Option(
+        "fallback",
+        "--ingest-classifier",
+        help="Lecture mode: 'fallback' (LLM only on untagged blocks) or 'none' (rules only).",
+    ),
+    no_render: bool = typer.Option(
+        False,
+        "--no-render",
+        help="Lecture mode: skip rasterizing code/tables to PNG (record HTML-only).",
+    ),
 ):
     """Stage 0a: Extract an EPUB into the novels/-folder layout.
 
@@ -104,10 +142,30 @@ def ingest_epub(
     """
     from lnvox.ingest.epub import extract_epub
 
-    console.print(f"Extracting [bold]{epub_path}[/] → [bold]{output_dir}[/]…")
+    if mode not in ("narration", "lecture"):
+        console.print(f"[red]--mode must be 'narration' or 'lecture', got {mode!r}.[/]")
+        raise typer.Exit(2)
+
+    # Lecture mode uses the LLM only as a fallback classifier (§13.2a). Build a
+    # client lazily so narration extraction never needs an endpoint.
+    llm = None
+    if mode == "lecture" and classifier == "fallback":
+        llm = LLMClient()
+        console.print(
+            f"[dim]Block classifier fallback via {llm.settings.llm.endpoint} "
+            f"(model={llm.settings.llm.model})[/]"
+        )
+
+    console.print(
+        f"Extracting [bold]{epub_path}[/] → [bold]{output_dir}[/] (mode={mode})…"
+    )
     meta = extract_epub(
         epub_path,
         output_dir,
+        mode=mode,
+        classifier=classifier,
+        render=not no_render,
+        llm=llm,
         progress=lambda m: console.print(f"[dim]{m}[/]"),
     )
 
@@ -120,6 +178,8 @@ def ingest_epub(
     table.add_row("cover image", meta.cover_image or "—")
     table.add_row("images", str(len(meta.images)))
     table.add_row("chapters", str(len(meta.chapters)))
+    if meta.visual_elements:
+        table.add_row("visual elements", str(len(meta.visual_elements)))
     console.print(table)
 
 
@@ -332,6 +392,83 @@ def stage3(
         n_d = sum(1 for s in r.scenes for b in s.beats if b.type == "dialogue")
         table.add_row(r.chapter_id, str(len(r.scenes)), str(beats), str(n_d))
     console.print(table)
+
+
+@app.command(name="lecture")
+def stage_lecture(
+    book_id: str,
+    chapters: Optional[str] = typer.Option(None, help="Comma-separated chapter ids (default: all)."),
+    no_normalize: bool = typer.Option(
+        False,
+        "--no-normalize",
+        help="Skip the LLM speech-normalize pass; read text verbatim (text == source_span).",
+    ),
+):
+    """Lecture mode: build single-voice narration beats (replaces s1/s2/s3).
+
+    Splits each chapter's prose into TTS-sized narration beats and (unless
+    --no-normalize) speech-normalizes each beat's text while keeping source_span
+    verbatim. Writes 03_directed/*.json directly, so s4/s5/s6 run unchanged.
+
+    Run AFTER `lnvox voice cast <book> --narrator-clip …` so the narrator's
+    descriptor is available. See DESIGN.md §13.3.
+    """
+    from lnvox.stages import lecture as lecture_stage
+
+    out_dir = _book_dir(book_id)
+    text_file = out_dir / "00_text.jsonl"
+    assign_file = out_dir / "04_voice_assignments.json"
+    if not text_file.exists():
+        console.print(f"[red]Missing ingest output at {text_file}. Run `lnvox ingest`.[/]")
+        raise typer.Exit(1)
+
+    selected = _filter_chapters(read_jsonl(text_file), chapters)
+    if not selected:
+        console.print(f"[red]No chapters matched filter '{chapters}'.[/]")
+        raise typer.Exit(1)
+
+    casting = None
+    if assign_file.exists():
+        casting = BookCasting.model_validate_json(assign_file.read_text(encoding="utf-8"))
+    else:
+        console.print(
+            f"[yellow]No {assign_file} — using the default narrator descriptor. "
+            f"Run `lnvox voice cast {book_id} --narrator-clip …` for a real voice.[/]"
+        )
+
+    client = None
+    if not no_normalize:
+        client = LLMClient()
+        console.print(
+            f"[dim]Speech-normalize via {client.settings.llm.endpoint} "
+            f"(model={client.settings.llm.model})[/]"
+        )
+    else:
+        console.print("[dim]--no-normalize: reading text verbatim (no LLM).[/]")
+
+    console.print(
+        f"Building lecture beats for {len(selected)} chapter(s) "
+        f"(narrator: {lecture_stage.narrator_descriptor(casting)})…"
+    )
+
+    def _progress(result):
+        n = sum(len(s.beats) for s in result.scenes)
+        console.print(f"  [green]✓[/] {result.chapter_id}: {n} narration beat(s)")
+
+    results = lecture_stage.run(
+        selected,
+        out_dir,
+        casting=casting,
+        client=client,
+        normalize=not no_normalize,
+        on_chapter_done=_progress,
+    )
+
+    total = sum(len(s.beats) for r in results for s in r.scenes)
+    console.print(
+        f"[green]Done.[/] {total} beat(s) across {len(results)} chapter(s) "
+        f"→ {out_dir / '03_directed'}/"
+    )
 
 
 def _default_tts_device() -> str:

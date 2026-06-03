@@ -435,7 +435,7 @@ def direct_scene(
             descriptor = profile_map.get(speaker, "voice unknown")
             cue = cues_by_line.get(line_no, "").strip()
             direction = f"{descriptor}, {cue}" if cue else descriptor
-        prompt = f'[{direction}]\n"{b.text}"'
+        prompt = f'{direction}, "{b.text}"'
         directed_beats.append(
             DirectedBeat(
                 type=b.type,

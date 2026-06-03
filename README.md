@@ -37,6 +37,11 @@ the VRAM):
 
 Stage 5 runs on CPU/ffmpeg only.
 
+> **Non-fiction?** For technical / reference books there's a single-voice
+> **lecture mode** that reads the text as written (no dramatization) and shows
+> code/tables/figures as images instead of narrating them. Jump to
+> [Lecture mode](#lecture-mode-non-fiction--technical-books).
+
 ---
 
 ## One-time setup
@@ -201,6 +206,85 @@ outputs.
 
 ---
 
+## Lecture mode (non-fiction / technical books)
+
+Narration mode (above) is built for novels: multi-voice, character casting,
+emotionally-acted delivery. **Lecture mode** is the opposite — a single steady
+narrator reading the text *as written*, for non-fiction and technical books.
+No characters, no scene segmentation, no dramatization. See
+[DESIGN.md §13](DESIGN.md) for the full design.
+
+What it does differently:
+
+- **Collapses s1 + s2 + s3 into one `lnvox lecture` stage.** No character or
+  scene LLM passes. The text is split into TTS-sized narration beats; each
+  beat's `source_span` stays verbatim (so Stage-6 sync is near-perfect).
+- **Speech-normalizes** each beat for the ear (`1973` → "nineteen
+  seventy-three", `Fig. 3` → "Figure three", `42%` → "forty-two percent")
+  without rewriting or dramatizing. `--no-normalize` reads the text byte-literal
+  and skips the LLM entirely.
+- **Never narrates code / tables / figures.** During EPUB import they're
+  classified out of the prose, **rendered to PNG** (code is syntax-highlighted),
+  and surfaced by Stage 6 as *visual elements* the reader displays at the right
+  timestamp — exactly like illustrations. Boilerplate (TOC, copyright, index)
+  is dropped.
+
+### Launch the whole pipeline in lecture mode
+
+One command, same launcher as narration — just add `--mode lecture`:
+
+```bash
+# 1. Import the EPUB in lecture mode (classify blocks, drop boilerplate,
+#    render code/tables to images). Needs the `render` extra (see below).
+uv run lnvox ingest-epub epubs/nonfiction/book.epub novels/nonfiction/book --mode lecture
+
+# 2. Run the full pipeline: ingest → voice cast → lecture → s4 → s5 → s6.
+#    s1/s2/s3 are skipped automatically. Pick a narrator clip by ear (lecture
+#    mode is 100% narrator, so this matters most here).
+./scripts/run_pipeline.sh nonfiction/book \
+    --mode lecture \
+    --narrator-clip cv_051e865815e5 \
+    --book-title "Book Title — Subtitle"
+```
+
+Flags specific to lecture mode:
+
+- `--mode lecture` — required; routes ingest → voice cast → `lnvox lecture`,
+  skipping s1/s2/s3.
+- `--no-normalize` — read the text verbatim (no speech-normalize LLM pass).
+  Combined with `--narrator-clip`, the launcher makes **zero** LLM calls and
+  **skips vLLM entirely** — the run is ingest → cast → split → TTS → mix.
+
+### The `render` extra (code/table images)
+
+Rendering code and tables to PNG uses Pygments + headless Chromium, kept out of
+the core install:
+
+```bash
+uv sync --extra render
+uv run playwright install chromium   # one-time browser download (~115 MB)
+```
+
+Without it, lecture ingest still works — code/table blocks are recorded as
+HTML-only visual elements (no PNG), and the pipeline never fails on a missing
+renderer. Pass `--no-render` to `ingest-epub` to skip rasterization explicitly.
+
+### Lecture-mode stages (advanced / re-runs)
+
+| Stage | Command | Notes |
+|---|---|---|
+| 0a | `lnvox ingest-epub <epub> <out> --mode lecture [--no-render] [--ingest-classifier none]` | Classifies blocks, drops boilerplate, renders code/tables → `images/`, records `visual_elements` in `.epub_meta.json`. |
+| 0 | `lnvox ingest novels/<book> --book-id <book> --mode lecture` | Writes `00_text.jsonl` + a Narrator-only `01_characters.json` stub (no s1). |
+| V | `lnvox voice cast <book> --narrator-clip cv_…` | Casts only the Narrator. |
+| L | `lnvox lecture <book> [--no-normalize]` | Split + speech-normalize → `03_directed/*.json`. **Replaces s1/s2/s3.** |
+| 4–6 | (unchanged) | `s4_retry.sh`, `lnvox s5`, `lnvox s6` run exactly as in narration mode. |
+
+`--ingest-classifier` controls the block classifier: `fallback` (default — the
+LLM is consulted *only* for untagged/ambiguous blocks) or `none` (rules-only,
+no LLM in ingest at all).
+
+---
+
 ## Stage 6 — sync layer (optional, post-stage-5)
 
 For players that highlight the current beat in sync with audio playback
@@ -267,7 +351,7 @@ The matcher runs in **two passes per chapter** (all of a chapter's
      top-level `match_confidence` histogram. Audio timings are cumulative
      through the Stage-5 silence layout (the silence flags must match Stage 5).
    - `images[]` in the same manifest — one entry per embedded illustration,
-     including light-novel insert/color/bonus pages that live as their own
+     including novel insert/color/bonus pages that live as their own
      spine items: `{src, xhtml, spine_page, after_chapter, before_chapter,
        after_beat_id, before_beat_id, trigger_seconds}`. The player flips to
      `src` when playback reaches `trigger_seconds` (= the start of

@@ -158,9 +158,14 @@ class DirectedBeat(BaseModel):
     type: BeatType
     text: str
     speaker: str  # always set — "Narrator" for narration
-    direction: str  # stage-direction body that goes inside the [ ... ] brackets
-    prompt: str  # final Dramabox-ready string: [direction]\n"text"
+    direction: str  # voice + performance descriptor that prefixes the line
+    prompt: str  # final Dramabox-ready string: `<direction>, "<text>"`
     source_span: str = ""  # carried through from Stage 2 for the sync stage
+    # Chapter-global paragraph index this beat was split from (lecture mode
+    # only; -1 in narration mode). Lets Stage 6 place ingest-extracted visual
+    # elements (code/table/figure), which carry an `after_paragraph`, against
+    # the beat that covers that paragraph. See DESIGN.md §13.2/§13.5.
+    source_paragraph: int = -1
 
 
 class DirectedScene(BaseModel):
@@ -172,3 +177,38 @@ class DirectedScene(BaseModel):
 class ChapterDirected(BaseModel):
     chapter_id: str
     scenes: list[DirectedScene]
+
+
+# ---------- Lecture mode (DESIGN.md §13) ----------
+
+
+# Block kinds the lecture-mode ingest classifier emits. `prose` (and headings,
+# folded into prose) is narrated; `drop` is excised entirely; the rest become
+# reader-side visual elements (§13.2).
+BlockKind = Literal[
+    "prose", "code", "table", "figure", "footnote", "equation", "drop"
+]
+
+
+class BlockClass(BaseModel):
+    """LLM-fallback classification of ONE untagged block (§13.2a step 2).
+
+    Only blocks the deterministic rules can't classify reach the LLM, so this
+    is a tiny, cheap call. `reason` is kept for debugging the classifier's
+    judgment on messy publisher markup."""
+
+    kind: BlockKind
+    reason: str = ""
+
+
+class NormalizedBeat(BaseModel):
+    """One beat's speech-normalized text, keyed back by its 0-indexed position
+    in the batch sent to the normalize pass (§13.6)."""
+
+    index: int
+    text: str
+
+
+class NormalizedBeats(BaseModel):
+    # maxItems caps a runaway model in the guided schema only (see Character).
+    beats: list[NormalizedBeat] = Field(json_schema_extra={"maxItems": 200})
