@@ -296,8 +296,8 @@ assigned reference clip and can generate a voice descriptor that's
 2. Emotional state inferred from local context (prior 2 beats + current).
 3. Performance cues (`whispered`, `interrupted`, `laughs softly`).
 
-A merge pass fuses consecutive same-speaker beats (capped at ~500 chars per
-beat, the empirically-validated sweet spot for Dramabox quality — see §2.6).
+A merge pass fuses consecutive same-speaker beats (capped at 375 chars per
+beat — short beats keep Dramabox's noise/intelligibility in check; see §2.6).
 
 Output: `03_directed/<chapter_id>.json` — same shape as scenes, but each
 dialogue beat gains a `direction` string and a `prompt` field with the
@@ -317,10 +317,11 @@ For each beat in scene order:
 
 Output: `05_audio/<chapter_id>/<beat_id>.wav` + `manifest.json` per chapter.
 
-**Beat length matters.** Empirically Dramabox renders best between 20–60 s of
-audio (~250–700 chars of English text). The Director's merge pass caps
-fused beats at ~500 chars and the prompt pipeline splits any longer source
-narration at sentence boundaries before this stage runs.
+**Beat length matters.** Empirically Dramabox renders best on shorter beats —
+longer text raises its noise floor and can slur into unintelligible speech. The
+Director's merge pass caps fused beats at 375 chars (~30 s) and the prompt
+pipeline splits any longer source narration at sentence boundaries before this
+stage runs.
 
 **Auto-retry.** Long Dramabox runs can SIGKILL after 10–15 min of continuous
 denoise (likely CUDA fragmentation on RTX 50-series). The bundled
@@ -1125,8 +1126,8 @@ which finds characters or scenes:
 
 1. **Deterministic beat split.** Split each chapter into paragraphs with
    `split_paragraphs` ([chunker.py:95](src/lnvox/llm/chunker.py#L95)), then
-   sentence-group each paragraph into beats ≤ `MAX_MERGED_BEAT_CHARS` (~500
-   chars / ~40 s) by **reusing `_split_long_text`**
+   sentence-group each paragraph into beats ≤ `MAX_MERGED_BEAT_CHARS` (375
+   chars / ~30 s) by **reusing `_split_long_text`**
    ([s3_director.py:269](src/lnvox/stages/s3_director.py#L269)) — the exact
    length policy Dramabox wants (§2.6). Every beat is `type:"narration"`,
    `speaker:"Narrator"`, and its `source_span` is the **verbatim** contiguous

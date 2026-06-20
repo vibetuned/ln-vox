@@ -46,8 +46,10 @@ DEFAULT_NARRATOR_AGE = "adult"
 DEFAULT_NARRATOR_ACCENT = "england"
 
 # Dramabox recommends 20-60 seconds per generation; English narration runs
-# roughly 12 chars/second so we cap merged beats at ~500 chars (~40s audio).
-MAX_MERGED_BEAT_CHARS = 500
+# roughly 12 chars/second. We cap merged beats at 375 chars (~30s audio):
+# beyond that Dramabox's denoise quality drops — noise rises and the voice can
+# slur into unintelligible speech — so we stay well under the upper bound.
+MAX_MERGED_BEAT_CHARS = 375
 
 
 def format_prompt(direction: str, text: str) -> str:

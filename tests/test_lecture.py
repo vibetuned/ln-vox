@@ -134,9 +134,11 @@ def test_split_chapter_verbatim_and_paragraph_index():
 def test_long_paragraph_splits_at_sentences():
     long_para = " ".join(f"Sentence number {i}." for i in range(80))
     ch = Chapter(chapter_id="01", title="T", text=long_para)
+    from lnvox.stages.s3_director import MAX_MERGED_BEAT_CHARS
+
     beats = lecture.split_chapter(ch)
     assert len(beats) > 1
-    assert all(len(b.text) <= 500 for b in beats)
+    assert all(len(b.text) <= MAX_MERGED_BEAT_CHARS for b in beats)
     # All sub-beats came from paragraph 0.
     assert all(b.source_paragraph == 0 for b in beats)
 

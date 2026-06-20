@@ -466,9 +466,10 @@ beat.
 
 ### Beat length
 
-Empirically Dramabox sounds best on 20–60 s beats (~250–700 chars). The
-Director's merge pass caps at ~500 chars. If a source narration paragraph
-is itself longer than that, it's auto-split at sentence boundaries before
+Empirically Dramabox sounds best on shorter beats — longer text raises its
+noise floor and can slur into unintelligible speech. The Director's merge pass
+caps at 375 chars (~30 s; `MAX_MERGED_BEAT_CHARS` in `s3_director.py`); a source
+narration paragraph longer than that is auto-split at sentence boundaries before
 TTS.
 
 ### Disk
