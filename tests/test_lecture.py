@@ -147,7 +147,8 @@ def test_direct_chapter_builds_prompt_without_llm():
     assert cd.chapter_id == "03"
     beat = cd.scenes[0].beats[0]
     assert beat.direction == "adult, British, male, clear voice"
-    assert beat.prompt == 'adult, British, male, clear voice, "Hello world."'
+    # Dramabox format: direction lowercased, commas → ' - ', wrapped in parens.
+    assert beat.prompt == '(adult - british - male - clear voice) "Hello world."'
     assert cd.scenes[0].scene_id == "03_s1"
 
 

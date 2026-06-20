@@ -160,6 +160,10 @@ The launcher manages vLLM and Dramabox transparently:
 2. Runs ingest → s1 → s2 → voice cast → s3 against the local vLLM.
 3. **Stops vLLM** to free the GPU.
 4. Runs s4 (Dramabox, with auto-retry) → s5 (mix to .m4b).
+5. Runs s6 (sync layer) when the source EPUB is present — produces the synced
+   EPUB + `sync_manifest.json`. Skipped automatically for a `.txt`-only book;
+   pass `--skip-sync` to opt out, or `--epub <path>` to point at a non-default
+   EPUB location.
 
 If you already have a vLLM serving (e.g. on a separate GPU), pass
 `--vllm-url http://host:8000/v1` to skip auto-start..gitignore
@@ -285,14 +289,17 @@ no LLM in ingest at all).
 
 ---
 
-## Stage 6 — sync layer (optional, post-stage-5)
+## Stage 6 — sync layer
 
-For players that highlight the current beat in sync with audio playback
-(WebKit-based reader apps, Plex audiobooks, Audiobookshelf, a custom front-end)
-the pipeline can re-align the Stage-3 beats back onto the original EPUB's
+The launcher runs this automatically as its final step whenever the source
+EPUB is present (skip it with `--skip-sync`, or run it standalone with
+`lnvox s6 <book>`). For players that highlight the current beat in sync with
+audio playback (WebKit-based reader apps, Plex audiobooks, Audiobookshelf, a
+custom front-end) it re-aligns the Stage-3 beats back onto the original EPUB's
 XHTML. The output is a copy of the EPUB with `<span id="<beat_id>">` wrappers
 around each beat's text plus a sidecar JSON mapping `beat_id → span_id →
-audio timing`.
+audio timing`. In lecture mode the same `sync_manifest.json` also carries the
+`visual_elements` (rendered code/tables/figures) with their `trigger_seconds`.
 
 ### Algorithm
 
@@ -498,6 +505,43 @@ on cloned-from-living-people references without explicit consent.
 | Narrator voice doesn't match descriptor | Stage order pre-dates the v2 fix | Re-run s3 with `--regen-profiles` AFTER voice cast |
 | Empty `accent` distribution in voicebank | TSV had pipe-separated accents | Fix `_normalize_accent` (already in `voices/common_voice.py`); re-seed |
 | Dramabox renders sound rushed | Long beats (>60 s) | Lower `MAX_MERGED_BEAT_CHARS` in `s3_director.py`, re-run s3 |
+| `No module named 'av'` / `requires accelerate` / `mamba-ssm` build fails when loading Dramabox | Dramabox env mixed with `--extra serve` (torch 2.8 vs 2.11 conflict), or `uv sync` pruned Dramabox's deps | Use a TTS-only env: `uv sync --extra voice --extra tts && ./scripts/setup_dramabox.sh` (see [Voicebank Studio & TTS Lab](#voicebank-studio--tts-lab)) |
+
+---
+
+## Voicebank Studio & TTS Lab
+
+`scripts/voicebank_studio.py` is a standalone PySide6 GUI for curating the
+voicebank by ear (listen, import from Common Voice, add/erase clips, cast
+characters) and, in its **TTS Lab** tab, auditioning Dramabox prompts — handy
+for finding how to phrase a direction so Dramabox *performs* it instead of
+reading it aloud. See [DESIGN.md §12](DESIGN.md).
+
+The first three tabs need only the `voice` extra:
+
+```bash
+uv pip install PySide6                       # GUI toolkit (dev-only, not a project dep)
+uv run python scripts/voicebank_studio.py
+```
+
+### TTS Lab — set up the Dramabox env
+
+The **TTS Lab** tab loads the Dramabox model (only when you click its
+**"⚙ Load model"** button — never on startup or when using the other tabs), so
+it needs Dramabox's runtime installed. Set it up in the **TTS environment**:
+
+```bash
+uv sync --extra voice --extra tts            # NOT --extra serve
+./scripts/setup_dramabox.sh                  # installs Dramabox + its deps
+```
+
+**Don't combine it with `--extra serve`.** vLLM (the `serve` extra) needs
+`torch>=2.11`, Dramabox pins `torch==2.8`, and they can't share a venv — which
+is exactly why the pipeline runs the LLM and TTS phases as separate stages with
+separate environments (`run_pipeline.sh` swaps between them). Mixing them is
+what causes `No module named 'av'` and the `mamba-ssm` build failures. Use the
+TTS env above for the Studio; run `uv sync --extra serve …` again when you go
+back to the LLM stages.
 
 ---
 
@@ -536,3 +580,4 @@ data/<cv-corpus-…>/                      Raw Common Voice extraction
 
 
 
+ ./scripts/run_pipeline.sh ascendance/volume-06 --skip-llm --book-title 'Ascendance of a Bookworm - Part 2 Apprentice Shrine Maiden v03'

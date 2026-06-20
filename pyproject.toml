@@ -17,7 +17,11 @@ dependencies = [
 serve = [
     # Linux/CUDA LLM phase. vLLM has no macOS wheels, so the whole extra
     # is marker-gated. The Apple Silicon equivalent is the `mlx` extra.
-    "vllm>=0.19.0 ; sys_platform == 'linux'",
+    # vLLM is pulled from the nightly wheel index (see [tool.uv.sources]
+    # and the vllm-nightly index below); nightly builds carry `.dev`
+    # versions, hence the global `prerelease = "allow"` in [tool.uv].
+    "vllm>=0.22.0 ; sys_platform == 'linux'",
+    "transformers>=5.10.1 ; sys_platform == 'linux'",
     "torch ; sys_platform == 'linux'",
 ]
 mlx = [
@@ -64,6 +68,10 @@ packages = ["src/lnvox"]
 
 [tool.uv]
 package = true
+# Nightly vLLM wheels are versioned as `.dev` builds, so prereleases must
+# be allowed for the resolver to accept them. This is global, but the
+# nightly index below is `explicit`, so only vllm is sourced from it.
+prerelease = "allow"
 
 [tool.uv.sources]
 # Linux-only: pull torch from the cu130 wheel index. macOS picks up the
@@ -72,8 +80,18 @@ package = true
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
 ]
+# Linux-only: pull vLLM from its nightly wheel index (cu130 variant to
+# match torch above). Marker-gated so `uv sync` on macOS is unaffected.
+vllm = [
+    { index = "vllm-nightly", marker = "sys_platform == 'linux'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-nightly"
+url = "https://wheels.vllm.ai/nightly/cu130"
 explicit = true

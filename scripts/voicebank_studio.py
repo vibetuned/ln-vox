@@ -46,6 +46,7 @@ try:
         QComboBox,
         QDialog,
         QDialogButtonBox,
+        QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
         QGroupBox,
@@ -84,6 +85,7 @@ except ImportError as e:  # pragma: no cover
     )
 
 from lnvox.voices import manifest as voice_manifest
+from lnvox.voices.matcher import descriptor_from_clip
 from lnvox.voices.common_voice import (
     _AGE_MAP,
     _GENDER_MAP,
@@ -275,6 +277,99 @@ class BuildWorker(QThread):
                 tsv_name=self.tsv_name,
             )
             self.built.emit(clip)
+        except Exception as e:  # pragma: no cover
+            self.failed.emit(str(e))
+
+
+class TtsLoadWorker(QThread):
+    """Load the Dramabox model once, off the GUI thread (DESIGN.md §2.6).
+
+    Heavy (downloads ~15 GB on first run, then loads into VRAM), so the import
+    of `lnvox.tts.dramabox_client` is deliberately kept inside `run()` — the
+    Studio launches (and its other tabs work) with no torch / Dramabox present.
+    """
+
+    loaded = Signal(object, str)  # (DramaboxClient, resolved_device)
+    failed = Signal(str)
+
+    def __init__(self, device: str) -> None:
+        super().__init__()
+        self.device = device
+
+    def run(self) -> None:
+        try:
+            resolved = self.device
+            if resolved == "auto":
+                resolved = "cuda"
+                try:
+                    import torch
+
+                    if torch.backends.mps.is_available():
+                        resolved = "mps"
+                    elif not torch.cuda.is_available():
+                        resolved = "cpu"
+                except Exception:
+                    pass
+            from lnvox.tts.dramabox_client import DramaboxClient
+
+            client = DramaboxClient(device=resolved)
+            self.loaded.emit(client, resolved)
+        except ModuleNotFoundError as e:  # pragma: no cover
+            # Dramabox's runtime deps live in external/DramaBox/requirements.txt,
+            # not the project's pyproject — and `uv sync` prunes them. Point the
+            # user at the torch-safe reinstall (the launcher does this in
+            # prepare_tts_env; the standalone Studio doesn't).
+            self.failed.emit(
+                f"Missing Python module: {e}.\n\n"
+                "This is a Dramabox runtime dependency (declared in "
+                "external/DramaBox/requirements.txt), which `uv sync` prunes.\n\n"
+                "Quick fix for this one:\n"
+                f"    uv pip install \"{e.name}\"\n\n"
+                "Restore all of them WITHOUT downgrading torch:\n"
+                "    grep -viE '^(torch|torchaudio|torchvision)' \\\n"
+                "      external/DramaBox/requirements.txt | uv pip install -r /dev/stdin"
+            )
+        except Exception as e:  # pragma: no cover
+            self.failed.emit(str(e))
+
+
+class TtsGenWorker(QThread):
+    """Render one prompt to a wav with an already-loaded DramaboxClient."""
+
+    done = Signal(str)  # output wav path
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        client,
+        *,
+        prompt: str,
+        output_path: Path,
+        voice_ref: Path | None,
+        seed: int,
+        cfg_scale: float,
+        stg_scale: float,
+    ) -> None:
+        super().__init__()
+        self.client = client
+        self.prompt = prompt
+        self.output_path = output_path
+        self.voice_ref = voice_ref
+        self.seed = seed
+        self.cfg_scale = cfg_scale
+        self.stg_scale = stg_scale
+
+    def run(self) -> None:
+        try:
+            self.client.generate(
+                prompt=self.prompt,
+                output_path=self.output_path,
+                voice_ref=self.voice_ref,
+                seed=self.seed,
+                cfg_scale=self.cfg_scale,
+                stg_scale=self.stg_scale,
+            )
+            self.done.emit(str(self.output_path))
         except Exception as e:  # pragma: no cover
             self.failed.emit(str(e))
 
@@ -1103,6 +1198,290 @@ class CastingTab(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+#  TTS Lab tab — load Dramabox once, A/B-test how prompts/directions sound
+# --------------------------------------------------------------------------- #
+class TtsLabTab(QWidget):
+    """Audition Dramabox prompts against a chosen voice clip.
+
+    The model is loaded ONCE, manually, via the "Load model" button — never on
+    construction or when other tabs are used (Dramabox is ~15 GB in VRAM). Use
+    it to find the best way to write a direction/description: the format buttons
+    compose the same description + line into different shapes (`desc, "line"`
+    vs `[desc] "line"` vs just `"line"`, …) so you can hear which leaks the
+    description into the narration. Keep the seed fixed to isolate the prompt.
+    """
+
+    # (label, template using {desc} and {line})
+    FORMATS = [
+        ("comma", '{desc}, "{line}"'),
+        ("brackets", '[{desc}] "{line}"'),
+        ("brackets+NL", '[{desc}]\n"{line}"'),
+        ("period", '{desc}. "{line}"'),
+        ("colon", '{desc}: "{line}"'),
+        ("dash", '{desc} — "{line}"'),
+        ("line only", '"{line}"'),
+    ]
+
+    def __init__(self, store: VoicebankStore, player: AudioPlayer) -> None:
+        super().__init__()
+        self.store = store
+        self.player = player
+        self.client = None  # DramaboxClient once loaded
+        self.loader: TtsLoadWorker | None = None
+        self.gen: TtsGenWorker | None = None
+        self._tts_dir = Path(tempfile.mkdtemp(prefix="vbstudio_tts_"))
+        self._gen_count = 0
+
+        layout = QVBoxLayout(self)
+
+        # --- model load row ---------------------------------------------- #
+        load_box = QGroupBox("Model")
+        load_l = QHBoxLayout(load_box)
+        load_l.addWidget(QLabel("Device:"))
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(["auto", "cuda", "mps", "cpu"])
+        load_l.addWidget(self.device_combo)
+        self.load_btn = QPushButton("⚙ Load model")
+        self.load_btn.clicked.connect(self._load_model)
+        load_l.addWidget(self.load_btn)
+        self.model_status = QLabel("Not loaded — Dramabox loads only when you click Load.")
+        self.model_status.setStyleSheet("color: gray;")
+        load_l.addWidget(self.model_status, 1)
+        layout.addWidget(load_box)
+
+        # --- voice selection --------------------------------------------- #
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(QLabel("Voice:"))
+        self.voice_combo = QComboBox()
+        self.voice_combo.currentIndexChanged.connect(self._on_voice_changed)
+        voice_row.addWidget(self.voice_combo, 1)
+        self.play_ref_btn = QPushButton("▶ Play reference")
+        self.play_ref_btn.clicked.connect(self._play_reference)
+        voice_row.addWidget(self.play_ref_btn)
+        layout.addLayout(voice_row)
+
+        # --- prompt composer --------------------------------------------- #
+        compose = QGroupBox("Compose")
+        compose_l = QFormLayout(compose)
+        self.desc_edit = QLineEdit()
+        self.desc_edit.setPlaceholderText("voice / performance description (e.g. adult, British, male, weary)")
+        desc_row = QHBoxLayout()
+        desc_row.addWidget(self.desc_edit, 1)
+        from_clip = QPushButton("↩ from clip")
+        from_clip.setToolTip("Fill the description from the selected voice clip's metadata")
+        from_clip.clicked.connect(self._desc_from_clip)
+        desc_row.addWidget(from_clip)
+        compose_l.addRow("Description:", self._wrap(desc_row))
+
+        self.line_edit = QLineEdit()
+        self.line_edit.setPlaceholderText("the spoken line, e.g. The duke turned from the window.")
+        compose_l.addRow("Line:", self.line_edit)
+
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Insert as:"))
+        for label, template in self.FORMATS:
+            b = QPushButton(label)
+            b.setToolTip(template.replace("\n", "\\n"))
+            b.clicked.connect(lambda _=False, t=template: self._apply_format(t))
+            fmt_row.addWidget(b)
+        fmt_row.addStretch(1)
+        compose_l.addRow("", self._wrap(fmt_row))
+        layout.addWidget(compose)
+
+        # --- the actual prompt sent to Dramabox -------------------------- #
+        layout.addWidget(QLabel("Prompt sent to Dramabox (edit freely):"))
+        self.prompt_edit = QPlainTextEdit()
+        self.prompt_edit.setPlaceholderText('e.g.  adult, British, male, weary, "You\'re late."')
+        self.prompt_edit.setFixedHeight(80)
+        layout.addWidget(self.prompt_edit)
+
+        # --- generation params ------------------------------------------- #
+        params = QHBoxLayout()
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 2_147_483_647)
+        self.seed_spin.setValue(42)
+        self.cfg_spin = QDoubleSpinBox()
+        self.cfg_spin.setRange(0.0, 10.0)
+        self.cfg_spin.setSingleStep(0.5)
+        self.cfg_spin.setValue(2.5)
+        self.stg_spin = QDoubleSpinBox()
+        self.stg_spin.setRange(0.0, 10.0)
+        self.stg_spin.setSingleStep(0.5)
+        self.stg_spin.setValue(1.5)
+        for lbl, w, tip in [
+            ("Seed:", self.seed_spin, "Keep fixed to compare prompts fairly."),
+            ("cfg_scale:", self.cfg_spin, "Prompt adherence."),
+            ("stg_scale:", self.stg_spin, "Spatial/temporal guidance."),
+        ]:
+            label = QLabel(lbl)
+            label.setToolTip(tip)
+            params.addWidget(label)
+            params.addWidget(w)
+        params.addStretch(1)
+        self.gen_btn = QPushButton("▶ Generate & play")
+        self.gen_btn.clicked.connect(self._generate)
+        params.addWidget(self.gen_btn)
+        layout.addLayout(params)
+
+        # --- history ----------------------------------------------------- #
+        hist_box = QGroupBox("History (double-click to replay)")
+        hist_l = QVBoxLayout(hist_box)
+        self.history = QListWidget()
+        self.history.itemDoubleClicked.connect(self._replay)
+        hist_l.addWidget(self.history)
+        layout.addWidget(hist_box, 1)
+
+        self.status = QLabel("")
+        layout.addWidget(self.status)
+
+        self.refresh_voices()
+        self._update_enabled()
+
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        w.setLayout(layout)
+        return w
+
+    # -- voices ------------------------------------------------------------ #
+    def refresh_voices(self) -> None:
+        current = self.voice_combo.currentData()
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        self.voice_combo.addItem("(no reference — Dramabox default voice)", None)
+        for c in sorted(self.store.clips, key=lambda c: c.id):
+            self.voice_combo.addItem(
+                f"{c.id}  ·  {c.gender}/{c.age_band}/{c.accent}", c.id
+            )
+        # Restore prior selection if it survived a reload.
+        idx = self.voice_combo.findData(current) if current else 0
+        self.voice_combo.setCurrentIndex(max(0, idx))
+        self.voice_combo.blockSignals(False)
+
+    def _selected_clip(self) -> VoiceClip | None:
+        clip_id = self.voice_combo.currentData()
+        if not clip_id:
+            return None
+        return next((c for c in self.store.clips if c.id == clip_id), None)
+
+    def _voice_ref(self) -> Path | None:
+        clip = self._selected_clip()
+        if not clip:
+            return None
+        wav = self.store.dir / clip.clip_path
+        return wav if wav.exists() else None
+
+    def _on_voice_changed(self) -> None:
+        # Prefill the description from the clip the first time, if still blank.
+        if not self.desc_edit.text().strip():
+            self._desc_from_clip()
+
+    def _desc_from_clip(self) -> None:
+        clip = self._selected_clip()
+        if clip:
+            self.desc_edit.setText(descriptor_from_clip(clip))
+
+    def _play_reference(self) -> None:
+        ref = self._voice_ref()
+        if not ref:
+            self.status.setText("No reference clip selected (or its wav is missing).")
+            return
+        self.player.play(ref)
+
+    # -- compose ----------------------------------------------------------- #
+    def _apply_format(self, template: str) -> None:
+        desc = self.desc_edit.text().strip()
+        line = self.line_edit.text().strip()
+        if not line:
+            self.status.setText("Enter a line first.")
+            return
+        self.prompt_edit.setPlainText(template.format(desc=desc, line=line))
+
+    # -- model load -------------------------------------------------------- #
+    def _load_model(self) -> None:
+        if self.client is not None or (self.loader and self.loader.isRunning()):
+            return
+        self.load_btn.setEnabled(False)
+        self.device_combo.setEnabled(False)
+        self.model_status.setText("Loading Dramabox… (first run downloads ~15 GB)")
+        self.loader = TtsLoadWorker(self.device_combo.currentText())
+        self.loader.loaded.connect(self._on_model_loaded)
+        self.loader.failed.connect(self._on_model_failed)
+        self.loader.start()
+
+    def _on_model_loaded(self, client, device: str) -> None:
+        self.client = client
+        self.model_status.setText(f"✓ Loaded on {device} — ready.")
+        self.model_status.setStyleSheet("color: green;")
+        self._update_enabled()
+
+    def _on_model_failed(self, msg: str) -> None:
+        self.load_btn.setEnabled(True)
+        self.device_combo.setEnabled(True)
+        self.model_status.setText("Load failed.")
+        self.model_status.setStyleSheet("color: #b00;")
+        QMessageBox.critical(self, "Dramabox load failed", msg)
+
+    # -- generate ---------------------------------------------------------- #
+    def _generate(self) -> None:
+        if self.client is None:
+            QMessageBox.information(self, "Model not loaded", "Click 'Load model' first.")
+            return
+        if self.gen and self.gen.isRunning():
+            return
+        prompt = self.prompt_edit.toPlainText().strip()
+        if not prompt:
+            self.status.setText("Enter or compose a prompt first.")
+            return
+        self._gen_count += 1
+        out = self._tts_dir / f"gen_{self._gen_count:03d}.wav"
+        self.gen_btn.setEnabled(False)
+        self.status.setText("Generating… (diffusion TTS — this can take a while)")
+        self.gen = TtsGenWorker(
+            self.client,
+            prompt=prompt,
+            output_path=out,
+            voice_ref=self._voice_ref(),
+            seed=self.seed_spin.value(),
+            cfg_scale=self.cfg_spin.value(),
+            stg_scale=self.stg_spin.value(),
+        )
+        self.gen.done.connect(self._on_generated)
+        self.gen.failed.connect(self._on_gen_failed)
+        self.gen.start()
+
+    def _on_generated(self, wav_path: str) -> None:
+        self.gen_btn.setEnabled(True)
+        wav = Path(wav_path)
+        prompt = self.prompt_edit.toPlainText().strip()
+        ref = self._voice_ref()
+        ref_name = ref.stem if ref else "default"
+        oneline = prompt.replace("\n", "\\n")
+        item = QListWidgetItem(
+            f"#{self._gen_count}  [{ref_name} · seed {self.seed_spin.value()}]  {oneline}"
+        )
+        item.setData(Qt.UserRole, wav_path)
+        item.setToolTip(prompt)
+        self.history.insertItem(0, item)
+        self.status.setText(f"Generated #{self._gen_count} → playing.")
+        self.player.play(wav)
+
+    def _on_gen_failed(self, msg: str) -> None:
+        self.gen_btn.setEnabled(True)
+        self.status.setText("Generation failed.")
+        QMessageBox.critical(self, "Generation failed", msg)
+
+    def _replay(self, item: QListWidgetItem) -> None:
+        wav = item.data(Qt.UserRole)
+        if wav and Path(wav).exists():
+            self.player.play(Path(wav))
+
+    def _update_enabled(self) -> None:
+        ready = self.client is not None
+        self.gen_btn.setEnabled(ready)
+
+
+# --------------------------------------------------------------------------- #
 #  Main window
 # --------------------------------------------------------------------------- #
 class MainWindow(QWidget):
@@ -1116,10 +1495,12 @@ class MainWindow(QWidget):
         self.vb_tab = VoicebankTab(store, self.player)
         self.casting_tab = CastingTab(store, self.player, casting_file)
         self.import_tab = ImportTab(store, self.player, cv_root, on_change=self._on_voicebank_changed)
+        self.tts_tab = TtsLabTab(store, self.player)
         self.vb_tab.on_change = self._on_voicebank_changed
         self.tabs.addTab(self.vb_tab, "Voicebank")
         self.tabs.addTab(self.import_tab, "Import from Common Voice")
         self.tabs.addTab(self.casting_tab, "Casting")
+        self.tabs.addTab(self.tts_tab, "TTS Lab")
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.tabs)
@@ -1128,6 +1509,7 @@ class MainWindow(QWidget):
         self.vb_tab.refresh()
         self.casting_tab.refresh_voicebank()
         self.casting_tab._refresh_chars()
+        self.tts_tab.refresh_voices()
 
 
 def main() -> None:

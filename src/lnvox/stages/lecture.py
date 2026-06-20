@@ -34,6 +34,7 @@ from lnvox.stages.s3_director import (
     MAX_MERGED_BEAT_CHARS,
     NARRATOR_NAME,
     _split_long_text,
+    format_prompt,
 )
 from lnvox.voices.schema import BookCasting
 
@@ -130,7 +131,7 @@ def direct_chapter(
         _normalize_beats(client, beats)
     for b in beats:
         b.direction = descriptor
-        b.prompt = f'{descriptor}, "{b.text}"'
+        b.prompt = format_prompt(descriptor, b.text)
     scene = DirectedScene(
         scene_id=f"{chapter.chapter_id}_s1",
         location_hint="",

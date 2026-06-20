@@ -508,6 +508,11 @@ and skips stages whose outputs are newer than inputs.
   OpenAI endpoint contract, so `LLMClient` is unchanged) and Dramabox runs on
   the MPS device with quantization + `torch.compile` disabled. Full details
   and known limitations live in §11.
+- **GGUF / llama-server variant** (§14). A third backend, native
+  `llama-server` from llama.cpp, runs on either platform and shares the
+  OpenAI endpoint contract. Useful when an MLX-quantized build of the
+  desired model isn't available, or as the macOS fallback if mlx-lm
+  doesn't work on your hardware.
 
 ## 5. Storage & idempotency
 
@@ -854,7 +859,8 @@ surface.
 ### 12.1 Scope
 
 Operations 1–4 act on `voicebank/manifest.json` + `voicebank/clips/`;
-operation 5 acts on a book's `04_voice_assignments.json`:
+operation 5 acts on a book's `04_voice_assignments.json`; operation 6 is a
+read-only TTS auditioning surface:
 
 1. **Listen** — play any voicebank clip; see its full metadata.
 2. **Import from Common Voice** — browse the raw `data/…/en` corpus by
@@ -876,11 +882,23 @@ operation 5 acts on a book's `04_voice_assignments.json`:
    `candidates_considered`, and `voice_descriptor` are round-tripped untouched;
    only `assigned_clip_id` changes. This is the by-ear counterpart to the
    automated Stage-V match and the manual-narrator flow (§6.2–6.3).
+6. **TTS Lab** (TTS Lab tab) — audition Dramabox prompts against a chosen
+   voicebank clip to find the best way to phrase a direction/description. The
+   Dramabox model is loaded **once, manually** via a "Load model" button — never
+   on construction or when other tabs are used (it's ~15 GB in VRAM; the lazy
+   `lnvox.tts.dramabox_client` import keeps the Studio launchable with no
+   torch/Dramabox present). Format buttons compose the same description + line
+   into different shapes (`desc, "line"` vs `[desc] "line"` vs `"line"` …) so a
+   listener can hear which phrasing leaks the description into the narration;
+   `seed` / `cfg_scale` / `stg_scale` are exposed (keep the seed fixed to
+   isolate the prompt). Generations accumulate in a replayable history. Renders
+   go to a temp dir — the lab writes nothing to the voicebank.
 
 Explicitly **out of scope**: editing existing clips' audio, multi-corpus
 import (only the local CV layout is wired), and any pipeline invocation. The
-Studio only reads/writes the voicebank and casting JSON; it never re-runs the
-LLM matcher (a cross-gender/age cast just prompts a confirmation).
+Studio only reads/writes the voicebank and casting JSON (the TTS Lab only
+*reads* clips and runs Dramabox); it never re-runs the LLM matcher (a
+cross-gender/age cast just prompts a confirmation).
 
 ### 12.2 Packaging
 
@@ -888,8 +906,12 @@ Standalone — `scripts/voicebank_studio.py`, run with
 `uv run python scripts/voicebank_studio.py` after `uv pip install PySide6`.
 Not wired into the `lnvox` CLI and not added as a project dependency; PySide6
 is a dev-machine-only concern and the pipeline never imports it. The script
-*does* import `lnvox.voices` (schema, manifest I/O, `build_speaker_clip`) so
-curation logic stays single-sourced with the seeder.
+*does* import `lnvox.voices` (schema, manifest I/O, `build_speaker_clip`,
+`descriptor_from_clip`) so curation logic stays single-sourced with the seeder.
+The TTS Lab (§12.1 op 6) additionally needs the `tts` extra + a GPU, but only
+when that tab's "Load model" button is pressed — `lnvox.tts.dramabox_client` is
+imported lazily inside the load worker, so the other three tabs run with neither
+Dramabox nor torch installed.
 
 ### 12.3 Common Voice browsing without loading 600 MB
 
@@ -1257,3 +1279,105 @@ TTS cache/idempotency (§5), or the s4/s5 stage contracts changes.
 - A bespoke lecture player UI — ln-reader's existing image-flip mechanism is
   the integration surface.
 - Mixing lecture and narration within one book.
+
+## 14. GGUF / llama-server path (third LLM backend)
+
+`llama-server` (the native binary from llama.cpp) is the third LLM backend,
+peer to vLLM (§4) and mlx-lm (§11). It runs on both Linux and macOS, takes
+GGUF weights (so the same checkpoint travels between platforms), and is the
+designated fallback when mlx-lm doesn't have an MLX-quantized build of the
+model you want — or when you want to A/B test specific quantization
+recipes against the same prompts.
+
+### 14.1 Topology
+
+The LLM-phase serve script is selected at launch time:
+
+```
+LNVOX_LLM_BACKEND=vllm   → scripts/serve_vllm.sh   (Linux + CUDA;   default on Linux)
+LNVOX_LLM_BACKEND=mlx    → scripts/serve_mlx.sh    (Apple Silicon;  default on Darwin)
+LNVOX_LLM_BACKEND=llama  → scripts/serve_llama.sh  (either platform; opt-in)
+```
+
+All three expose the same OpenAI-compatible `/v1/chat/completions`
+endpoint on `:8000`, so `LLMClient` ([client.py:57-60](src/lnvox/llm/client.py#L57-L60))
+is unchanged. The pipeline launcher's `--llm-backend` flag (or the env var
+above) picks one; everything downstream is identical.
+
+### 14.2 Install
+
+`llama-server` is a native binary, NOT a Python package. Install it
+out-of-band — there is no `llama` extra in `pyproject.toml`:
+
+- **macOS:** `brew install llama.cpp` (Metal-enabled).
+- **Linux:** either grab a pre-built release from the
+  `ggerganov/llama.cpp` GitHub Releases page, or build from source:
+
+  ```sh
+  git clone https://github.com/ggerganov/llama.cpp && cd llama.cpp
+  cmake -B build -DGGML_CUDA=on
+  cmake --build build --target llama-server -j
+  ```
+
+  Drop the produced `build/bin/llama-server` somewhere on `PATH`.
+
+`scripts/serve_llama.sh` looks up `llama-server` on `PATH` and fails fast
+with a clear install hint if it's missing.
+
+### 14.3 Model selection
+
+`LNVOX_LLM_MODEL` carries either:
+
+- An HF GGUF repo id (auto-downloaded): the project default is
+  `google/gemma-4-E4B-it-qat-q4_0-gguf` — Google's official QAT-quantized
+  GGUF of the same E4B dev model served by `serve_vllm.sh`. Append
+  `:Q4_0` etc. to pick a specific quant inside a multi-file repo.
+- A local GGUF file path: `/path/to/gemma-4-31B-it-qat-q4_0.gguf`.
+
+The serve script `-hf`'s the first form and `-m`'s the second.
+
+### 14.4 Limitations vs vLLM
+
+- **No `extra_body["guided_json"]` enforcement** — same loss as mlx-lm
+  (§11.2.1). llama.cpp DOES support schema-constrained generation, but via
+  `response_format: {"type": "json_schema", ...}` rather than the
+  `guided_json` shape `LLMClient` currently sends
+  ([client.py:118](src/lnvox/llm/client.py#L118)). The retry loop handles
+  parse failures; first-attempt fidelity is below vLLM. Future change:
+  thread a `response_format` override through `LLMClient` (benefits
+  mlx-lm and llama-server equally).
+- **`repetition_penalty` IS honored** (unlike mlx-lm). llama.cpp accepts
+  `repeat_penalty` natively and the standard `frequency_penalty` /
+  `presence_penalty` knobs. The runaway-loop escape hatch in
+  [config.py:16-19](src/lnvox/config.py#L16-L19) keeps working on this
+  path.
+- **Prefix caching via `--cache-reuse N`** — bounded to N tokens of
+  matched prefix per request. Less powerful than vLLM's automatic
+  unbounded prefix cache but real. `serve_llama.sh` enables it.
+- **Throughput** is install-dependent: a Q4_K_M Gemma 27B on a 4090 lands
+  around 25-40 tok/s; the same quant on an M3 Max Metal build lands
+  ~10-20 tok/s. Measure on your hardware before committing to it for
+  production runs.
+
+### 14.5 Code surface affected
+
+| Area                                       | Change                                                                                                                                                                                                       |
+|--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `scripts/serve_llama.sh` (new)             | Exec native `llama-server` with `LNVOX_LLM_MODEL` (HF repo or local path), `LNVOX_LLM_PORT`, `LNVOX_LLM_HOST`, `LNVOX_LLM_N_GPU_LAYERS` (999 = full offload), `LNVOX_LLM_MAX_LEN`. Hard-exits if the binary isn't on `PATH`. |
+| `scripts/run_pipeline.sh`                  | New `LNVOX_LLM_BACKEND` env var + `--llm-backend {vllm,mlx,llama}` flag. Defaults: Darwin→`mlx`, Linux→`vllm`. `prepare_llm_env` and `start_vllm` dispatch on it.                                              |
+| `pyproject.toml`                           | **No change** — llama-server is a native binary, not a Python package.                                                                                                                                       |
+| `src/lnvox/{llm,tts,stages,cli}/*`         | **No change** — `LLMClient` already speaks the OpenAI dialect llama-server provides.                                                                                                                          |
+
+### 14.6 What's explicitly **not** in this section
+
+- **Auto-fallback.** Setting `LNVOX_LLM_BACKEND=llama` is a manual
+  recovery step, not an automatic one. If mlx-lm fails to start, the
+  pipeline aborts; the user re-runs with `--llm-backend llama`. Auto-
+  failover would tangle the launcher's lifecycle code and is out of scope.
+- **Threading `response_format` schemas through `LLMClient`.** Both mlx-lm
+  and llama-server would benefit, but it's an API design pass and
+  belongs in a separate v2 change. Until then, both backends rely on the
+  client's existing validate-and-retry loop.
+- **Bundling llama.cpp.** Vendoring the binary or pinning a build version
+  is intentionally avoided — installs are heterogeneous (Metal vs.
+  cuBLAS vs. ROCm) and out-of-band wins.

@@ -3,12 +3,13 @@
 # API on localhost:8000 — the same contract serve_vllm.sh provides on Linux,
 # so LLMClient runs unchanged. See DESIGN.md §11.2.
 #
-# Defaults:
-#   LNVOX_LLM_MODEL=mlx-community/gemma-3-4b-it-4bit    (dev, ~4GB unified)
+# Defaults (mirror serve_vllm.sh's Gemma 4 conventions):
+#   LNVOX_LLM_MODEL=mlx-community/gemma-4-E4B-it-4bit    (dev; same E4B
+#                                                         model used by
+#                                                         serve_vllm.sh)
 #
-# Heavier picks (need 32GB+ unified memory):
-#   LNVOX_LLM_MODEL=mlx-community/gemma-3-12b-it-4bit
-#   LNVOX_LLM_MODEL=mlx-community/gemma-3-27b-it-4bit
+# Heavier prod pick (needs 32GB+ unified memory):
+#   LNVOX_LLM_MODEL=mlx-community/gemma-4-31B-it-4bit
 #
 # Known limitations vs vLLM (accepted in §11.2):
 #   - No `guided_json` enforcement (client retries handle parse failures).
@@ -16,7 +17,7 @@
 #   - No prefix caching across calls.
 set -euo pipefail
 
-MODEL="${LNVOX_LLM_MODEL:-mlx-community/gemma-3-4b-it-4bit}"
+MODEL="${LNVOX_LLM_MODEL:-mlx-community/gemma-4-E4B-it-4bit}"
 PORT="${LNVOX_LLM_PORT:-8000}"
 HOST="${LNVOX_LLM_HOST:-127.0.0.1}"
 

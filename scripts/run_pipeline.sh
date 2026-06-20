@@ -15,27 +15,36 @@
 #                              one assigned — it'll be inherited automatically.
 #     --book-title <title>     Final m4b title (default: book_id).
 #     --novels-root <path>     Where the chapter .txt files live (default: novels).
-#     --vllm-url <url>         Use an already-running vLLM at this URL (skip
-#                              auto start/stop). Default: launch vLLM ourselves.
-#     --llm-model <id>         HF model id for vLLM (default: google/gemma-4-E4B-it).
-#                              Try `nvidia/Gemma-4-31B-IT-NVFP4` for better quality.
+#     --vllm-url <url>         Use an already-running LLM server at this URL
+#                              (skip auto start/stop). Flag name is historical;
+#                              applies to whichever backend you've selected.
+#     --llm-backend <name>     Which LLM server to launch: vllm | mlx | llama.
+#                              Default: mlx on Darwin, vllm elsewhere. See
+#                              DESIGN.md §14 for the llama-server (GGUF) path.
+#                              Honors $LNVOX_LLM_BACKEND.
+#     --llm-model <id>         Model id for the selected backend (HF repo,
+#                              GGUF repo, or local path depending on backend).
+#                              Default: google/gemma-4-E4B-it for vllm.
 #     --max-model-len <N>      Override vLLM context window (default: model-dependent).
 #     --skip-llm               Skip s1..s3 + voice cast (assume already done).
 #     --skip-tts               Skip s4 (assume already rendered).
 #     --skip-mix               Skip s5 (skip the m4b assembly).
+#     --skip-sync              Skip s6 (skip the synced-EPUB / sync_manifest).
+#     --epub <path>            Source EPUB for s6 (default: epubs/<book_id>.epub).
 #     --max-retries N          Auto-retry budget for s4 (default 30).
 #     --step-retries N         Auto-retry budget per non-TTS step (default 3).
 #
-# vLLM lifecycle: by default the launcher starts vLLM in the background,
-# waits for it to be ready, runs the LLM-phase stages, then stops it
-# (freeing GPU memory for Dramabox). Pass --vllm-url to skip this if you
-# already have a vLLM server elsewhere (or running externally on a second
-# GPU). The full pipeline is non-interactive; safe for overnight runs.
+# LLM lifecycle: by default the launcher picks an LLM backend, starts the
+# matching serve script in the background, waits for it to be ready, runs
+# the LLM-phase stages, then stops it (freeing GPU memory for Dramabox).
+# Pass --vllm-url to skip this if you already have a server running.
 #
-# Apple Silicon (Darwin): the launcher swaps serve_vllm.sh for
-# scripts/serve_mlx.sh (Apple's mlx_lm.server, same OpenAI endpoint) and
-# uses --device mps for Dramabox. See DESIGN.md §11. `--vllm-url` is reused
-# as the "external LLM endpoint already running" knob on either platform.
+# Backends (DESIGN.md §4 / §11 / §14):
+#   - vllm  : scripts/serve_vllm.sh   (Linux + CUDA, default on Linux)
+#   - mlx   : scripts/serve_mlx.sh    (Apple Silicon, default on Darwin)
+#   - llama : scripts/serve_llama.sh  (native llama-server, GGUF, either OS)
+# Pick one with --llm-backend or $LNVOX_LLM_BACKEND. The TTS phase always
+# uses Dramabox; --device mps is auto-selected on Darwin.
 
 set -uo pipefail
 
@@ -48,11 +57,14 @@ NARRATOR_CLIP=""
 BOOK_TITLE=""
 NOVELS_ROOT="novels"
 VLLM_URL=""
+LLM_BACKEND="${LNVOX_LLM_BACKEND:-}"
 LLM_MODEL=""
 MAX_MODEL_LEN=""
 SKIP_LLM=0
 SKIP_TTS=0
 SKIP_MIX=0
+SKIP_SYNC=0
+EPUB_PATH=""
 MAX_RETRIES="${MAX_RETRIES:-30}"
 STEP_RETRIES="${STEP_RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-5}"
@@ -61,7 +73,7 @@ VLLM_PID=""
 VLLM_LOG=""
 
 usage() {
-    sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -74,11 +86,14 @@ while [ $# -gt 0 ]; do
         --book-title)    BOOK_TITLE="$2";   shift 2 ;;
         --novels-root)   NOVELS_ROOT="$2";  shift 2 ;;
         --vllm-url)      VLLM_URL="$2";     shift 2 ;;
+        --llm-backend)   LLM_BACKEND="$2";  shift 2 ;;
         --llm-model)     LLM_MODEL="$2";    shift 2 ;;
         --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
         --skip-llm)      SKIP_LLM=1;        shift   ;;
         --skip-tts)      SKIP_TTS=1;        shift   ;;
         --skip-mix)      SKIP_MIX=1;        shift   ;;
+        --skip-sync)     SKIP_SYNC=1;       shift   ;;
+        --epub)          EPUB_PATH="$2";    shift 2 ;;
         --max-retries)   MAX_RETRIES="$2";  shift 2 ;;
         --step-retries)  STEP_RETRIES="$2"; shift 2 ;;
         -*)              echo "Unknown option: $1" >&2; usage 2 ;;
@@ -90,6 +105,23 @@ if [ -z "$BOOK_ID" ]; then
     echo "ERROR: book id (e.g. 'toaru/volume-01') is required" >&2
     usage 2
 fi
+
+# Resolve LLM backend: explicit --llm-backend / $LNVOX_LLM_BACKEND wins;
+# otherwise default to mlx on Darwin and vllm everywhere else. See §14.
+if [ -z "$LLM_BACKEND" ]; then
+    if [ "$OS" = "Darwin" ]; then
+        LLM_BACKEND="mlx"
+    else
+        LLM_BACKEND="vllm"
+    fi
+fi
+case "$LLM_BACKEND" in
+    vllm|mlx|llama) ;;
+    *)
+        echo "ERROR: --llm-backend must be one of vllm|mlx|llama (got '$LLM_BACKEND')" >&2
+        usage 2
+        ;;
+esac
 
 if [ "$MODE" != "narration" ] && [ "$MODE" != "lecture" ]; then
     echo "ERROR: --mode must be 'narration' or 'lecture' (got '$MODE')" >&2
@@ -120,7 +152,7 @@ if [ -n "$VLLM_URL" ]; then
 fi
 LNVOX_VLLM_BASE="${LNVOX_LLM__ENDPOINT:-http://localhost:8000/v1}"
 
-# Propagate model + max-model-len to both serve_vllm.sh and the lnvox client.
+# Propagate model + max-model-len to whichever serve script we picked.
 if [ -n "$LLM_MODEL" ]; then
     export LNVOX_LLM_MODEL="$LLM_MODEL"
     echo "Using LLM model: $LLM_MODEL"
@@ -128,6 +160,7 @@ fi
 if [ -n "$MAX_MODEL_LEN" ]; then
     export LNVOX_LLM_MAX_LEN="$MAX_MODEL_LEN"
 fi
+echo "Using LLM backend: $LLM_BACKEND"
 
 banner() {
     echo ""
@@ -180,27 +213,46 @@ run_step() {
 # overhead is minimal when the state is already correct.
 
 prepare_llm_env() {
-    if [ "$OS" = "Darwin" ]; then
-        banner "Preparing venv for LLM phase (mlx-lm on Apple Silicon)"
-        # The mlx-lm path is much lighter than the vLLM one — mlx_lm pulls
-        # its own MLX runtime and there's no torch ABI minefield to navigate.
-        if [ -d .venv ] && ! uv run python -c "import mlx_lm" >/dev/null 2>&1; then
-            echo "Detected broken venv (mlx_lm import fails). Recreating from scratch…"
-            rm -rf .venv
-        fi
-        uv sync --extra mlx --extra voice --extra tts
-        return 0
-    fi
+    case "$LLM_BACKEND" in
+        mlx)
+            banner "Preparing venv for LLM phase (mlx-lm on Apple Silicon)"
+            # mlx-lm path is much lighter than vLLM — mlx_lm pulls its own
+            # MLX runtime and there's no torch ABI minefield to navigate.
+            if [ -d .venv ] && ! uv run python -c "import mlx_lm" >/dev/null 2>&1; then
+                echo "Detected broken venv (mlx_lm import fails). Recreating from scratch…"
+                rm -rf .venv
+            fi
+            uv sync --extra mlx --extra voice --extra tts
+            ;;
 
-    banner "Preparing venv for LLM phase (vLLM-compatible torch)"
-    # If torch can't even import (libcudnn / NCCL ABI mismatch after a prior
-    # botched install), uv sync won't rescue us because the lockfile thinks
-    # everything is already installed. Nuke the venv and let uv rebuild.
-    if [ -d .venv ] && ! uv run python -c "import torch, vllm" >/dev/null 2>&1; then
-        echo "Detected broken venv (torch/vllm import fails). Recreating from scratch…"
-        rm -rf .venv
-    fi
-    uv sync --extra serve --extra voice --extra tts
+        llama)
+            banner "Preparing venv for LLM phase (native llama-server)"
+            # llama-server is an out-of-band native binary (DESIGN.md §14.2);
+            # there's no Python LLM dep to install. We just want the voice +
+            # tts extras synced for the TTS phase that follows.
+            uv sync --extra voice --extra tts
+            if ! command -v llama-server >/dev/null 2>&1; then
+                echo "" >&2
+                echo "ERROR: --llm-backend=llama but 'llama-server' is not on PATH." >&2
+                echo "  Install via:  brew install llama.cpp   (macOS)" >&2
+                echo "                or build from https://github.com/ggerganov/llama.cpp" >&2
+                exit 1
+            fi
+            ;;
+
+        vllm)
+            banner "Preparing venv for LLM phase (vLLM-compatible torch)"
+            # If torch can't even import (libcudnn / NCCL ABI mismatch after a
+            # prior botched install), uv sync won't rescue us because the
+            # lockfile thinks everything is already installed. Nuke the venv
+            # and let uv rebuild.
+            if [ -d .venv ] && ! uv run python -c "import torch, vllm" >/dev/null 2>&1; then
+                echo "Detected broken venv (torch/vllm import fails). Recreating from scratch…"
+                rm -rf .venv
+            fi
+            uv sync --extra serve --extra voice --extra tts
+            ;;
+    esac
 }
 
 # Install Dramabox's requirements.txt with platform-aware torch handling.
@@ -314,13 +366,13 @@ start_vllm() {
         return 0
     fi
 
-    local serve_script="./scripts/serve_vllm.sh"
-    local backend_name="vLLM"
-    if [ "$OS" = "Darwin" ]; then
-        serve_script="./scripts/serve_mlx.sh"
-        backend_name="mlx_lm.server"
-    fi
-    VLLM_LOG="$(mktemp -t lnvox_vllm.XXXXXX.log)"
+    local serve_script backend_name
+    case "$LLM_BACKEND" in
+        vllm)  serve_script="./scripts/serve_vllm.sh";  backend_name="vLLM" ;;
+        mlx)   serve_script="./scripts/serve_mlx.sh";   backend_name="mlx_lm.server" ;;
+        llama) serve_script="./scripts/serve_llama.sh"; backend_name="llama-server" ;;
+    esac
+    VLLM_LOG="$(mktemp -t lnvox_llm.XXXXXX.log)"
     echo "Starting $backend_name in background (log: $VLLM_LOG)…"
     nohup "$serve_script" > "$VLLM_LOG" 2>&1 &
     VLLM_PID=$!
@@ -481,6 +533,33 @@ else
     run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE"
 fi
 
+# ----- Sync phase (Stage 6, CPU-only) ----------------------------------------
+#
+# Re-aligns the directed beats onto the original EPUB → a synced EPUB +
+# sync_manifest.json the ln-reader uses to highlight text in time with the
+# audio (and, in lecture mode, to flip to code/table/figure visual elements).
+# Needs the source EPUB and the rendered audio, so it's skipped gracefully for
+# a .txt-only book or when TTS hasn't run. Stage-6 silence defaults match
+# Stage 5's defaults used above.
+if [ "$SKIP_SYNC" -eq 1 ]; then
+    banner "Skipping sync phase (--skip-sync)"
+else
+    SYNC_EPUB="${EPUB_PATH:-epubs/$BOOK_ID.epub}"
+    if [ ! -f "$SYNC_EPUB" ]; then
+        banner "Stage 6: skipped (no source EPUB at $SYNC_EPUB)"
+        echo "Place the EPUB at epubs/$BOOK_ID.epub or pass --epub <path> to enable sync."
+    elif [ ! -d "$BOOK_ART/05_audio" ]; then
+        banner "Stage 6: skipped (no rendered audio at $BOOK_ART/05_audio)"
+    else
+        banner "Stage 6: sync layer (EPUB beat-spans + sync_manifest.json)"
+        run_step - "Stage 6 (sync)" uv run lnvox s6 "$BOOK_ID" \
+            --epub "$SYNC_EPUB" --novels-root "$NOVELS_ROOT"
+    fi
+fi
+
 banner "Pipeline complete."
 echo "Final output should be at: $BOOK_ART/06_final/$BOOK_TITLE.m4b"
 ls -la "$BOOK_ART/06_final/" 2>/dev/null || true
+if [ -f "$BOOK_ART/07_sync/sync_manifest.json" ]; then
+    echo "Sync layer:               $BOOK_ART/07_sync/ (synced EPUB + sync_manifest.json)"
+fi

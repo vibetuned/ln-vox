@@ -50,6 +50,19 @@ DEFAULT_NARRATOR_ACCENT = "england"
 MAX_MERGED_BEAT_CHARS = 500
 
 
+def format_prompt(direction: str, text: str) -> str:
+    """Compose the Dramabox-ready prompt string.
+
+    Empirically (via the Voicebank Studio TTS Lab) Dramabox reads the direction
+    aloud unless it's phrased a specific way: lowercased, with its commas turned
+    into ' - ', and wrapped in parentheses. The spoken `text` keeps its own
+    punctuation untouched. Used by both the Director (s3) and lecture mode so
+    the format stays single-sourced.
+    """
+    spoken_direction = re.sub(r"\s*,\s*", " - ", direction.lower()).strip()
+    return f'({spoken_direction}) "{text}"'
+
+
 # ---------------- voice profiles ----------------
 
 
@@ -435,7 +448,7 @@ def direct_scene(
             descriptor = profile_map.get(speaker, "voice unknown")
             cue = cues_by_line.get(line_no, "").strip()
             direction = f"{descriptor}, {cue}" if cue else descriptor
-        prompt = f'{direction}, "{b.text}"'
+        prompt = format_prompt(direction, b.text)
         directed_beats.append(
             DirectedBeat(
                 type=b.type,
