@@ -7,7 +7,7 @@ from pathlib import Path
 
 from lnvox.ingest.text import Chapter
 from lnvox.llm.client import LLMClient
-from lnvox.llm.schemas import Character, CharacterList
+from lnvox.llm.schemas import Character, CharacterList, CharacterMergeProposal
 
 
 SYSTEM = (
@@ -113,13 +113,78 @@ _FUZZY_MIN_LEN = 4
 _MERGE_INPUT_CHAR_BUDGET = 160_000
 
 
+# Pronouns are never identity keys. A first-person POV entry routinely lists
+# "I" (or "he"/"she") as an alias; clustering on those would chain every POV
+# character in the book into one blob. Personal/possessive/reflexive forms
+# only — kept tight so we never shadow a real name.
+_PRONOUNS = {
+    "i", "me", "my", "mine", "myself",
+    "you", "your", "yours", "yourself", "yourselves",
+    "he", "him", "his", "himself",
+    "she", "her", "hers", "herself",
+    "it", "its", "itself",
+    "we", "us", "our", "ours", "ourselves",
+    "they", "them", "their", "theirs", "themselves",
+}
+
+
 def _norm(s: str) -> str:
     return " ".join(s.lower().strip().split())
+
+
+def _is_generic_alias(name: str) -> bool:
+    """Whether a name is a generic descriptor rather than a proper name/epithet.
+
+    A proper name or distinctive epithet always carries a capitalized word
+    ("Miss Myne", "the Saint", "High Bishop"); a bare role/relation descriptor
+    ("the girl", "merchant", "attendant", "little brother") is all lowercase.
+    Used to keep such descriptors out of a character's alias list — they're
+    noise for casting and speaker-tagging, and (being shared) cause confusion.
+    The character's primary `name` is never filtered this way, only aliases.
+    """
+    return not any(ch.isupper() for ch in name)
 
 
 def _digits(s: str) -> list[str]:
     """Runs of digits in a string, e.g. 'Knight 12' → ['12']."""
     return re.findall(r"\d+", s)
+
+
+def _similar(a: str, b: str) -> bool:
+    """Whether two normalized names are variants of the SAME underlying name.
+
+    True when one contains the other (e.g. a short form inside a longer
+    titled form) or they're fuzzily near-identical (transliteration / typo
+    variants). Short tokens are excluded from the substring path so we don't
+    treat an incidental fragment as a name match.
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= _FUZZY_MIN_LEN and short in long:
+        return True
+    if min(len(a), len(b)) >= _FUZZY_MIN_LEN:
+        if difflib.SequenceMatcher(None, a, b).ratio() >= _FUZZY_NAME_THRESHOLD:
+            return True
+    return False
+
+
+def _names_all_similar(names: set[str]) -> bool:
+    """Whether a shared name/alias key denotes ONE identity vs a generic token.
+
+    Variants of a single name (a short form, a titled form, a nickname) are all
+    similar to the longest form, so the key is a safe identity key. A generic
+    role/title/relation shared by DIFFERENT people (e.g. "attendant",
+    "merchant", "the maid" carried by several distinct names) yields dissimilar
+    names — that key must NOT cluster them together.
+    """
+    names = {n for n in names if n}
+    if len(names) <= 1:
+        return True
+    base = max(names, key=len)
+    return all(_similar(base, n) for n in names if n != base)
 
 
 def _majority(values: list[str]) -> str:
@@ -153,18 +218,30 @@ class CharacterCluster:
         ) - {""}
 
 
-def _build_cluster(chars: list[Character], origins: list[str]) -> CharacterCluster:
+def _build_cluster(
+    chars: list[Character],
+    origins: list[str],
+    drop_keys: frozenset[str] = frozenset(),
+) -> CharacterCluster:
     name_counts = Counter(c.name for c in chars)
     canonical = max(name_counts, key=lambda nm: (name_counts[nm], len(nm)))
     canon_key = _norm(canonical)
 
     # Aliases = union of every name/alias form except the canonical, deduped
-    # case-insensitively (keeping the first-seen casing).
+    # case-insensitively (keeping the first-seen casing). Pronouns and generic
+    # tokens shared across distinct characters (`drop_keys`) are excluded so the
+    # final cast doesn't carry role/title noise into casting and speaker-tagging.
     alias_repr: dict[str, str] = {}
     for c in chars:
         for nm in [c.name, *c.aliases]:
             k = _norm(nm)
-            if k and k != canon_key:
+            if (
+                k
+                and k != canon_key
+                and k not in _PRONOUNS
+                and k not in drop_keys
+                and not _is_generic_alias(nm)
+            ):
                 alias_repr.setdefault(k, nm)
 
     evidence: list[str] = []
@@ -215,17 +292,34 @@ def cluster_characters(
         if ra != rb:
             parent[rb] = ra
 
-    # Exact: share a name/alias key.
-    key_owner: dict[str, int] = {}
+    # Exact: share a name/alias key — but ONLY on keys that safely denote a
+    # single identity. The per-chapter extractor emits generic role/title words
+    # ("attendant", "the merchant", "guard"), relations ("dad"), and pronouns as
+    # aliases; unioning on those chains unrelated people (across genders and
+    # ages) into one mega-cluster. So we first collect, per key, the distinct
+    # source canonical names carrying it, and union only on keys whose carriers
+    # are spelling variants of one name (`_names_all_similar`) — never on a token
+    # shared by genuinely different characters.
+    key_entries: dict[str, list[int]] = defaultdict(list)
+    key_names: dict[str, set[str]] = defaultdict(set)
     for idx, (c, _) in enumerate(entries):
-        keys = {_norm(c.name)} | {_norm(a) for a in c.aliases}
+        keys = ({_norm(c.name)} | {_norm(a) for a in c.aliases}) - {""}
         for k in keys:
-            if not k:
+            if k in _PRONOUNS:
                 continue
-            if k in key_owner:
-                union(idx, key_owner[k])
-            else:
-                key_owner[k] = idx
+            key_entries[k].append(idx)
+            key_names[k].add(_norm(c.name))
+    # Keys shared across genuinely different characters are generic tokens
+    # (roles, titles, relations). They never link an identity and shouldn't
+    # surface as anyone's alias — drop them when building clusters below.
+    generic_keys = frozenset(
+        k for k, names in key_names.items() if not _names_all_similar(names)
+    )
+    for k, idxs in key_entries.items():
+        if len(idxs) < 2 or k in generic_keys:
+            continue
+        for other in idxs[1:]:
+            union(idxs[0], other)
 
     # Fuzzy: near-identical canonical names not already in the same cluster.
     norm_names = [_norm(c.name) for c, _ in entries]
@@ -251,7 +345,11 @@ def cluster_characters(
         groups[find(idx)].append(idx)
 
     clusters = [
-        _build_cluster([entries[m][0] for m in members], [entries[m][1] for m in members])
+        _build_cluster(
+            [entries[m][0] for m in members],
+            [entries[m][1] for m in members],
+            drop_keys=generic_keys,
+        )
         for members in groups.values()
     ]
     clusters.sort(key=lambda c: (-c.occurrences, c.canonical.lower()))
@@ -278,21 +376,128 @@ def _cluster_payload(clusters: list[CharacterCluster]) -> str:
     )
 
 
-def _deterministic_merge(clusters: list[CharacterCluster]) -> CharacterList:
-    """Fallback when the LLM merge can't run: clusters → characters verbatim."""
-    return CharacterList(
-        characters=[
-            Character(
-                name=c.canonical,
-                aliases=c.aliases,
-                gender=c.gender,
-                approx_age=c.approx_age,
-                description=c.description,
-                evidence=c.evidence,
-            )
-            for c in clusters
-        ]
+def _cluster_to_character(c: CharacterCluster) -> Character:
+    return Character(
+        name=c.canonical,
+        aliases=c.aliases,
+        gender=c.gender,
+        approx_age=c.approx_age,
+        description=c.description,
+        evidence=c.evidence,
     )
+
+
+def _deterministic_merge(clusters: list[CharacterCluster]) -> CharacterList:
+    """The clean base cast: one character per cluster, verbatim."""
+    return CharacterList(characters=[_cluster_to_character(c) for c in clusters])
+
+
+def _combine_clusters(
+    members: list[CharacterCluster], canonical_hint: str = ""
+) -> Character:
+    """Fuse clusters the LLM judged to be one person into a single character.
+
+    Every field value comes from our own clean cluster data — the LLM
+    contributes only the grouping decision and the preferred name. Gender/age
+    use occurrence-weighted majority so one mis-tagged chapter can't flip a
+    well-established trait.
+    """
+    member_keys = set().union(*(m.keys for m in members))
+    if canonical_hint and _norm(canonical_hint) in member_keys:
+        canonical = canonical_hint
+    else:
+        canonical = max(
+            members, key=lambda m: (m.occurrences, len(m.canonical))
+        ).canonical
+    canon_key = _norm(canonical)
+
+    aliases: list[str] = []
+    seen = {canon_key}
+    for m in members:
+        for nm in [m.canonical, *m.aliases]:
+            k = _norm(nm)
+            if k and k not in seen and k not in _PRONOUNS and not _is_generic_alias(nm):
+                seen.add(k)
+                aliases.append(nm)
+
+    genders = [m.gender for m in members for _ in range(max(1, m.occurrences))]
+    ages = [m.approx_age for m in members for _ in range(max(1, m.occurrences))]
+
+    evidence: list[str] = []
+    seen_ev: set[str] = set()
+    for m in members:
+        for e in m.evidence:
+            if e not in seen_ev:
+                seen_ev.add(e)
+                evidence.append(e)
+
+    return Character(
+        name=canonical,
+        aliases=aliases,
+        gender=_majority(genders),
+        approx_age=_majority(ages),
+        description=max((m.description for m in members), key=len, default=""),
+        evidence=evidence[:4],
+    )
+
+
+def _apply_merge_groups(
+    clusters: list[CharacterCluster], proposal: CharacterMergeProposal
+) -> CharacterList:
+    """Apply the LLM's same-person groupings to our clean clusters.
+
+    Only groups that resolve to 2+ distinct clusters and don't fuse a known
+    gender split are honored; everything else stays its own character. Output
+    keeps prominence order (most chapters first).
+    """
+    key_to_idx: dict[str, int] = {}
+    for i, c in enumerate(clusters):
+        for k in c.keys:
+            key_to_idx.setdefault(k, i)
+
+    parent = list(range(len(clusters)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    hints: dict[int, str] = {}
+    for g in proposal.merges:
+        roots = sorted(
+            {find(key_to_idx[_norm(nm)]) for nm in g.names if _norm(nm) in key_to_idx}
+        )
+        if len(roots) < 2:
+            continue  # nothing real to merge (unknown or single name)
+        known = {clusters[r].gender for r in roots if clusters[r].gender != "unknown"}
+        if len(known) > 1:
+            continue  # safety net: never fuse a known gender split
+        for other in roots[1:]:
+            union(roots[0], other)
+        if g.canonical:
+            hints.setdefault(find(roots[0]), g.canonical)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for i in range(len(clusters)):
+        groups[find(i)].append(i)
+
+    items: list[tuple[int, Character]] = []
+    for root, members in groups.items():
+        cl = [clusters[i] for i in members]
+        char = (
+            _cluster_to_character(cl[0])
+            if len(cl) == 1
+            else _combine_clusters(cl, hints.get(root, ""))
+        )
+        items.append((max(c.occurrences for c in cl), char))
+    items.sort(key=lambda t: (-t[0], t[1].name.lower()))
+    return CharacterList(characters=[c for _, c in items])
 
 
 def merge_clusters(
@@ -302,43 +507,36 @@ def merge_clusters(
     prior_volume_casts: list[CharacterList] | None = None,
     current_volume_label: str = "",
 ) -> CharacterList:
-    """LLM-merge the deterministically-clustered cast.
+    """Final cast = the clean deterministic clusters, refined by an LLM pass
+    that ONLY proposes which differently-named clusters are the same person.
 
-    The LLM still does the judgment work clustering can't: fusing the same
-    person appearing under unrelated names, polishing descriptions, and
-    dropping trivial one-chapter background characters. Input is bounded by the
-    distinct-character count, not the chapter count.
+    The model sees just this volume's compact cluster list (no prior volumes,
+    no descriptions to rewrite) and returns merge GROUPS, which we apply to our
+    own clusters. This does the cross-name fusion judgment clustering can't,
+    without the failure modes of a full-cast rewrite (reintroduced generic
+    aliases, runaway repetition) or the prior-volume context blow-up.
+    `prior_volume_casts` is accepted for caller compatibility but intentionally
+    unused — cross-volume continuity is handled at voice-cast time.
     """
-    clustered_json = _cluster_payload(clusters)
-    prior_json = ""
-    if prior_volume_casts:
-        prior_json = json.dumps(
-            [cl.model_dump() for cl in prior_volume_casts],
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    if len(clustered_json) + len(prior_json) > _MERGE_INPUT_CHAR_BUDGET:
+    if len(clusters) < 2:
         return _deterministic_merge(clusters)
 
-    user = client.render(
-        "characters_merge.jinja",
-        clustered_cast_json=clustered_json,
-        prior_volume_casts=prior_json,
-        current_volume=current_volume_label,
-    )
-    # The clustered input is compact, so most of the context is free for the
-    # merged cast — size to the distinct-character count, clamped to fit.
-    n = len(clusters) + sum(len(c.characters) for c in (prior_volume_casts or []))
-    budget = client.budget_for(
-        system=SYSTEM, user=user, desired=800 * n + 4096, floor=4096
-    )
+    clustered_json = _cluster_payload(clusters)
+    if len(clustered_json) > _MERGE_INPUT_CHAR_BUDGET:
+        return _deterministic_merge(clusters)
+
+    user = client.render("characters_merge.jinja", clustered_cast_json=clustered_json)
+    # Output is just a handful of name groups — small and bounded, so a tight
+    # budget is plenty and keeps a weak model from running away.
+    budget = client.budget_for(system=SYSTEM, user=user, desired=4096, floor=1024)
     try:
-        return client.structured(
-            system=SYSTEM, user=user, schema=CharacterList, max_tokens=budget
+        proposal = client.structured(
+            system=SYSTEM, user=user, schema=CharacterMergeProposal, max_tokens=budget
         )
     except Exception:
         return _deterministic_merge(clusters)
+
+    return _apply_merge_groups(clusters, proposal)
 
 
 def _merge_log(clusters: list[CharacterCluster], final: CharacterList) -> dict:

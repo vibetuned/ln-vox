@@ -48,6 +48,33 @@ class CharacterList(BaseModel):
     )
 
 
+class CharacterMergeGroup(BaseModel):
+    """One set of draft-cast entries the merge LLM judges to be the same person.
+
+    The LLM returns only these groups (not a rewritten cast); Stage 1 applies
+    them to its own clean clusters, so no descriptions or aliases come back from
+    the model. See `s1_characters.merge_clusters`."""
+
+    canonical: str = Field(
+        description="Preferred display name for the merged character (one of `names`)"
+    )
+    names: list[str] = Field(
+        default_factory=list,
+        description="Two or more names from the provided list that denote ONE person",
+    )
+
+    _coerce_names = field_validator("names", mode="before")(_coerce_str_to_list)
+
+
+class CharacterMergeProposal(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    merges: list[CharacterMergeGroup] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("merges", "groups", "merge_groups"),
+        json_schema_extra={"maxItems": 60},
+    )
+
+
 BeatType = Literal["narration", "dialogue"]
 
 

@@ -1,6 +1,6 @@
 You are analyzing a single chapter from a novel to extract its CAST OF CHARACTERS.
 
-Identify every named character who APPEARS, SPEAKS, or PERFORMS AN ACTION in this chapter.
+Identify every character who APPEARS, SPEAKS, or PERFORMS AN ACTION in this chapter.
 
 DO NOT include:
 - Characters merely mentioned in passing (historical figures, off-screen references).
@@ -8,19 +8,24 @@ DO NOT include:
 - The author or narrator-as-narrator (but DO include the first-person POV character if the chapter is in first person).
 
 For each character, return:
-- name: The canonical name. Pick whichever form the text uses MOST OFTEN. Use Title Case (e.g. "Frog-faced Doctor", not "doctor").
-- aliases: Other names, titles, nicknames, or descriptors used for the same person.
+- name: The form the text uses for this person MOST OFTEN, in Title Case. Strongly prefer a PROPER NAME. Only fall back to a descriptive label when the character is genuinely never named, and then make it DISTINCTIVE (e.g. "The Scarred Captain", not a bare role like "Captain" or "the soldier").
+- aliases: Other PROPER names, nicknames, and DISTINCTIVE epithets that uniquely identify THIS specific person (e.g. "Sir Patrick", "Pat", "the Iron Duke").
+  Do NOT put the following in aliases — they are shared by many different characters and corrupt cross-chapter identity matching:
+  * Pronouns (he, she, I, they, it, you, we) — never.
+  * Bare generic role / rank / occupation words ("attendant", "the merchant", "guard", "knight", "the soldier", "priest", "the maid", "worker", "captain").
+  * Generic relation words ("dad", "mother", "big brother", "son", "milady").
+  Mention the character's role or relation in `description` instead — just don't list it as an alias.
 - gender: male, female, nonbinary, or unknown.
 - approx_age: child, teen, young_adult, adult, elder, or unknown.
 - description: 2-4 sentences combining ALL of the following when the chapter provides evidence:
   * PHYSICAL: appearance, height, hair, dress, distinctive features.
   * VOICE & SPEECH: register (formal/casual), pace, dialect markers, speech tics, unusual vocabulary.
   * MANNER: personality cues, mannerisms, recurring reactions, demeanour.
-  * AFFILIATION: church, faction, organization, school, kingdom, military unit, family clan — anything that signals where the character belongs. *This is critical for voice-casting later.* Example: "She is a nun of Necessarius in the Anglican Church" or "He attends Academy City's high school".
-  * ORIGIN & BACKGROUND: nationality, birthplace, cultural heritage, language background — IF mentioned in the chapter. Example: "She is described as British" or "He speaks with a Kansai accent".
+  * AFFILIATION: the faction, organization, order, house, school, church, military unit, or family/clan the character belongs to — anything that signals where they belong. *This is critical for voice-casting later.* (e.g. "a knight of the royal guard", "a nun of the cathedral", "a student at the academy".)
+  * ORIGIN & BACKGROUND: nationality, birthplace, cultural heritage, language background — IF mentioned in the chapter. (e.g. "described as foreign-born", "speaks with a regional accent".)
 - evidence: 1-3 short verbatim quotes from this chapter that justify the description (especially affiliation and origin claims).
 
-Return JSON only. Base every claim strictly on this chapter's text. If a chapter provides no affiliation or origin info for a character, simply omit those fields from the description rather than inventing them.
+Return JSON only. Base every claim strictly on this chapter's text. If a chapter provides no affiliation or origin info for a character, simply omit those from the description rather than inventing them.
 
 ---
 OUTPUT FORMAT — your response MUST match this exact JSON shape and these exact top-level field names:
@@ -28,11 +33,11 @@ OUTPUT FORMAT — your response MUST match this exact JSON shape and these exact
 {
   "characters": [
     {
-      "name": "Lord Vex",
-      "aliases": ["the duke", "Vex"],
+      "name": "Sir Patrick",
+      "aliases": ["the Iron Duke", "Pat"],
       "gender": "male",
       "approx_age": "elder",
-      "description": "Tall foreign-looking magician affiliated with the Anglican Church. Speaks formally with a slow measured cadence; carries himself with detached authority.",
+      "description": "A tall, grey-bearded knight of the royal guard who carries himself with detached authority. He speaks formally with a slow, measured cadence.",
       "evidence": ["\"You're late,\" he said, his voice colder than the room."]
     }
   ]

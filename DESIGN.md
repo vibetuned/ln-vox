@@ -101,15 +101,15 @@ Run **per chapter** then **merge globally**. Per-chapter keeps prompts short
 and avoids the 256K context being mostly wasted; the merge step deduplicates
 aliases ("Lord Vex" / "Vex" / "the duke").
 
-**Cross-volume merge.** When the book ID is `<series>/volume-NN` with NN > 01,
-the pipeline auto-detects all prior volumes in the same series
-(`artifacts/<series>/volume-*`) and feeds their `01_characters.json` files into
-the global merge step *in addition* to the current volume's per-chapter lists.
-The merge prompt is instructed to PRESERVE every trait from prior volumes
-(affiliation, origin, established personality) while integrating new traits
-from the current volume. A character who appeared as "Anglican Church nun" in
-volume 01 stays an Anglican nun in volume 02 even if the new chapters only
-mention her grimoire memory.
+**Cross-volume continuity.** When the book ID is `<series>/volume-NN`, the
+pipeline detects prior volumes in the same series (`artifacts/<series>/volume-*`).
+Continuity — a recurring character keeping the same voice — is applied at
+**voice-cast** time, which reuses a prior volume's clip assignment by canonical
+name. The Stage 1 merge itself is per-volume and deliberately does NOT feed
+prior-volume casts into the LLM: on a long series that input grows without
+bound (vol-13 would ship ~480K chars of priors), and a differently-named entry
+is better fused from the current volume's evidence than coerced to match a
+prior list.
 
 **Per-chapter prompt** asks Gemma 4 to return strict JSON:
 
@@ -136,25 +136,36 @@ exceeds the model's input budget (observed: ~36K input tokens on a 25-chapter
 volume, over the 64K ceiling once the output budget is added).
 
 1. **Deterministic clustering** (`cluster_characters`): union-find over the
-   per-chapter entries, fusing any that share a normalized name/alias key, plus
-   a fuzzy name pass (`difflib` ratio ≥ 0.9, min length 4) for transliteration
-   / typo variants ("Gunther"/"Gunter"). Enumerated names whose digit runs
-   differ ("Knight 1"/"Knight 2") are never fuzzy-fused. Each cluster combines
-   its members' fields by rule (canonical = most-frequent name form, alias =
-   union, gender/age = majority vote, description = longest, evidence = union).
-2. **LLM refine** (`merge_clusters`): a Gemma 4 call receives only a COMPACT
-   per-cluster summary (capped description, ≤2 evidence quotes, a `chapters`
-   occurrence count) — bounded by distinct-character count, not chapter count
-   (~91× smaller on the 25-chapter case). It does the judgment clustering
-   can't: fusing the same person under unrelated names, polishing descriptions,
-   and dropping trivial one-chapter background characters. A hard input-size
-   guard (`_MERGE_INPUT_CHAR_BUDGET`) falls back to the deterministic merge
-   rather than risk a context-length error.
+   per-chapter entries, fusing entries that share an *identity-safe* normalized
+   name/alias key. A key is identity-safe only when it denotes one person:
+   pronouns are never keys, and a key shared across genuinely different
+   canonical names — a generic role/title/relation like "attendant", "the
+   merchant", "milady", "high bishop" — is rejected (`_names_all_similar`), so
+   it can't chain unrelated characters (across genders and ages) into one
+   mega-cluster. Only spelling variants of one name ("Rozemyne"/"Lady
+   Rozemyne"/"Myne") cluster together. A fuzzy name pass (`difflib` ratio ≥ 0.9,
+   min length 4) catches transliteration / typo variants ("Gunther"/"Gunter");
+   enumerated names whose digit runs differ ("Knight 1"/"Knight 2") are never
+   fused. Each cluster combines its members' fields by rule (canonical =
+   most-frequent form, aliases = union minus pronouns and generic descriptors,
+   gender/age = majority, description = longest, evidence = union).
+2. **LLM merge-groups** (`merge_clusters`): a single Gemma 4 call receives a
+   COMPACT per-cluster summary of the *current* volume only (no prior volumes,
+   no descriptions to rewrite) and returns ONLY the GROUPS of clusters that are
+   the same person under different names. Stage 1 applies those groups to its
+   own clean clusters (`_apply_merge_groups`), so nothing the model writes —
+   descriptions or aliases — re-enters the cast. This does the cross-name
+   fusion judgment clustering can't, while avoiding a full-cast rewrite's
+   failure modes (an un-guided backend reintroducing generic aliases or looping
+   to the token cap) and the prior-volume context blow-up. A same-gender safety
+   net refuses any proposed group that would fuse a known gender split; a hard
+   input-size guard (`_MERGE_INPUT_CHAR_BUDGET`) and any transport/model error
+   fall back to the deterministic clusters.
 
 Outputs: `01_characters.json` (the merged cast) and
 `01_characters_merge_log.json` — provenance recording what merged into each
 cluster, which clusters are "lone" (single chapter), and each one's final
-disposition (kept / dropped / new-in-final).
+disposition.
 
 > **Model choice.** Use **Gemma 4 E4B** for dev/iteration (fits in ~10 GB
 > VRAM, ~2× faster) and **Gemma 4 31B Dense** for production runs. Both via
