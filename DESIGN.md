@@ -1393,3 +1393,173 @@ The serve script `-hf`'s the first form and `-m`'s the second.
 - **Bundling llama.cpp.** Vendoring the binary or pinning a build version
   is intentionally avoided — installs are heterogeneous (Metal vs.
   cuBLAS vs. ROCm) and out-of-band wins.
+
+## 15. Staged s4 (batched TTS phases, crash-isolated)
+
+Split the monolithic per-beat Dramabox render into four GPU phases with
+disk checkpoints between them. Each phase loads exactly ONE model, sweeps
+all pending work items in batches, and writes small tensors to disk.
+A crash loses at most one item and restarts pay a single-model reload,
+not the full four-model `TTSServer` boot.
+
+### 15.1 Why
+
+Consumer GPUs without ECC (the RTX 5090 dev box) crash sporadically
+mid-render: transient CUDA errors, driver resets, OOM under VRAM
+pressure. Today's mitigation is brute force — `s4_retry.sh` /
+`MAX_RETRIES` restart the whole stage and rely on the per-beat content
+cache to skip finished work. Every restart re-pays the full
+`TTSServer._load_all()`: Gemma (~11 s) + DiT (~8 s) + VAE encoder +
+decoder + `torch.compile` warm-up, all before the first pending beat
+resumes. On a run with dozens of crashes that overhead dominates.
+
+The monolithic path also carries structural costs
+([inference_server.py](external/DramaBox/src/inference_server.py)):
+
+- **Four models resident in VRAM simultaneously** (Gemma-3-12B bnb-4bit
+  prompt encoder ≈ 8 GB, the LTX audio-only DiT, VAE encoder, VAE
+  decoder + BigVGAN BWE). During the 30-step CFG+STG denoise the guider
+  triples the effective batch, so peak pressure lands on top of ~all
+  weights. Thin headroom is itself a crash driver.
+- **Per-beat waste:** `generate()` re-encodes the constant negative
+  prompt through Gemma on EVERY beat (`[prompt, DEFAULT_NEG]`), and
+  re-VAE-encodes the voice reference on every beat (only the RE-USE
+  denoise is cached, keyed by path).
+- **Long beats have no internal checkpoints:** `generate_long()` renders
+  N chunks inside one call and crossfades in memory — a crash on chunk
+  3/4 loses all four.
+
+### 15.2 Dramabox inference anatomy
+
+`TTSServer.generate()` is already a linear composition of separable
+steps. What each one needs and produces:
+
+| # | step               | model needed                    | output (per item)                | fp16 size    |
+|---|--------------------|---------------------------------|----------------------------------|--------------|
+| 0 | plan               | none (CPU)                      | work item: prompt chunk, frames, seed, cache key | bytes |
+| 1 | ref conditioning   | RE-USE + VAE **encoder**        | ref latent, per unique clip      | ~1 MB        |
+| 2 | prompt encode      | Gemma-3-12B (bnb-4bit)          | `a_ctx` audio encoding           | ~1–2 MB      |
+| 3 | denoise            | LTX audio DiT (the big one)     | denoised latent `(1,128,F,1)`    | ~130 KB/20 s |
+| 4 | decode + finish    | VAE **decoder** + BigVGAN BWE   | final WAV → `05_audio/` + cache  | audio        |
+
+Steps 0–2 are cheap sweeps. Step 3 dominates wall-clock and stays
+sequential in v1. Step 4 is fast. The negative-prompt context is
+encoded ONCE for the whole book instead of once per beat, and refs are
+encoded once per unique clip instead of once per beat.
+
+### 15.3 Phase layout
+
+`lnvox s4 --staged` runs a driver that executes phases in order, each as
+a **subprocess** (fresh CUDA context — a poisoned context from a prior
+fault can't leak forward):
+
+```
+P0 plan     artifacts/<book>/05_audio/_staged/plan.json
+P1 refs     _staged/refs/<clip_hash>.safetensors        (per unique voice clip)
+P2 ctx      _staged/ctx/<item_id>.safetensors + neg.safetensors
+P3 denoise  _staged/latents/<item_id>.safetensors
+P4 decode   05_audio/<chapter>/<beat_id>.wav + cache/tts/<key>.wav + manifest.json
+```
+
+- **Work item = beat chunk.** P0 replicates the monolithic sizing
+  exactly: `estimate_duration(prompt, multiplier)` per beat, and beats
+  whose estimate exceeds `max_chunk_duration` (45 s) are split with
+  `text_chunker.chunk_prompt_for_duration` up front. Beats whose final
+  WAV is already in the content cache are marked done in the plan — an
+  interrupted monolithic run resumes seamlessly under staged and vice
+  versa (same `cache_key` recipe, same `MODEL_VERSION`).
+- **P1** dedupes by voice clip: RE-USE denoise → mono/peak-norm/tile to
+  10 s → VAE encode, keyed by clip content hash + ref duration. A book
+  has tens of clips, not thousands of beats.
+- **P2** sweeps all prompts through Gemma one item at a time
+  (`PromptEncoder` takes a list but encodes sequentially inside — there
+  is no true batched forward to exploit), checkpointing each context
+  tensor as it lands. The savings are the negative prompt encoded once
+  per book instead of once per beat, and Gemma running with the whole
+  GPU to itself.
+- **P3** loads ref latent + ctx from disk, rebuilds the latent state
+  (conditioning applied BEFORE noise, same `manual_seed(seed)` order as
+  `generate()` — outputs are numerically identical modulo kernel
+  nondeterminism), runs the 30-step euler loop with the same
+  guider/rescale config, applies the frame-513 silence-prior fix, saves
+  the latent. Items are sorted by `n_frames` so `torch.compile(dynamic=True)`
+  sees few distinct shapes.
+- **P4** VAE-decodes each latent, equal-power-crossfades chunk groups
+  back into per-beat WAVs (same `_equal_power_crossfade`, 50 ms), writes
+  the WAV + content cache entry, deletes the item's intermediates, and
+  writes the per-chapter `manifest.json` (schema unchanged — s5/s6
+  don't know staged exists).
+
+All writes are `tmp + os.replace` atomic; "done" = output file exists.
+
+### 15.4 Crash isolation & resume
+
+- The driver restarts a failed phase subprocess; completed items skip by
+  file existence, so a crash costs one item's compute plus one
+  single-model load (P3 restart ≈ DiT load only, vs the full four-model
+  boot today).
+- **No item is ever skipped.** An audiobook with a silently missing
+  beat is worse than a stalled run, so every item retries until it
+  renders — crashes on non-ECC hardware are transient, and the same
+  item almost always succeeds on the next attempt. `_staged/attempts.json`
+  counts per-item failures purely as diagnostics (a beat that crashed
+  5× is worth looking at even after it eventually rendered). The one
+  guard: if `LNVOX_S4_STALL_LIMIT` (default 10) consecutive phase
+  restarts complete **zero** new items, the driver aborts loudly naming
+  the stuck item — a deterministic crasher should fail the stage for a
+  human to look at, not silently grind forever or get skipped.
+- `run_pipeline.sh`'s outer retry loop and `s4_retry.sh` become
+  redundant for staged runs (the driver owns retries); they stay for the
+  monolithic path.
+
+### 15.5 Storage
+
+Intermediates for a ~5 000-item novel peak at roughly: refs ~50 MB, ctx
+~5–10 GB (the dominant term — fp16, deleted per item as P4 lands its
+WAV), latents ~1 GB. `--keep-staged` retains everything for debugging;
+default is delete-on-finish, so steady-state overhead is bounded by the
+not-yet-decoded window.
+
+### 15.6 Code surface affected
+
+| Area                              | Change                                                                                                                                          |
+|-----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `src/lnvox/tts/staged.py` (new)   | Phase implementations. Imports Dramabox building blocks (`PromptEncoder`, `AudioConditioner`, `AudioDecoder`, DiT builder, `auto_rescale_for_cfg`, `_equal_power_crossfade`, `text_chunker`) exactly the way `inference_server.py` composes them — **Dramabox source stays unpatched**. |
+| `src/lnvox/tts/staged_driver.py` (new) | Plan model, subprocess orchestration, attempts/poisoned bookkeeping.                                                                        |
+| `src/lnvox/cli.py`                | `lnvox s4 --staged` flag + hidden `lnvox s4-phase {plan,refs,ctx,denoise,decode}` per-phase entry points (what the driver spawns).               |
+| `scripts/run_pipeline.sh`         | `--staged-tts` (or `LNVOX_S4_STAGED=1`) routes s4 through the driver and skips the outer retry loop for it.                                       |
+| `src/lnvox/stages/s4_tts.py`      | Untouched — monolithic path remains the default until staged is validated on a full book.                                                        |
+
+### 15.7 Expected wins (honest)
+
+- **Crash restart cost:** full 4-model boot + compile warm-up (≈ 40–60 s)
+  → one model (P3 ≈ 10–15 s). This is the headline win on non-ECC
+  hardware; with dozens of crashes per book it's hours.
+- **Fewer crashes to begin with:** P3 runs with only the DiT resident —
+  the VRAM freed from Gemma + both VAE halves becomes headroom under
+  the 3× guider batch.
+- **Throughput on a crash-free run:** modest (~10–20 %) — the denoise
+  loop dominates and is unchanged. The savings are the eliminated
+  per-beat negative-prompt encode, per-beat ref VAE encode, batched
+  Gemma calls, and fewer compile shape misses from frame-sorted P3.
+- **Long beats** checkpoint per chunk instead of per beat.
+
+Before building: capture one crash-free chapter with the existing per-step
+log lines (`Prompt:`, `Denoise (30 steps):`, `Decode (LTX BWE):`) to
+validate these ratios on the 5090.
+
+### 15.8 What's explicitly **not** in this section
+
+- **True batched denoise (batch > 1 in P3).** The LTX euler loop +
+  `BatchSplitAdapter` suggest it's reachable, but padding/attention-mask
+  semantics across mixed-length latents are unverified. v2 experiment
+  behind an env flag; v1 keeps per-item denoise.
+- **Parallel phases / multi-GPU.** The phase boundary would support a
+  producer-consumer overlap (P2 on one card, P3 on another); out of
+  scope for one-GPU boxes.
+- **MPS.** Staged runs fine as subprocesses on Apple Silicon and
+  inherits the §11.3 knobs via the same code path, but is not
+  smoke-tested there; monolithic stays the Darwin default.
+- **Changing voice or sampling params.** cfg/stg/seed/duration logic is
+  byte-for-byte the monolithic recipe — this section is plumbing, not
+  quality tuning.

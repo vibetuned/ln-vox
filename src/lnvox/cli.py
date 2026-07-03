@@ -504,6 +504,19 @@ def stage4(
             "when available, else 'cuda'. Pass 'cpu' to force CPU."
         ),
     ),
+    staged: bool = typer.Option(
+        False,
+        "--staged",
+        help=(
+            "Run the crash-isolated staged pipeline (DESIGN.md §15): four "
+            "checkpointed phases, one model in VRAM at a time, subprocess "
+            "per phase with automatic resume."
+        ),
+    ),
+    keep_staged: bool = typer.Option(
+        False,
+        help="Keep _staged/ intermediates after a successful staged run (debugging).",
+    ),
 ):
     """Stage 4: Render directed beats to audio via Dramabox.
 
@@ -571,6 +584,27 @@ def stage4(
         f"→ {audio_dir}"
     )
 
+    if staged:
+        from lnvox.tts import staged_driver
+
+        staged_driver.run_staged(
+            book_id=book_id,
+            chapters=chapters_loaded,
+            casting=casting,
+            voicebank=voicebank,
+            voicebank_root=vb_dir,
+            book_dir=out_dir,
+            cache_dir=cache_dir,
+            device=device,
+            limit=limit,
+            keep_staged=keep_staged,
+            progress=_progress,
+        )
+        console.print(
+            f"[green]Done (staged).[/] Audio under {audio_dir}/, cache under {cache_dir}/."
+        )
+        return
+
     from lnvox.tts.dramabox_client import DramaboxClient
 
     s4_tts.run(
@@ -586,6 +620,33 @@ def stage4(
         limit=limit,
     )
     console.print(f"[green]Done.[/] Audio under {audio_dir}/, cache under {cache_dir}/.")
+
+
+@app.command(name="s4-phase", hidden=True)
+def stage4_phase(
+    phase: str,
+    book_id: str,
+    device: Optional[str] = typer.Option(None, help="Torch device (default: auto)."),
+):
+    """Internal: run ONE staged-s4 phase sweep (DESIGN.md §15).
+
+    Spawned as a subprocess by `lnvox s4 --staged` so each attempt gets a
+    fresh CUDA context; exits non-zero on any failure and is relaunched by
+    the driver, resuming from the per-item files already on disk.
+    """
+    from lnvox.tts import staged
+
+    if phase not in staged.PHASES:
+        console.print(f"[red]Unknown phase '{phase}'. Expected one of {staged.PHASES}.[/]")
+        raise typer.Exit(2)
+    if device is None:
+        device = _default_tts_device()
+    staged.run_phase(
+        phase,
+        book_dir=_book_dir(book_id),
+        cache_dir=Path("cache") / "tts",
+        device=device,
+    )
 
 
 @app.command(name="s5")

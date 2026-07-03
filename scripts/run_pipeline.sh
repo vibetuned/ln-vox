@@ -28,6 +28,9 @@
 #     --max-model-len <N>      Override vLLM context window (default: model-dependent).
 #     --skip-llm               Skip s1..s3 + voice cast (assume already done).
 #     --skip-tts               Skip s4 (assume already rendered).
+#     --staged-tts             Run s4 via the staged pipeline (DESIGN.md §15):
+#                              checkpointed single-model phases with built-in
+#                              crash resume. Honors $LNVOX_S4_STAGED=1.
 #     --skip-mix               Skip s5 (skip the m4b assembly).
 #     --skip-sync              Skip s6 (skip the synced-EPUB / sync_manifest).
 #     --epub <path>            Source EPUB for s6 (default: epubs/<book_id>.epub).
@@ -62,10 +65,11 @@ LLM_MODEL=""
 MAX_MODEL_LEN=""
 SKIP_LLM=0
 SKIP_TTS=0
+STAGED_TTS="${LNVOX_S4_STAGED:-1}"
 SKIP_MIX=0
 SKIP_SYNC=0
 EPUB_PATH=""
-MAX_RETRIES="${MAX_RETRIES:-300}"
+MAX_RETRIES="${MAX_RETRIES:-30}"
 STEP_RETRIES="${STEP_RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-5}"
 
@@ -91,6 +95,7 @@ while [ $# -gt 0 ]; do
         --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
         --skip-llm)      SKIP_LLM=1;        shift   ;;
         --skip-tts)      SKIP_TTS=1;        shift   ;;
+        --staged-tts)    STAGED_TTS=1;      shift   ;;
         --skip-mix)      SKIP_MIX=1;        shift   ;;
         --skip-sync)     SKIP_SYNC=1;       shift   ;;
         --epub)          EPUB_PATH="$2";    shift 2 ;;
@@ -548,8 +553,19 @@ else
         sleep 5
     fi
     prepare_tts_env
-    banner "Stage 4: TTS (Dramabox, with auto-retry)"
-    MAX_ATTEMPTS="$MAX_RETRIES" ./scripts/s4_retry.sh "$BOOK_ID"
+    if [ "$STAGED_TTS" -eq 1 ]; then
+        # The staged driver owns crash retries internally (per-phase
+        # subprocesses with file-level resume, DESIGN.md §15.4) — no outer
+        # retry loop, so a driver abort (stall limit) surfaces immediately.
+        banner "Stage 4: TTS (Dramabox, staged phases)"
+        if ! uv run lnvox s4 "$BOOK_ID" --staged; then
+            echo "ERROR: staged s4 failed — see the stall diagnostics above." >&2
+            exit 1
+        fi
+    else
+        banner "Stage 4: TTS (Dramabox, with auto-retry)"
+        MAX_ATTEMPTS="$MAX_RETRIES" ./scripts/s4_retry.sh "$BOOK_ID"
+    fi
 fi
 
 # ----- Mix phase -------------------------------------------------------------

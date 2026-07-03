@@ -38,6 +38,7 @@ from typing import Callable
 from xml.etree import ElementTree as ET
 
 from bs4 import BeautifulSoup, NavigableString
+from bs4.element import PreformattedString
 
 
 # ---- constants --------------------------------------------------------------
@@ -92,8 +93,14 @@ def _normalize_with_map(text: str) -> tuple[str, list[int]]:
             orig.append(i)
             continue
         in_ws = False
-        out.append(ch.lower())
-        orig.append(i)
+        low = ch.lower()
+        # A handful of codepoints lowercase to MORE than one char ('İ' →
+        # 'i̇'). Emit one map entry per output char, all pointing at the
+        # same original index, so len(normalized) == len(map) always holds —
+        # otherwise every wrap offset after that char shifts.
+        for c in low:
+            out.append(c)
+            orig.append(i)
     return "".join(out), orig
 
 
@@ -146,6 +153,14 @@ def _build_shadow(
     cursor = 0
     for node in body.descendants:
         if isinstance(node, NavigableString):
+            # Comments / CDATA / processing instructions / doctypes are all
+            # NavigableString subclasses (via PreformattedString). Their text
+            # is invisible in a reader — letting it into the shadow both
+            # misplaces matches AND, if a match lands inside one, the wrap
+            # step replaces the comment node with a plain-text span, making
+            # previously hidden text visible in the synced EPUB.
+            if isinstance(node, PreformattedString):
+                continue
             if any(p.name in _SKIP_NODE_PARENTS for p in node.parents if p.name):
                 continue
             raw = str(node)
@@ -446,7 +461,14 @@ def _wrap_matches(
         if cursor < len(text):
             new_parts.append(NavigableString(text[cursor:]))
 
-        idx = list(parent.contents).index(node)
+        # Find the node's position by IDENTITY. list.index() compares with
+        # ==, and NavigableString == is string equality — with two identical
+        # text nodes under one parent (repeated phrases around inline tags)
+        # it returns the FIRST twin, and the replacement parts get inserted
+        # there, reordering the chapter text.
+        idx = next(
+            i for i, c in enumerate(parent.contents) if c is node
+        )
         node.extract()
         for offset, part in enumerate(new_parts):
             parent.insert(idx + offset, part)
@@ -665,9 +687,6 @@ def run(
     # chapter_id → [(beat_id, source_paragraph, start_s, end_s)] in playback
     # order, for placing lecture-mode visual elements (DESIGN.md §13.5).
     chapter_matched_seq: dict[str, list[tuple[str, int, float, float]]] = {}
-    # chapter_id → (first_matched_beat_id, last_matched_beat_id) for spine
-    # image placement.
-    chapter_first_last: dict[str, tuple[str, str]] = {}
     confidence_counts: dict[str, int] = {
         "span-exact": 0,
         "exact": 0,
@@ -858,15 +877,6 @@ def run(
                 })
                 chapter_matched_seq.setdefault(chapter_id, []).append(
                     (beat_id, beat.get("source_paragraph", -1), timing[0], timing[1])
-                )
-
-            # Record first/last matched beat (in source position order) for
-            # spine-level image placement after the chapter loop.
-            if chapter_matches:
-                by_pos = sorted(chapter_matches, key=lambda m: m.shadow_start)
-                chapter_first_last[chapter_id] = (
-                    by_pos[0].beat_id,
-                    by_pos[-1].beat_id,
                 )
 
             # ---- Map INLINE images to neighbouring beats --------------------
