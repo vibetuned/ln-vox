@@ -70,8 +70,27 @@ if [ "$OS" = "Darwin" ]; then
 else
     case "$ARCH" in
         x86_64)
-            echo "==> x86_64 → installing $REQ_FILE verbatim"
-            uv pip install -r "$REQ_FILE"
+            echo "==> x86_64 → installing $REQ_FILE (mamba kernels via prebuilt wheels)"
+            # mamba-ssm / causal-conv1d ship only sdists on PyPI. Building them
+            # under uv's isolated build env links selective_scan_cuda against
+            # the build env's (latest) torch, not the pinned 2.8 — the .so then
+            # fails to import ("undefined symbol") and RE-USE silently drops to
+            # its kernel-free fallback (~5-10x slower denoise). Filter them out
+            # and install the ABI-matched prebuilt wheels from the upstream
+            # GitHub releases instead. Mirrors run_pipeline.sh's
+            # install_mamba_kernel_wheels.
+            FILTERED="$(mktemp)"
+            trap 'rm -f "$FILTERED"' EXIT
+            grep -v -i -E '^[[:space:]]*(mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' \
+                "$REQ_FILE" > "$FILTERED"
+            uv pip install -r "$FILTERED"
+            PYTAG="$(.venv/bin/python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+            ABI="cu12torch2.8cxx11abiTRUE"
+            MAMBA_SSM_VERSION="2.3.1"
+            CAUSAL_CONV1D_VERSION="1.6.2.post1"
+            uv pip install --no-deps \
+                "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_x86_64.whl" \
+                "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_x86_64.whl"
             ;;
 
         aarch64|arm64)

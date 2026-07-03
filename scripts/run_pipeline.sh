@@ -255,6 +255,25 @@ prepare_llm_env() {
     esac
 }
 
+# mamba-ssm / causal-conv1d ship only sdists on PyPI. Building those under
+# uv's isolated build env links selective_scan_cuda against the build env's
+# (latest) torch, not the venv's pinned 2.8 — the .so then fails to import
+# ("undefined symbol: _ZN3c104cuda...") and RE-USE silently drops to its
+# kernel-free fallback (~5-10x slower denoise). Install the prebuilt wheels
+# keyed to torch 2.8 / cu12 from the upstream GitHub releases instead.
+# x86_64 Linux only: that's the arch where the torch 2.8 pin is kept verbatim.
+MAMBA_SSM_VERSION="2.3.1"
+CAUSAL_CONV1D_VERSION="1.6.2.post1"
+
+install_mamba_kernel_wheels() {
+    local pytag abi
+    pytag="$(.venv/bin/python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+    abi="cu12torch2.8cxx11abiTRUE"
+    uv pip install --no-deps \
+        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${abi}-${pytag}-${pytag}-linux_x86_64.whl" \
+        "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${abi}-${pytag}-${pytag}-linux_x86_64.whl"
+}
+
 # Install Dramabox's requirements.txt with platform-aware torch handling.
 # Dramabox pins torch==2.8.0 which has no CUDA-enabled aarch64 wheel — on that
 # arch we strip the torch lines and pull torch>=2.10 from the cu130 index
@@ -288,7 +307,16 @@ install_dramabox_reqs() {
 
     case "$arch" in
         x86_64)
-            uv pip install -r "$req_file"
+            # Strip the mamba kernel packages so uv never builds their sdists
+            # blind; install_mamba_kernel_wheels puts the ABI-matched prebuilt
+            # wheels in their place.
+            local filtered
+            filtered="$(mktemp)"
+            grep -v -i -E '^[[:space:]]*(mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' \
+                "$req_file" > "$filtered"
+            uv pip install -r "$filtered"
+            rm -f "$filtered"
+            install_mamba_kernel_wheels
             ;;
         aarch64|arm64)
             local filtered
