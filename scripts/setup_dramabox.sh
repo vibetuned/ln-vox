@@ -95,20 +95,32 @@ else
 
         aarch64|arm64)
             echo "==> aarch64 detected (DGX Spark / Grace Hopper / Jetson)"
-            echo "    Filtering torch / torchaudio out of Dramabox's requirements"
-            echo "    (no CUDA-enabled aarch64 wheel exists for torch 2.8.0)."
+            echo "    Filtering torch / torchaudio + mamba kernels out of Dramabox's requirements"
+            echo "    (no CUDA-enabled aarch64 wheel exists for torch 2.8.0; mamba"
+            echo "    sdist builds link the wrong torch ABI under build isolation)."
             FILTERED="$(mktemp)"
             trap 'rm -f "$FILTERED"' EXIT
-            # Drop any line that pins torch / torchaudio / torchvision regardless
-            # of the operator (==, >=, <=, ~=, !=).
-            grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision)([[:space:]]|=|<|>|~|!|$)' "$REQ_FILE" > "$FILTERED"
+            # Drop any line that pins torch / torchaudio / torchvision /
+            # mamba-ssm / causal-conv1d regardless of the operator.
+            grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision|mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' "$REQ_FILE" > "$FILTERED"
             echo "    Installing filtered Dramabox requirements…"
             uv pip install -r "$FILTERED"
             echo "    Installing torch + torchaudio from the cu130 aarch64+sbsa wheels…"
+            # ==2.10.* (not >=2.10,<2.12): the newest prebuilt mamba kernel
+            # wheels are keyed cu13torch2.10. Bump both together when upstream
+            # adds torch2.11 wheels. Mirrors run_pipeline.sh.
             uv pip install \
                 --index-url https://download.pytorch.org/whl/cu130 \
-                "torch>=2.10,<2.12" \
-                "torchaudio>=2.10,<2.12"
+                "torch==2.10.*" \
+                "torchaudio==2.10.*"
+            echo "    Installing prebuilt mamba kernel wheels (cu13torch2.10, aarch64)…"
+            PYTAG="$(.venv/bin/python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+            ABI="cu13torch2.10cxx11abiTRUE"
+            MAMBA_SSM_VERSION="2.3.1"
+            CAUSAL_CONV1D_VERSION="1.6.2.post1"
+            uv pip install --no-deps \
+                "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_aarch64.whl" \
+                "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_aarch64.whl"
             ;;
 
         *)

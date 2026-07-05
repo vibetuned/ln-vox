@@ -262,21 +262,24 @@ prepare_llm_env() {
 
 # mamba-ssm / causal-conv1d ship only sdists on PyPI. Building those under
 # uv's isolated build env links selective_scan_cuda against the build env's
-# (latest) torch, not the venv's pinned 2.8 — the .so then fails to import
+# (latest) torch, not the venv's actual torch — the .so then fails to import
 # ("undefined symbol: _ZN3c104cuda...") and RE-USE silently drops to its
 # kernel-free fallback (~5-10x slower denoise). Install the prebuilt wheels
-# keyed to torch 2.8 / cu12 from the upstream GitHub releases instead.
-# x86_64 Linux only: that's the arch where the torch 2.8 pin is kept verbatim.
+# from the upstream GitHub releases instead, keyed to the venv's exact
+# torch/CUDA combo:
+#   x86_64  → cu12torch2.8   (torch pinned 2.8.0+cu128 by Dramabox's reqs)
+#   aarch64 → cu13torch2.10  (torch ==2.10.* from the cu130 index; 2.10 is
+#             the newest torch the upstream wheel matrix covers, hence the
+#             pin below instead of >=2.10,<2.12. Verified on DGX Spark GB10.)
 MAMBA_SSM_VERSION="2.3.1"
 CAUSAL_CONV1D_VERSION="1.6.2.post1"
 
 install_mamba_kernel_wheels() {
-    local pytag abi
+    local abi="$1" arch="$2" pytag
     pytag="$(.venv/bin/python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
-    abi="cu12torch2.8cxx11abiTRUE"
     uv pip install --no-deps \
-        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${abi}-${pytag}-${pytag}-linux_x86_64.whl" \
-        "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${abi}-${pytag}-${pytag}-linux_x86_64.whl"
+        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${abi}cxx11abiTRUE-${pytag}-${pytag}-linux_${arch}.whl" \
+        "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${abi}cxx11abiTRUE-${pytag}-${pytag}-linux_${arch}.whl"
 }
 
 # Install Dramabox's requirements.txt with platform-aware torch handling.
@@ -321,21 +324,27 @@ install_dramabox_reqs() {
                 "$req_file" > "$filtered"
             uv pip install -r "$filtered"
             rm -f "$filtered"
-            install_mamba_kernel_wheels
+            install_mamba_kernel_wheels "cu12torch2.8" "x86_64"
             ;;
         aarch64|arm64)
             local filtered
             filtered="$(mktemp)"
-            # Drop torch / torchaudio / torchvision pins; Dramabox's 2.8 has
-            # no aarch64+CUDA build.
-            grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision)([[:space:]]|=|<|>|~|!|$)' \
+            # Drop torch / torchaudio / torchvision pins (Dramabox's 2.8 has
+            # no aarch64+CUDA build) AND the mamba kernel packages (sdist
+            # builds link the wrong torch ABI — see install_mamba_kernel_wheels).
+            grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision|mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' \
                 "$req_file" > "$filtered"
             uv pip install -r "$filtered"
             rm -f "$filtered"
+            # ==2.10.* (not >=2.10,<2.12): the newest prebuilt mamba kernel
+            # wheels are keyed cu13torch2.10 — torch 2.11 would leave RE-USE
+            # on the slow kernel-free fallback. Bump both together when
+            # upstream adds torch2.11 wheels.
             uv pip install \
                 --index-url https://download.pytorch.org/whl/cu130 \
-                "torch>=2.10,<2.12" \
-                "torchaudio>=2.10,<2.12"
+                "torch==2.10.*" \
+                "torchaudio==2.10.*"
+            install_mamba_kernel_wheels "cu13torch2.10" "aarch64"
             ;;
         *)
             echo "WARN: unknown arch '$arch'; installing Dramabox reqs verbatim." >&2
