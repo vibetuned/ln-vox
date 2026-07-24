@@ -1,0 +1,35 @@
+This is the characters section of a theater script (any language). Extract one entry per ROLE (a script may map several roles onto one performer).
+
+Fields per entry:
+- "name": the role name exactly as printed (markdown stripped).
+- "description": the role's bio/notes as printed, verbatim; "" when the section gives none.
+- "actor": the performer's name when the section maps the role to one (arrow, slash, or similar notation); "" otherwise.
+
+Rules:
+- One entry per role, even when several roles share a performer.
+- Copy text verbatim (markdown markers removed); never invent or embellish.
+
+Example (invented):
+
+Input:
+```
+- **Gardien \+ Le facteur → Paul**
+- **Voyageuse → Jeanne** : jeune femme pressée, arrivée de nuit
+```
+
+Output JSON:
+{
+  "entries": [
+    {"name": "Gardien", "description": "", "actor": "Paul"},
+    {"name": "Le facteur", "description": "", "actor": "Paul"},
+    {"name": "Voyageuse", "description": "jeune femme pressée, arrivée de nuit", "actor": "Jeanne"}
+  ]
+}
+
+---
+Characters section:
+
+{{ chunk }}
+
+---
+Output JSON only, matching the schema {"entries": [{"name": ..., "description": ..., "actor": ...}]}.

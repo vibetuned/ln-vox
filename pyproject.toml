@@ -49,8 +49,12 @@ tts = [
     # We deliberately don't pin torch here because vLLM requires a
     # newer torchaudio than Dramabox; the DramaboxClient monkey-patches
     # torchaudio.save() so version mismatches don't trip the WAV writer.
+    # VibeVoice is likewise git-cloned (scripts/setup_vibevoice.sh) and
+    # pip-installed editable; soxr is the 24k→48k resampler its client
+    # uses at save time (DESIGN.md §16.4).
     "soundfile>=0.12",
     "huggingface-hub>=0.24",
+    "soxr>=0.5",
 ]
 
 [project.scripts]

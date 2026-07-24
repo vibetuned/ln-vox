@@ -19,6 +19,7 @@ from typing import Callable
 
 from lnvox.llm.schemas import ChapterDirected
 from lnvox.tts.schema import ChapterAudio, RenderedBeat
+from lnvox.tts.trim import trim_file
 from lnvox.voices.schema import BookCasting, Voicebank
 
 
@@ -45,31 +46,88 @@ def _build_speaker_to_clip_path(
     voicebank: Voicebank,
     voicebank_root: Path,
 ) -> dict[str, Path | None]:
-    """character_name → Path to the assigned ref clip, or None if no assignment."""
+    """character_name → Path to the assigned ref clip, or None if no assignment.
+
+    An UNASSIGNED character (empty `assigned_clip_id`) maps to None — that's a
+    legitimate state (descriptor-only rendering). An ASSIGNED clip id that is
+    missing from the loaded voicebank is always a configuration error (the
+    casting was made against a different bank): rendering would silently lose
+    the cast voices AND re-key the whole content cache, so fail loudly instead.
+    """
     clip_by_id = {c.id: c for c in voicebank.clips}
     mapping: dict[str, Path | None] = {}
+    missing: dict[str, str] = {}
     for cst in casting.castings:
         if not cst.assigned_clip_id:
             mapping[cst.character_name] = None
             continue
         clip = clip_by_id.get(cst.assigned_clip_id)
-        mapping[cst.character_name] = (
-            (voicebank_root / clip.clip_path).resolve() if clip else None
+        if clip is None:
+            missing[cst.character_name] = cst.assigned_clip_id
+            continue
+        mapping[cst.character_name] = (voicebank_root / clip.clip_path).resolve()
+    if missing:
+        sample = ", ".join(
+            f"{name} → {cid}" for name, cid in list(missing.items())[:3]
+        )
+        raise RuntimeError(
+            f"{len(missing)} cast character(s) reference clip ids that don't exist "
+            f"in the voicebank at {voicebank_root}/ (e.g. {sample}).\n"
+            f"The casting was made against a DIFFERENT voicebank — point "
+            f"LNVOX_VOICEBANK at the right directory (e.g. "
+            f"`export LNVOX_VOICEBANK=voicebank-fr`) and re-run."
         )
     return mapping
+
+
+def slice_chapters(
+    chapters: list[ChapterDirected], limit: int | None
+) -> list[ChapterDirected]:
+    """Truncate to the first `limit` beats overall (smoke-test mode)."""
+    if limit is None:
+        return chapters
+    remaining = limit
+    sliced: list[ChapterDirected] = []
+    for ch in chapters:
+        if remaining <= 0:
+            break
+        kept_scenes = []
+        for sc in ch.scenes:
+            if remaining <= 0:
+                break
+            take = sc.beats[:remaining]
+            if take:
+                kept_scenes.append(sc.model_copy(update={"beats": take}))
+                remaining -= len(take)
+        if kept_scenes:
+            sliced.append(ch.model_copy(update={"scenes": kept_scenes}))
+    return sliced
 
 
 def render_chapter(
     chapter: ChapterDirected,
     *,
-    client,  # DramaboxClient (typed loosely so this module imports without the optional dep)
+    client=None,  # DramaboxClient (typed loosely so this module imports without the optional dep)
+    client_provider: Callable[[], "object"] | None = None,  # lazy alternative
     speaker_to_clip: dict[str, Path | None],
     output_dir: Path,
     cache_dir: Path,
     model_version: str,
     progress: Callable[[str], None] = print,
 ) -> ChapterAudio:
-    """Render every beat in `chapter` to a WAV file. Returns a ChapterAudio manifest."""
+    """Render every beat in `chapter` to a WAV file. Returns a ChapterAudio manifest.
+
+    The client may be passed lazily via `client_provider` — it is only
+    resolved on the first cache MISS, so a fully-cached re-run never loads
+    the model (no GPU touch to re-place a rendered book/play from cache).
+    """
+
+    def _client():
+        nonlocal client
+        if client is None:
+            client = client_provider()
+        return client
+
     chapter_dir = output_dir / chapter.chapter_id
     chapter_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -92,15 +150,21 @@ def render_chapter(
             cached = False
             if cache_path.exists():
                 shutil.copy(cache_path, wav_path)
+                # Legacy cache entries may predate the edge-silence trim
+                # (DESIGN.md §2.6); trimming is idempotent, and a real trim
+                # upgrades the cache entry in place.
+                if trim_file(wav_path) > 0:
+                    shutil.copy(wav_path, cache_path)
                 cached = True
                 cache_hits += 1
             else:
-                client.generate(
+                _client().generate(
                     prompt=beat.prompt,
                     output_path=wav_path,
                     voice_ref=ref_clip_path,
                 )
                 if wav_path.exists():
+                    trim_file(wav_path)
                     shutil.copy(wav_path, cache_path)
                 renders += 1
 
@@ -162,32 +226,23 @@ def run(
     output_dir.mkdir(parents=True, exist_ok=True)
     speaker_to_clip = _build_speaker_to_clip_path(casting, voicebank, voicebank_root)
 
-    if limit is not None:
-        remaining = limit
-        sliced: list[ChapterDirected] = []
-        for ch in chapters:
-            if remaining <= 0:
-                break
-            kept_scenes = []
-            for sc in ch.scenes:
-                if remaining <= 0:
-                    break
-                take = sc.beats[:remaining]
-                if take:
-                    kept_scenes.append(sc.model_copy(update={"beats": take}))
-                    remaining -= len(take)
-            if kept_scenes:
-                sliced.append(ch.model_copy(update={"scenes": kept_scenes}))
-        chapters = sliced
+    chapters = slice_chapters(chapters, limit)
 
-    progress(f"Loading Dramabox (first model load downloads ~3-4GB of weights)…")
-    client = client_factory()
+    # Lazy client: constructed on the first cache miss only, so a fully-cached
+    # re-run (e.g. re-placing trimmed WAVs) never loads the model.
+    _holder: list = []
+
+    def _get_client():
+        if not _holder:
+            progress("Loading Dramabox (first model load downloads ~3-4GB of weights)…")
+            _holder.append(client_factory())
+        return _holder[0]
 
     results: list[ChapterAudio] = []
     for ch in chapters:
         result = render_chapter(
             ch,
-            client=client,
+            client_provider=_get_client,
             speaker_to_clip=speaker_to_clip,
             output_dir=output_dir,
             cache_dir=cache_dir,

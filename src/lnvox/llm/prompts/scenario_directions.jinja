@@ -1,0 +1,28 @@
+You are directing the vocal performance of one theater scene. Below is the scene in order (dialogue with speakers, plus staging directions), followed by a numbered list of the dialogue lines that need direction.
+
+For each numbered line, produce:
+- "emotion": exactly one of calm, joy, sadness, anger, fear, surprise, disgust — the speaker's dominant emotion on that line.
+- "cue": a SHORT performance cue (2-6 words) in the SAME LANGUAGE as the script — vocal manner and intent (e.g., for a French script: "méfiant, voix basse", "faussement enjoué", "à bout de souffle").
+
+Rules:
+- Ground the emotion in the staging directions and surrounding lines; do not contradict them.
+- Do NOT repeat the line's words inside the cue.
+- Comedy plays fast: prefer active, playable cues over generic ones ("calme" is a last resort).
+- Output ONE entry per numbered line, no skipping, no extras.
+
+---
+Scene "{{ scene_id }}"{% if scene_title %} — {{ scene_title }}{% endif %}:
+{{ scene_context }}
+
+---
+Dialogue lines needing direction:
+{{ numbered_dialogue }}
+
+---
+Output JSON only:
+{
+  "directions": [
+    {"line": 1, "emotion": "fear", "cue": "..."},
+    {"line": 2, "emotion": "calm", "cue": "..."}
+  ]
+}

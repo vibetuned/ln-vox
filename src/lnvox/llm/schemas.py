@@ -192,7 +192,13 @@ class DirectedBeat(BaseModel):
     # only; -1 in narration mode). Lets Stage 6 place ingest-extracted visual
     # elements (code/table/figure), which carry an `after_paragraph`, against
     # the beat that covers that paragraph. See DESIGN.md §13.2/§13.5.
+    # Scenario mode (§17) reuses it as the chapter-global dialogue-line index
+    # so the sync emitter can re-group a long line's split chunks.
     source_paragraph: int = -1
+    # Scenario mode (§17) / emotion voicebank (§16.7): one of the 7-value
+    # Emotion enum. "calm" everywhere else — a plain str so old artifacts
+    # and non-scenario paths validate unchanged.
+    emotion: str = "calm"
 
 
 class DirectedScene(BaseModel):
@@ -239,3 +245,75 @@ class NormalizedBeat(BaseModel):
 class NormalizedBeats(BaseModel):
     # maxItems caps a runaway model in the guided schema only (see Character).
     beats: list[NormalizedBeat] = Field(json_schema_extra={"maxItems": 200})
+
+
+# ---------- Scenario mode (DESIGN.md §17) ----------
+
+
+# Shared with the §16.7 emotion-voicebank plan: 7 language-neutral values.
+Emotion = Literal["calm", "joy", "sadness", "anger", "fear", "surprise", "disgust"]
+
+ScriptItemType = Literal["dialogue", "staging", "cue"]
+
+
+class ScriptItem(BaseModel):
+    """One structured line of a theater script (verbatim text, never rewritten)."""
+
+    type: ScriptItemType
+    speaker: str = Field(
+        default="",
+        description="Speaker label as printed (markdown stripped); '' unless dialogue",
+    )
+    text: str = Field(description="Verbatim line text, markdown markers/escapes removed")
+
+
+class SceneStructure(BaseModel):
+    """LLM output for one scene chunk of a script (§17.2)."""
+
+    items: list[ScriptItem] = Field(json_schema_extra={"maxItems": 300})
+
+
+class RosterEntry(BaseModel):
+    """One entry of the script's own characters section, when present."""
+
+    name: str
+    description: str = ""
+    actor: str = Field(
+        default="",
+        description="Performer this role maps to when the script lists one; else ''",
+    )
+
+
+class RosterList(BaseModel):
+    entries: list[RosterEntry] = Field(
+        default_factory=list, json_schema_extra={"maxItems": 80}
+    )
+
+
+class ScriptScene(BaseModel):
+    scene_id: str  # "01", "02", … (also the s4/s5 chapter id)
+    title: str = ""
+    items: list[ScriptItem] = Field(default_factory=list)
+
+
+class ScenarioScript(BaseModel):
+    """artifacts/<id>/00_script.json — the structured, verbatim script."""
+
+    scenario_id: str
+    title: str = ""
+    language: str = ""
+    roster: list[RosterEntry] = Field(default_factory=list)
+    scenes: list[ScriptScene] = Field(default_factory=list)
+
+
+class ScenarioCue(BaseModel):
+    line: int = Field(description="1-indexed dialogue-line number from the prompt")
+    emotion: Emotion = "calm"
+    cue: str = Field(
+        default="",
+        description="Short performance cue (2-6 words) in the script's language",
+    )
+
+
+class ScenarioDirections(BaseModel):
+    directions: list[ScenarioCue] = Field(json_schema_extra={"maxItems": 300})

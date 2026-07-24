@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 import tempfile
 from collections import defaultdict
@@ -281,19 +282,45 @@ class BuildWorker(QThread):
             self.failed.emit(str(e))
 
 
-class TtsLoadWorker(QThread):
-    """Load the Dramabox model once, off the GUI thread (DESIGN.md §2.6).
+def _installed_transformers_version() -> str | None:
+    try:
+        from importlib.metadata import version
 
-    Heavy (downloads ~15 GB on first run, then loads into VRAM), so the import
-    of `lnvox.tts.dramabox_client` is deliberately kept inside `run()` — the
-    Studio launches (and its other tabs work) with no torch / Dramabox present.
+        return version("transformers")
+    except Exception:
+        return None
+
+
+def _augment_engine_error(engine: str, msg: str) -> str:
+    """Append the DESIGN.md §16.6 transformers-conflict hint when the error
+    smells like it — Dramabox needs transformers ≥4.52 (Gemma `.model`
+    submodule), VibeVoice's fork pins ==4.51.3."""
+    if "has no attribute 'model'" in msg or "Gemma3" in msg:
+        msg += (
+            "\n\nLikely the Dramabox↔VibeVoice transformers conflict (DESIGN.md §16.6):\n"
+            "Dramabox needs transformers ≥ 4.52, VibeVoice pins == 4.51.3.\n"
+            f"Installed: {_installed_transformers_version() or 'unknown'}.\n\n"
+            "For Dramabox:   uv pip install -U 'transformers>=4.52'\n"
+            "For VibeVoice:  uv pip install -e external/VibeVoice\n"
+            "…then restart the Studio."
+        )
+    return msg
+
+
+class TtsLoadWorker(QThread):
+    """Load ONE TTS engine once, off the GUI thread (DESIGN.md §2.6 / §16).
+
+    Heavy (first run downloads 15-18 GB, then loads into VRAM), so the engine
+    imports are deliberately kept inside `run()` — the Studio launches (and its
+    other tabs work) with no torch / Dramabox / VibeVoice present.
     """
 
-    loaded = Signal(object, str)  # (DramaboxClient, resolved_device)
+    loaded = Signal(object, str, str)  # (client, engine, resolved_device)
     failed = Signal(str)
 
-    def __init__(self, device: str) -> None:
+    def __init__(self, engine: str, device: str) -> None:
         super().__init__()
+        self.engine = engine
         self.device = device
 
     def run(self) -> None:
@@ -310,11 +337,24 @@ class TtsLoadWorker(QThread):
                         resolved = "cpu"
                 except Exception:
                     pass
-            from lnvox.tts.dramabox_client import DramaboxClient
+            if self.engine == "vibevoice":
+                from lnvox.tts.vibevoice_client import VibeVoiceClient
 
-            client = DramaboxClient(device=resolved)
-            self.loaded.emit(client, resolved)
+                client = VibeVoiceClient(device=resolved)
+            else:
+                from lnvox.tts.dramabox_client import DramaboxClient
+
+                client = DramaboxClient(device=resolved)
+            self.loaded.emit(client, self.engine, resolved)
         except ModuleNotFoundError as e:  # pragma: no cover
+            if self.engine == "vibevoice":
+                self.failed.emit(
+                    f"Missing Python module: {e}.\n\n"
+                    "VibeVoice isn't installed in this venv. Run:\n"
+                    "    ./scripts/setup_vibevoice.sh\n"
+                    "(clones the community fork and pip-installs it editable — DESIGN.md §16.6)"
+                )
+                return
             # Dramabox's runtime deps live in external/DramaBox/requirements.txt,
             # not the project's pyproject — and `uv sync` prunes them. Point the
             # user at the torch-safe reinstall (the launcher does this in
@@ -330,11 +370,27 @@ class TtsLoadWorker(QThread):
                 "      external/DramaBox/requirements.txt | uv pip install -r /dev/stdin"
             )
         except Exception as e:  # pragma: no cover
-            self.failed.emit(str(e))
+            self.failed.emit(_augment_engine_error(self.engine, str(e)))
+
+
+_SPEAKER_RE = re.compile(r"^\s*Speaker\s+(\d+)\s*:", re.IGNORECASE)
+
+
+def _to_vibevoice_script(prompt: str) -> tuple[str, int]:
+    """Pass `Speaker N:` scripts through; wrap plain text as Speaker 1.
+
+    Returns (script, highest speaker number) — the Lab clones every speaker
+    from the same selected reference, so the count sizes `voice_refs`.
+    """
+    lines = [ln.strip() for ln in prompt.splitlines() if ln.strip()]
+    numbers = [int(m.group(1)) for ln in lines if (m := _SPEAKER_RE.match(ln))]
+    if not numbers:
+        return "Speaker 1: " + " ".join(prompt.split()), 1
+    return "\n".join(lines), max(numbers)
 
 
 class TtsGenWorker(QThread):
-    """Render one prompt to a wav with an already-loaded DramaboxClient."""
+    """Render one prompt/script to a wav with an already-loaded engine client."""
 
     done = Signal(str)  # output wav path
     failed = Signal(str)
@@ -343,35 +399,50 @@ class TtsGenWorker(QThread):
         self,
         client,
         *,
+        engine: str,
         prompt: str,
         output_path: Path,
         voice_ref: Path | None,
+        n_speakers: int,
         seed: int,
         cfg_scale: float,
         stg_scale: float,
     ) -> None:
         super().__init__()
         self.client = client
+        self.engine = engine
         self.prompt = prompt
         self.output_path = output_path
         self.voice_ref = voice_ref
+        self.n_speakers = n_speakers
         self.seed = seed
         self.cfg_scale = cfg_scale
         self.stg_scale = stg_scale
 
     def run(self) -> None:
         try:
-            self.client.generate(
-                prompt=self.prompt,
-                output_path=self.output_path,
-                voice_ref=self.voice_ref,
-                seed=self.seed,
-                cfg_scale=self.cfg_scale,
-                stg_scale=self.stg_scale,
-            )
+            if self.engine == "vibevoice":
+                # Every Speaker N clones the same selected reference — the Lab
+                # auditions one voice; true multi-voice sessions live in s4.
+                self.client.generate_session(
+                    script=self.prompt,
+                    voice_refs=[self.voice_ref] * self.n_speakers,
+                    output_path=self.output_path,
+                    seed=self.seed,
+                    cfg_scale=self.cfg_scale,
+                )
+            else:
+                self.client.generate(
+                    prompt=self.prompt,
+                    output_path=self.output_path,
+                    voice_ref=self.voice_ref,
+                    seed=self.seed,
+                    cfg_scale=self.cfg_scale,
+                    stg_scale=self.stg_scale,
+                )
             self.done.emit(str(self.output_path))
         except Exception as e:  # pragma: no cover
-            self.failed.emit(str(e))
+            self.failed.emit(_augment_engine_error(self.engine, str(e)))
 
 
 # --------------------------------------------------------------------------- #
@@ -1201,15 +1272,23 @@ class CastingTab(QWidget):
 #  TTS Lab tab — load Dramabox once, A/B-test how prompts/directions sound
 # --------------------------------------------------------------------------- #
 class TtsLabTab(QWidget):
-    """Audition Dramabox prompts against a chosen voice clip.
+    """Audition TTS prompts against a chosen voice clip — Dramabox or VibeVoice.
 
     The model is loaded ONCE, manually, via the "Load model" button — never on
-    construction or when other tabs are used (Dramabox is ~15 GB in VRAM). Use
-    it to find the best way to write a direction/description: the format buttons
-    compose the same description + line into different shapes (`desc, "line"`
-    vs `[desc] "line"` vs just `"line"`, …) so you can hear which leaks the
-    description into the narration. Keep the seed fixed to isolate the prompt.
+    construction or when other tabs are used (either engine is 15-18 GB in
+    VRAM). Only ONE engine can be loaded per Studio session: the two need
+    conflicting transformers versions (Dramabox ≥4.52, VibeVoice ==4.51.3 —
+    DESIGN.md §16.6), and the Load button warns which one the venv supports.
+
+    Dramabox: use the format buttons to hear how the same description + line
+    compose into different prompt shapes (`desc, "line"` vs `[desc] "line"` …).
+    VibeVoice: the prompt box is a `Speaker N:` script (plain text auto-wraps
+    as Speaker 1); voice identity comes ONLY from the reference clip, so one
+    is required, and description / stg_scale / format buttons don't apply.
+    Keep the seed fixed to isolate the prompt.
     """
+
+    CFG_DEFAULTS = {"dramabox": 2.5, "vibevoice": 1.3}
 
     # (label, template using {desc} and {line})
     FORMATS = [
@@ -1226,7 +1305,8 @@ class TtsLabTab(QWidget):
         super().__init__()
         self.store = store
         self.player = player
-        self.client = None  # DramaboxClient once loaded
+        self.client = None  # DramaboxClient | VibeVoiceClient once loaded
+        self.engine: str | None = None  # set on successful load
         self.loader: TtsLoadWorker | None = None
         self.gen: TtsGenWorker | None = None
         self._tts_dir = Path(tempfile.mkdtemp(prefix="vbstudio_tts_"))
@@ -1237,6 +1317,10 @@ class TtsLabTab(QWidget):
         # --- model load row ---------------------------------------------- #
         load_box = QGroupBox("Model")
         load_l = QHBoxLayout(load_box)
+        load_l.addWidget(QLabel("Engine:"))
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(["dramabox", "vibevoice"])
+        load_l.addWidget(self.engine_combo)
         load_l.addWidget(QLabel("Device:"))
         self.device_combo = QComboBox()
         self.device_combo.addItems(["auto", "cuda", "mps", "cpu"])
@@ -1244,7 +1328,7 @@ class TtsLabTab(QWidget):
         self.load_btn = QPushButton("⚙ Load model")
         self.load_btn.clicked.connect(self._load_model)
         load_l.addWidget(self.load_btn)
-        self.model_status = QLabel("Not loaded — Dramabox loads only when you click Load.")
+        self.model_status = QLabel("Not loaded — the engine loads only when you click Load (one per session).")
         self.model_status.setStyleSheet("color: gray;")
         load_l.addWidget(self.model_status, 1)
         layout.addWidget(load_box)
@@ -1288,8 +1372,9 @@ class TtsLabTab(QWidget):
         compose_l.addRow("", self._wrap(fmt_row))
         layout.addWidget(compose)
 
-        # --- the actual prompt sent to Dramabox -------------------------- #
-        layout.addWidget(QLabel("Prompt sent to Dramabox (edit freely):"))
+        # --- the actual prompt sent to the engine ------------------------- #
+        self.prompt_label = QLabel("Prompt sent to Dramabox (edit freely):")
+        layout.addWidget(self.prompt_label)
         self.prompt_edit = QPlainTextEdit()
         self.prompt_edit.setPlaceholderText('e.g.  adult, British, male, weary, "You\'re late."')
         self.prompt_edit.setFixedHeight(80)
@@ -1334,6 +1419,9 @@ class TtsLabTab(QWidget):
         self.status = QLabel("")
         layout.addWidget(self.status)
 
+        # Connected last: the handler touches cfg/stg/prompt widgets above.
+        self.engine_combo.currentTextChanged.connect(self._on_engine_changed)
+
         self.refresh_voices()
         self._update_enabled()
 
@@ -1343,12 +1431,73 @@ class TtsLabTab(QWidget):
         w.setLayout(layout)
         return w
 
+    # -- engine selection ---------------------------------------------------- #
+    def _on_engine_changed(self, engine: str) -> None:
+        self.cfg_spin.setValue(self.CFG_DEFAULTS[engine])
+        self.stg_spin.setEnabled(engine == "dramabox")
+        if engine == "vibevoice":
+            self.prompt_label.setText("Script sent to VibeVoice (edit freely):")
+            self.prompt_edit.setPlaceholderText(
+                "e.g.  Speaker 1: You're late.\n"
+                "Plain text auto-wraps as Speaker 1; every Speaker N clones the "
+                "selected reference. Description / stg_scale / format buttons are Dramabox-only."
+            )
+            self.status.setText(
+                "VibeVoice: a reference clip is required (it IS the voice); cfg default 1.3."
+            )
+        else:
+            self.prompt_label.setText("Prompt sent to Dramabox (edit freely):")
+            self.prompt_edit.setPlaceholderText('e.g.  adult, British, male, weary, "You\'re late."')
+            self.status.setText("")
+
+    def _confirm_engine(self, engine: str) -> bool:
+        """One-engine-per-session warning, keyed to the installed transformers.
+
+        The engines need conflicting versions (DESIGN.md §16.6): Dramabox's
+        Gemma encoder needs ≥4.52, VibeVoice's fork pins ==4.51.3 — so the
+        venv's current transformers decides which one this session can load.
+        """
+        ver = _installed_transformers_version()
+        try:
+            major_minor = tuple(int(p) for p in ver.split(".")[:2])
+        except Exception:
+            major_minor = (0, 0)
+        if engine == "dramabox":
+            compatible = major_minor >= (4, 52)
+            fix = "uv pip install -U 'transformers>=4.52'"
+        else:
+            compatible = (0, 0) < major_minor < (4, 52)
+            fix = "uv pip install -e external/VibeVoice"
+        base = (
+            "Only one TTS engine can be loaded per Studio session — the installed\n"
+            "transformers version decides which one works (DESIGN.md §16.6):\n"
+            "  •  dramabox needs transformers ≥ 4.52\n"
+            "  •  vibevoice pins transformers == 4.51.3\n\n"
+            f"Installed transformers: {ver or 'not found'}"
+        )
+        if compatible:
+            QMessageBox.information(
+                self, "One engine per session", f"{base} — compatible with {engine}."
+            )
+            return True
+        return (
+            QMessageBox.warning(
+                self,
+                "Engine / transformers mismatch",
+                f"{base} — {engine} will likely FAIL to run.\n\n"
+                f"Fix, then restart the Studio:\n    {fix}\n\nTry to load anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            == QMessageBox.Yes
+        )
+
     # -- voices ------------------------------------------------------------ #
     def refresh_voices(self) -> None:
         current = self.voice_combo.currentData()
         self.voice_combo.blockSignals(True)
         self.voice_combo.clear()
-        self.voice_combo.addItem("(no reference — Dramabox default voice)", None)
+        self.voice_combo.addItem("(no reference — Dramabox default voice; VibeVoice requires one)", None)
         for c in sorted(self.store.clips, key=lambda c: c.id):
             self.voice_combo.addItem(
                 f"{c.id}  ·  {c.gender}/{c.age_band}/{c.accent}", c.id
@@ -1401,26 +1550,32 @@ class TtsLabTab(QWidget):
     def _load_model(self) -> None:
         if self.client is not None or (self.loader and self.loader.isRunning()):
             return
+        engine = self.engine_combo.currentText()
+        if not self._confirm_engine(engine):
+            return
         self.load_btn.setEnabled(False)
         self.device_combo.setEnabled(False)
-        self.model_status.setText("Loading Dramabox… (first run downloads ~15 GB)")
-        self.loader = TtsLoadWorker(self.device_combo.currentText())
+        self.engine_combo.setEnabled(False)
+        self.model_status.setText(f"Loading {engine}… (first run downloads 15-18 GB)")
+        self.loader = TtsLoadWorker(engine, self.device_combo.currentText())
         self.loader.loaded.connect(self._on_model_loaded)
         self.loader.failed.connect(self._on_model_failed)
         self.loader.start()
 
-    def _on_model_loaded(self, client, device: str) -> None:
+    def _on_model_loaded(self, client, engine: str, device: str) -> None:
         self.client = client
-        self.model_status.setText(f"✓ Loaded on {device} — ready.")
+        self.engine = engine
+        self.model_status.setText(f"✓ {engine} loaded on {device} — ready.")
         self.model_status.setStyleSheet("color: green;")
         self._update_enabled()
 
     def _on_model_failed(self, msg: str) -> None:
         self.load_btn.setEnabled(True)
         self.device_combo.setEnabled(True)
+        self.engine_combo.setEnabled(True)
         self.model_status.setText("Load failed.")
         self.model_status.setStyleSheet("color: #b00;")
-        QMessageBox.critical(self, "Dramabox load failed", msg)
+        QMessageBox.critical(self, "TTS engine load failed", msg)
 
     # -- generate ---------------------------------------------------------- #
     def _generate(self) -> None:
@@ -1433,15 +1588,30 @@ class TtsLabTab(QWidget):
         if not prompt:
             self.status.setText("Enter or compose a prompt first.")
             return
+        engine = self.engine or "dramabox"
+        voice_ref = self._voice_ref()
+        n_speakers = 1
+        if engine == "vibevoice":
+            if voice_ref is None:
+                QMessageBox.information(
+                    self,
+                    "Reference required",
+                    "VibeVoice has no default voice — the reference clip IS the "
+                    "voice (zero-shot cloning). Select a voicebank clip first.",
+                )
+                return
+            prompt, n_speakers = _to_vibevoice_script(prompt)
         self._gen_count += 1
         out = self._tts_dir / f"gen_{self._gen_count:03d}.wav"
         self.gen_btn.setEnabled(False)
-        self.status.setText("Generating… (diffusion TTS — this can take a while)")
+        self.status.setText("Generating… (this can take a while)")
         self.gen = TtsGenWorker(
             self.client,
+            engine=engine,
             prompt=prompt,
             output_path=out,
-            voice_ref=self._voice_ref(),
+            voice_ref=voice_ref,
+            n_speakers=n_speakers,
             seed=self.seed_spin.value(),
             cfg_scale=self.cfg_spin.value(),
             stg_scale=self.stg_spin.value(),
@@ -1458,7 +1628,7 @@ class TtsLabTab(QWidget):
         ref_name = ref.stem if ref else "default"
         oneline = prompt.replace("\n", "\\n")
         item = QListWidgetItem(
-            f"#{self._gen_count}  [{ref_name} · seed {self.seed_spin.value()}]  {oneline}"
+            f"#{self._gen_count}  [{self.engine or 'dramabox'} · {ref_name} · seed {self.seed_spin.value()}]  {oneline}"
         )
         item.setData(Qt.UserRole, wav_path)
         item.setToolTip(prompt)

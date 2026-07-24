@@ -12,10 +12,19 @@ from lnvox.llm.schemas import (
     CharacterList,
     ChapterDirected,
     ChapterScenes,
+    ScenarioScript,
     VoiceProfileList,
 )
 from lnvox.series import find_prior_volumes, latest_prior_volume
-from lnvox.stages import s1_characters, s2_scenes, s3_director, s4_tts, s5_mix, s6_sync
+from lnvox.stages import (
+    s1_characters,
+    s2_scenes,
+    s3_director,
+    s4_tts,
+    s4_vibevoice,
+    s5_mix,
+    s6_sync,
+)
 from lnvox.voices import manifest as voice_manifest
 from lnvox.voices import matcher as voice_matcher
 from lnvox.voices.schema import BookCasting
@@ -30,7 +39,12 @@ def _book_dir(book_id: str) -> Path:
 
 
 def _voicebank_dir() -> Path:
-    return Path("voicebank")
+    # DESIGN.md §17.5: a per-language bank (e.g. voicebank-fr, seeded from the
+    # French Common Voice corpus) is selected once via env, not per-command
+    # flags. Default stays the historical English bank.
+    import os
+
+    return Path(os.environ.get("LNVOX_VOICEBANK", "voicebank"))
 
 
 def _filter_chapters(chapters, selected: Optional[str]):
@@ -471,6 +485,165 @@ def stage_lecture(
     )
 
 
+@app.command(name="ingest-scenario")
+def ingest_scenario(
+    md_path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Theater-script markdown file."
+    ),
+    id: str = typer.Option(..., "--id", help="Artifact id (e.g. 'my-play')."),
+    title: Optional[str] = typer.Option(None, help="Play title (default: filename)."),
+    language: str = typer.Option("fr", help="Script language tag stored in 00_script.json."),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help=(
+            "Bypass the cache/scenario/ LLM cache (content-keyed on script "
+            "text + prompt + model) — use to re-roll the structuring."
+        ),
+    ),
+):
+    """Scenario mode (DESIGN.md §17): structure a theater script.
+
+    LLM-classifies each scene's lines into dialogue / staging / cue items
+    with a VERBATIM-text invariant (validated in code), extracts the
+    script's own characters section when present, and prepares the casting
+    roster. Needs the LLM server running.
+
+    Output: artifacts/<id>/00_script.json, 00_text.jsonl, 01_characters.json.
+    Next: `lnvox voice cast <id>`, then `lnvox scenario <id>`.
+    """
+    from lnvox.ingest import scenario as scenario_ingest
+
+    out_dir = _book_dir(id)
+    client = LLMClient()
+    console.print(f"Structuring {md_path.name} → {out_dir}/")
+    script = scenario_ingest.run(
+        md_path,
+        id,
+        client,
+        out_dir,
+        title=title or "",
+        language=language,
+        cache_dir=None if no_cache else Path("cache") / "scenario",
+        progress=lambda m: console.print(f"[dim]{m}[/]"),
+    )
+    n_items = sum(len(s.items) for s in script.scenes)
+    console.print(
+        f"[green]Done.[/] {len(script.scenes)} scene(s), {n_items} item(s) → "
+        f"{out_dir / '00_script.json'}\n"
+        f"Next: `lnvox voice cast {id}` then `lnvox scenario {id}`."
+    )
+
+
+@app.command(name="scenario")
+def stage_scenario(book_id: str):
+    """Scenario mode direction pass (DESIGN.md §17.3).
+
+    Adds per-line emotion (7-value enum) + a short cue in the script's
+    language, composes the TTS prompts, and writes 03_directed/*.json so
+    s4/s5 run unchanged (one chapter per scene; staging pauses become
+    DirectedScene boundaries). Run AFTER `lnvox voice cast` so descriptors
+    match the assigned clips. Group lines render with the Narrator voice.
+    """
+    from lnvox.stages import scenario as scenario_stage
+
+    out_dir = _book_dir(book_id)
+    script_file = out_dir / "00_script.json"
+    if not script_file.exists():
+        console.print(f"[red]Missing {script_file}. Run `lnvox ingest-scenario`.[/]")
+        raise typer.Exit(1)
+    script = ScenarioScript.model_validate_json(script_file.read_text(encoding="utf-8"))
+
+    chars_file = out_dir / "01_characters.json"
+    cast = (
+        CharacterList.model_validate_json(chars_file.read_text(encoding="utf-8"))
+        if chars_file.exists()
+        else CharacterList(characters=[])
+    )
+
+    assign_file = out_dir / "04_voice_assignments.json"
+    casting = None
+    voicebank = None
+    if assign_file.exists():
+        casting = BookCasting.model_validate_json(assign_file.read_text(encoding="utf-8"))
+        vb_dir = _voicebank_dir()
+        if (vb_dir / "manifest.json").exists():
+            voicebank = voice_manifest.load(vb_dir)
+    else:
+        console.print(
+            "[yellow]No 04_voice_assignments.json — descriptors won't be anchored "
+            f"to clips. Run `lnvox voice cast {book_id}` first for best results.[/]"
+        )
+
+    client = LLMClient()
+
+    def _progress(scene, result):
+        beats = sum(len(s.beats) for s in result.scenes)
+        console.print(
+            f"[dim]  ✓ scene {scene.scene_id}: {beats} beat(s), "
+            f"{len(result.scenes)} staging-delimited group(s)[/]"
+        )
+
+    results = scenario_stage.run(
+        script,
+        cast,
+        client,
+        out_dir,
+        casting=casting,
+        voicebank=voicebank,
+        on_scene_done=_progress,
+    )
+    total = sum(len(s.beats) for r in results for s in r.scenes)
+    console.print(
+        f"[green]Done.[/] {total} beat(s) across {len(results)} scene(s) → "
+        f"{out_dir / '03_directed'}/\n"
+        f"Next: `lnvox s4 {book_id}`, `lnvox s5 {book_id}`, "
+        f"`lnvox scenario-sync {book_id}`."
+    )
+
+
+@app.command(name="scenario-sync")
+def stage_scenario_sync(
+    book_id: str,
+    intra: float = typer.Option(
+        0.25, help="Pad between lines of one run — MUST match `lnvox s5 --intra`."
+    ),
+    staging_pause: float = typer.Option(
+        1.0,
+        help="Pause where staging happens — MUST match `lnvox s5 --inter-scene`.",
+    ),
+    inter_scene: float = typer.Option(
+        2.0,
+        help="Pad between script scenes — MUST match `lnvox s5 --inter-chapter`.",
+    ),
+):
+    """Scenario mode sync emitter (DESIGN.md §17.4).
+
+    Emits 07_sync/<scene>.json + play.json + play.srt: one timed entry per
+    script item (dialogue spans, staging pauses, zero-duration cues),
+    computed from the same plan as the s5 mix so both agree. Requires
+    per-beat rendering (dramabox backend).
+    """
+    from lnvox.stages import scenario_sync
+
+    out_dir = _book_dir(book_id)
+    if not (out_dir / "00_script.json").exists():
+        console.print(f"[red]Missing {out_dir / '00_script.json'}. Run `lnvox ingest-scenario`.[/]")
+        raise typer.Exit(1)
+    try:
+        scenario_sync.run(
+            out_dir,
+            intra=intra,
+            staging_pause=staging_pause,
+            inter_scene=inter_scene,
+            progress=lambda m: console.print(f"[dim]{m}[/]"),
+        )
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]Done.[/] Sync under {out_dir / '07_sync'}/.")
+
+
 def _default_tts_device() -> str:
     """Pick a torch device for Dramabox when the CLI flag isn't passed.
 
@@ -517,18 +690,66 @@ def stage4(
         False,
         help="Keep _staged/ intermediates after a successful staged run (debugging).",
     ),
+    tts_backend: Optional[str] = typer.Option(
+        None,
+        "--tts-backend",
+        help=(
+            "TTS engine: 'dramabox' (default, per-beat → 05_audio/) or "
+            "'vibevoice' (multi-speaker sessions → 05_audio_v2/, DESIGN.md "
+            "§16). Falls back to $LNVOX_TTS_BACKEND, else dramabox."
+        ),
+    ),
+    max_session_chars: int = typer.Option(
+        s4_vibevoice.DEFAULT_MAX_SESSION_CHARS,
+        "--max-session-chars",
+        help=(
+            "vibevoice only: max characters per generation session — the "
+            "cache-granularity vs prosody-continuity tradeoff (DESIGN.md §16.3)."
+        ),
+    ),
+    no_trim: bool = typer.Option(
+        False,
+        "--no-trim",
+        help=(
+            "Keep the engine-emitted leading/trailing silence (the edge-"
+            "silence trim is on by default — DESIGN.md §2.6)."
+        ),
+    ),
 ):
-    """Stage 4: Render directed beats to audio via Dramabox.
+    """Stage 4: Render directed beats to audio via the selected TTS backend.
+
+    Backends (DESIGN.md §16): `dramabox` renders per beat into 05_audio/;
+    `vibevoice` renders multi-speaker scene sessions into 05_audio_v2/
+    (mix those with `lnvox s5 --v2`).
 
     Inputs:
-      - artifacts/<book>/03_directed/*.json (Dramabox-ready prompts)
+      - artifacts/<book>/03_directed/*.json (directed beats)
       - artifacts/<book>/04_voice_assignments.json (character → clip)
       - voicebank/manifest.json + voicebank/clips/*.wav
 
     Output:
-      - artifacts/<book>/05_audio/<chapter>/<beat_id>.wav
-      - artifacts/<book>/05_audio/<chapter>/manifest.json
+      - artifacts/<book>/05_audio[_v2]/<chapter>/<id>.wav
+      - artifacts/<book>/05_audio[_v2]/<chapter>/manifest.json
     """
+    import os
+
+    backend = (tts_backend or os.environ.get("LNVOX_TTS_BACKEND") or "dramabox").lower()
+    if backend not in ("dramabox", "vibevoice"):
+        console.print(
+            f"[red]Unknown --tts-backend '{backend}' (expected dramabox|vibevoice).[/]"
+        )
+        raise typer.Exit(2)
+    if backend == "vibevoice" and staged:
+        console.print(
+            "[red]--staged is Dramabox-only (DESIGN.md §16.2). VibeVoice is a "
+            "single-model boot — use the monolithic path (s4_retry.sh covers "
+            "crashes).[/]"
+        )
+        raise typer.Exit(2)
+    if no_trim:
+        # Read by tts.trim / VibeVoiceClient; inherited by the staged-phase
+        # subprocesses, so one env var covers all three render paths.
+        os.environ["LNVOX_S4_NO_TRIM"] = "1"
     out_dir = _book_dir(book_id)
     directed_dir = out_dir / "03_directed"
     assign_file = out_dir / "04_voice_assignments.json"
@@ -565,13 +786,8 @@ def stage4(
         device = _default_tts_device()
         console.print(f"[dim]Auto-detected device: {device}[/]")
 
-    audio_dir = out_dir / "05_audio"
+    audio_dir = out_dir / ("05_audio_v2" if backend == "vibevoice" else "05_audio")
     cache_dir = Path("cache") / "tts"
-
-    def _factory():
-        from lnvox.tts.dramabox_client import DramaboxClient
-
-        return DramaboxClient(device=device)
 
     def _progress(msg):
         console.print(f"[dim]{msg}[/]")
@@ -581,8 +797,38 @@ def stage4(
         total_beats = min(total_beats, limit)
     console.print(
         f"Rendering {total_beats} beat(s) across {len(chapters_loaded)} chapter(s) "
-        f"→ {audio_dir}"
+        f"→ {audio_dir} [{backend}]"
     )
+
+    if backend == "vibevoice":
+        from lnvox.tts.vibevoice_client import VibeVoiceClient
+
+        def _vv_factory():
+            return VibeVoiceClient(device=device)
+
+        s4_vibevoice.run(
+            chapters_loaded,
+            casting,
+            voicebank,
+            vb_dir,
+            audio_dir,
+            cache_dir,
+            client_factory=_vv_factory,
+            model_version=VibeVoiceClient.MODEL_VERSION,
+            max_session_chars=max_session_chars,
+            progress=_progress,
+            limit=limit,
+        )
+        console.print(
+            f"[green]Done (vibevoice).[/] Audio under {audio_dir}/, cache under "
+            f"{cache_dir}/. Mix with `lnvox s5 {book_id} --v2`."
+        )
+        return
+
+    def _factory():
+        from lnvox.tts.dramabox_client import DramaboxClient
+
+        return DramaboxClient(device=device)
 
     if staged:
         from lnvox.tts import staged_driver
@@ -681,15 +927,24 @@ def stage5(
         "--novels-root",
         help="Where chapter .txt files (and the images/ sibling) live.",
     ),
+    v2: bool = typer.Option(
+        False,
+        "--v2",
+        help=(
+            "Mix from 05_audio_v2/ (VibeVoice session renders, DESIGN.md §16) "
+            "instead of 05_audio/."
+        ),
+    ),
 ):
     """Stage 5: Mix rendered beats into a final .m4b with chapter markers."""
     from lnvox.tts.schema import ChapterAudio
 
     out_dir = _book_dir(book_id)
-    audio_root = out_dir / "05_audio"
+    audio_root = out_dir / ("05_audio_v2" if v2 else "05_audio")
     text_jsonl = out_dir / "00_text.jsonl"
     if not audio_root.exists():
-        console.print(f"[red]Missing {audio_root}. Run `lnvox s4`.[/]")
+        hint = "lnvox s4 --tts-backend vibevoice" if v2 else "lnvox s4"
+        console.print(f"[red]Missing {audio_root}. Run `{hint}`.[/]")
         raise typer.Exit(1)
 
     # Load chapter titles from the ingest output.

@@ -5,9 +5,11 @@
 #     ./scripts/run_pipeline.sh <series>/<volume-XX> [options]
 #
 # Options:
-#     --mode <m>               narration (default, multi-voice novel) or
-#                              lecture (single-voice non-fiction: no s1/s2/s3,
-#                              one `lnvox lecture` stage instead). See §13.
+#     --mode <m>               narration (default, multi-voice novel),
+#                              lecture (single-voice non-fiction, §13), or
+#                              scenario (theater script → sync + audio, §17).
+#     --scenario-file <path>   Scenario mode: the script markdown to ingest
+#                              (omit to reuse a prior ingest-scenario run).
 #     --no-normalize           Lecture mode: skip the LLM speech-normalize pass
 #                              (read text verbatim — no LLM phase at all).
 #     --narrator-clip <id>     Voicebank clip id for the Narrator. Optional when
@@ -31,6 +33,11 @@
 #     --staged-tts             Run s4 via the staged pipeline (DESIGN.md §15):
 #                              checkpointed single-model phases with built-in
 #                              crash resume. Honors $LNVOX_S4_STAGED=1.
+#                              Dramabox-only.
+#     --tts-backend <name>     TTS engine for s4: dramabox (default, per-beat)
+#                              or vibevoice (multi-speaker sessions →
+#                              05_audio_v2/; s5 mixes with --v2, s6 is
+#                              skipped). Honors $LNVOX_TTS_BACKEND. See §16.
 #     --skip-mix               Skip s5 (skip the m4b assembly).
 #     --skip-sync              Skip s6 (skip the synced-EPUB / sync_manifest).
 #     --epub <path>            Source EPUB for s6 (default: epubs/<book_id>.epub).
@@ -46,8 +53,9 @@
 #   - vllm  : scripts/serve_vllm.sh   (Linux + CUDA, default on Linux)
 #   - mlx   : scripts/serve_mlx.sh    (Apple Silicon, default on Darwin)
 #   - llama : scripts/serve_llama.sh  (native llama-server, GGUF, either OS)
-# Pick one with --llm-backend or $LNVOX_LLM_BACKEND. The TTS phase always
-# uses Dramabox; --device mps is auto-selected on Darwin.
+# Pick one with --llm-backend or $LNVOX_LLM_BACKEND. The TTS phase uses
+# Dramabox by default; pick VibeVoice sessions with --tts-backend vibevoice
+# (DESIGN.md §16). --device mps is auto-selected on Darwin.
 
 set -uo pipefail
 
@@ -55,6 +63,7 @@ OS="$(uname -s)"
 
 BOOK_ID=""
 MODE="narration"
+SCENARIO_FILE=""
 NO_NORMALIZE=0
 NARRATOR_CLIP=""
 BOOK_TITLE=""
@@ -66,6 +75,11 @@ MAX_MODEL_LEN=""
 SKIP_LLM=0
 SKIP_TTS=0
 STAGED_TTS="${LNVOX_S4_STAGED:-1}"
+# Records whether staging was *asked for* (env var set or flag passed), as
+# opposed to inherited from the default above — vibevoice ignores the
+# default silently but rejects an explicit request (DESIGN.md §16.2).
+STAGED_TTS_EXPLICIT="${LNVOX_S4_STAGED+1}"
+TTS_BACKEND="${LNVOX_TTS_BACKEND:-dramabox}"
 SKIP_MIX=0
 SKIP_SYNC=0
 EPUB_PATH=""
@@ -77,7 +91,7 @@ VLLM_PID=""
 VLLM_LOG=""
 
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -85,6 +99,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage 0 ;;
         --mode)          MODE="$2";          shift 2 ;;
+        --scenario-file) SCENARIO_FILE="$2"; shift 2 ;;
         --no-normalize)  NO_NORMALIZE=1;     shift   ;;
         --narrator-clip) NARRATOR_CLIP="$2"; shift 2 ;;
         --book-title)    BOOK_TITLE="$2";   shift 2 ;;
@@ -95,7 +110,8 @@ while [ $# -gt 0 ]; do
         --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
         --skip-llm)      SKIP_LLM=1;        shift   ;;
         --skip-tts)      SKIP_TTS=1;        shift   ;;
-        --staged-tts)    STAGED_TTS=1;      shift   ;;
+        --staged-tts)    STAGED_TTS=1; STAGED_TTS_EXPLICIT=1; shift ;;
+        --tts-backend)   TTS_BACKEND="$2";  shift 2 ;;
         --skip-mix)      SKIP_MIX=1;        shift   ;;
         --skip-sync)     SKIP_SYNC=1;       shift   ;;
         --epub)          EPUB_PATH="$2";    shift 2 ;;
@@ -128,8 +144,24 @@ case "$LLM_BACKEND" in
         ;;
 esac
 
-if [ "$MODE" != "narration" ] && [ "$MODE" != "lecture" ]; then
-    echo "ERROR: --mode must be 'narration' or 'lecture' (got '$MODE')" >&2
+case "$TTS_BACKEND" in
+    dramabox|vibevoice) ;;
+    *)
+        echo "ERROR: --tts-backend must be one of dramabox|vibevoice (got '$TTS_BACKEND')" >&2
+        usage 2
+        ;;
+esac
+if [ "$TTS_BACKEND" = "vibevoice" ] && [ -n "${STAGED_TTS_EXPLICIT:-}" ] && [ "$STAGED_TTS" = "1" ]; then
+    echo "ERROR: --staged-tts is Dramabox-only (DESIGN.md §16.2); vibevoice uses the monolithic path + retry loop." >&2
+    usage 2
+fi
+
+if [ "$MODE" != "narration" ] && [ "$MODE" != "lecture" ] && [ "$MODE" != "scenario" ]; then
+    echo "ERROR: --mode must be 'narration', 'lecture' or 'scenario' (got '$MODE')" >&2
+    usage 2
+fi
+if [ "$MODE" = "scenario" ] && [ -z "$SCENARIO_FILE" ] && [ ! -f "artifacts/$BOOK_ID/00_script.json" ]; then
+    echo "ERROR: scenario mode needs --scenario-file <script.md> (or a prior ingest at artifacts/$BOOK_ID/00_script.json)" >&2
     usage 2
 fi
 
@@ -146,7 +178,7 @@ BOOK_TITLE="${BOOK_TITLE:-$BOOK_ID}"
 NOVEL_DIR="$NOVELS_ROOT/$BOOK_ID"
 BOOK_ART="artifacts/$BOOK_ID"
 
-if [ ! -d "$NOVEL_DIR" ] && [ "$SKIP_LLM" -eq 0 ]; then
+if [ "$MODE" != "scenario" ] && [ ! -d "$NOVEL_DIR" ] && [ "$SKIP_LLM" -eq 0 ]; then
     echo "ERROR: novel dir not found: $NOVEL_DIR" >&2
     exit 1
 fi
@@ -360,6 +392,12 @@ prepare_tts_env() {
     uv sync --extra voice --extra tts
     install_dramabox_reqs
 
+    # A prior VibeVoice env prep pins transformers==4.51.3, which breaks
+    # Dramabox's Gemma encoder (needs the ≥4.52 model structure — DESIGN.md
+    # §16.6), and Dramabox's own '>=4.45' spec won't force the upgrade back.
+    # Restore it explicitly; no-op when already satisfied.
+    uv pip install "transformers>=4.52"
+
     # Sanity: refuse to proceed to Dramabox unless the expected torch
     # backend is actually available. Same check setup_dramabox.sh runs
     # after a fresh install — catches the case where a prior LLM-phase
@@ -383,6 +421,39 @@ PY
         uv run python -c "import torch; print(f'  torch={torch.__version__}  cuda={torch.cuda.is_available()}  mps={torch.backends.mps.is_available()}')" >&2 || true
         echo "" >&2
         echo "Run ./scripts/setup_dramabox.sh manually and inspect its output." >&2
+        exit 1
+    fi
+}
+
+prepare_vibevoice_env() {
+    banner "Preparing venv for TTS phase (VibeVoice runtime, DESIGN.md §16)"
+    uv sync --extra voice --extra tts
+    if [ ! -d "external/VibeVoice" ]; then
+        echo "ERROR: external/VibeVoice not found — run ./scripts/setup_vibevoice.sh first." >&2
+        exit 1
+    fi
+    uv pip install -e external/VibeVoice
+
+    # Same torch-backend sanity check as prepare_tts_env: MPS on Darwin,
+    # CUDA elsewhere — catches a CPU-only wheel left by an LLM-phase sync.
+    local backend="cuda"
+    if [ "$OS" = "Darwin" ]; then
+        backend="mps"
+    fi
+    if ! uv run python - "$backend" <<'PY' >/dev/null 2>&1
+import sys, torch
+backend = sys.argv[1]
+if backend == "mps":
+    sys.exit(0 if torch.backends.mps.is_available() else 1)
+sys.exit(0 if torch.cuda.is_available() else 1)
+PY
+    then
+        echo "" >&2
+        echo "ERROR: torch.$backend is not available after TTS env preparation." >&2
+        echo "  uname -s: $OS  uname -m: $(uname -m)" >&2
+        uv run python -c "import torch; print(f'  torch={torch.__version__}  cuda={torch.cuda.is_available()}  mps={torch.backends.mps.is_available()}')" >&2 || true
+        echo "" >&2
+        echo "Run ./scripts/setup_vibevoice.sh manually and inspect its output." >&2
         exit 1
     fi
 }
@@ -508,8 +579,19 @@ else
     VC_HOOK="-"; LEC_HOOK="-"
     [ "$NEED_LLM" -eq 1 ] && { VC_HOOK="ensure_vllm"; LEC_HOOK="ensure_vllm"; }
 
-    banner "Stage 0: ingest (mode=$MODE)"
-    run_step - "Stage 0 (ingest)" uv run lnvox ingest "$NOVEL_DIR" --book-id "$BOOK_ID" --mode "$MODE"
+    if [ "$MODE" = "scenario" ]; then
+        # ingest-scenario is itself an LLM pass (structure + characters);
+        # skipped when the artifacts already exist and no file was passed.
+        if [ -n "$SCENARIO_FILE" ]; then
+            banner "Stage 0: ingest-scenario (structure + characters)"
+            run_step ensure_vllm "Stage 0 (ingest-scenario)" uv run lnvox ingest-scenario "$SCENARIO_FILE" --id "$BOOK_ID"
+        else
+            banner "Stage 0: ingest-scenario skipped (artifacts/$BOOK_ID/00_script.json exists)"
+        fi
+    else
+        banner "Stage 0: ingest (mode=$MODE)"
+        run_step - "Stage 0 (ingest)" uv run lnvox ingest "$NOVEL_DIR" --book-id "$BOOK_ID" --mode "$MODE"
+    fi
 
     if [ "$MODE" = "narration" ]; then
         banner "Stage 1: cast extraction (with cross-volume merge if applicable)"
@@ -518,7 +600,7 @@ else
         banner "Stage 2: scene segmentation"
         run_step ensure_vllm "Stage 2 (scene segmentation)" uv run lnvox s2 "$BOOK_ID"
     else
-        banner "Lecture mode: skipping s1 (characters) and s2 (scenes)"
+        banner "Skipping s1 (characters) and s2 (scenes) — mode=$MODE"
     fi
 
     banner "Stage V: voice cast"
@@ -535,6 +617,9 @@ else
     if [ "$MODE" = "narration" ]; then
         banner "Stage 3: director (uses voice cast metadata)"
         run_step ensure_vllm "Stage 3 (director)" uv run lnvox s3 "$BOOK_ID" --regen-profiles
+    elif [ "$MODE" = "scenario" ]; then
+        banner "Stage S: scenario direction (emotion + cues → directed beats)"
+        run_step ensure_vllm "Stage S (scenario)" uv run lnvox scenario "$BOOK_ID"
     else
         banner "Stage L: lecture (split + speech-normalize → directed beats)"
         if [ "$NO_NORMALIZE" -eq 1 ]; then
@@ -561,8 +646,15 @@ else
     if [ -z "$VLLM_URL" ]; then
         sleep 5
     fi
-    prepare_tts_env
-    if [ "$STAGED_TTS" -eq 1 ]; then
+    if [ "$TTS_BACKEND" = "vibevoice" ]; then
+        prepare_vibevoice_env
+        # Single-model boot — no staged phases (DESIGN.md §16.2); the retry
+        # loop's restart cost is just that boot. The env var routes the
+        # `lnvox s4` inside s4_retry.sh to the vibevoice backend.
+        banner "Stage 4: TTS (VibeVoice sessions → 05_audio_v2, with auto-retry)"
+        MAX_ATTEMPTS="$MAX_RETRIES" LNVOX_TTS_BACKEND=vibevoice ./scripts/s4_retry.sh "$BOOK_ID"
+    elif [ "$STAGED_TTS" -eq 1 ]; then
+        prepare_tts_env
         # The staged driver owns crash retries internally (per-phase
         # subprocesses with file-level resume, DESIGN.md §15.4) — no outer
         # retry loop, so a driver abort (stall limit) surfaces immediately.
@@ -572,6 +664,7 @@ else
             exit 1
         fi
     else
+        prepare_tts_env
         banner "Stage 4: TTS (Dramabox, with auto-retry)"
         MAX_ATTEMPTS="$MAX_RETRIES" ./scripts/s4_retry.sh "$BOOK_ID"
     fi
@@ -583,7 +676,11 @@ if [ "$SKIP_MIX" -eq 1 ]; then
     banner "Skipping mix phase (--skip-mix)"
 else
     banner "Stage 5: mix → m4b"
-    run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE"
+    if [ "$TTS_BACKEND" = "vibevoice" ]; then
+        run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE" --v2
+    else
+        run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE"
+    fi
 fi
 
 # ----- Sync phase (Stage 6, CPU-only) ----------------------------------------
@@ -596,6 +693,17 @@ fi
 # Stage 5's defaults used above.
 if [ "$SKIP_SYNC" -eq 1 ]; then
     banner "Skipping sync phase (--skip-sync)"
+elif [ "$MODE" = "scenario" ]; then
+    if [ "$TTS_BACKEND" = "vibevoice" ]; then
+        banner "Skipping scenario-sync (VibeVoice sessions have no per-line timing — DESIGN.md §17.4)"
+    else
+        banner "Scenario sync: timed sync files (DESIGN.md §17.4)"
+        run_step - "Scenario sync" uv run lnvox scenario-sync "$BOOK_ID"
+    fi
+elif [ "$TTS_BACKEND" = "vibevoice" ]; then
+    # A session WAV has no per-beat timestamps for the reader to anchor to;
+    # recovering them needs forced alignment — future work (DESIGN.md §16.10).
+    banner "Skipping sync phase (VibeVoice v2 audio has no per-beat timing)"
 else
     SYNC_EPUB="${EPUB_PATH:-epubs/$BOOK_ID.epub}"
     if [ ! -f "$SYNC_EPUB" ]; then

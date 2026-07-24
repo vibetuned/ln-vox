@@ -859,6 +859,12 @@ def _finalize(plan: StagedPlan, root: Path, cache_dir: Path) -> None:
                         "the decode phase should have produced it."
                     )
                 shutil.copy(cache_path, wav_path)
+            # Edge-silence trim (DESIGN.md §2.6) — idempotent; a real trim
+            # upgrades the cache entry in place so re-runs stay trimmed.
+            from lnvox.tts.trim import trim_file
+
+            if trim_file(wav_path) > 0 and cache_path.exists():
+                shutil.copy(wav_path, cache_path)
             dur = _wav_duration(wav_path)
             total += dur
             rendered.append(

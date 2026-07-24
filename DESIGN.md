@@ -328,6 +328,17 @@ For each beat in scene order:
 
 Output: `05_audio/<chapter_id>/<beat_id>.wav` + `manifest.json` per chapter.
 
+**Edge-silence trim (added 2026-07-24).** Dramabox sizes its latent from a
+duration estimate; the overshoot renders as silence, mostly leading —
+measured: a play carried a median 2.2 s lead (37% of all rendered audio was
+edge silence), a novel ~15%. Every WAV is trimmed as it lands in
+`05_audio/` (`tts/trim.py`: 10 ms RMS envelope, −40 dBFS, 100 ms keep-pad;
+idempotent; upgrades cache entries in place; all-silent files left alone so
+failures stay audible). All three render paths hook it — monolithic s4,
+staged `_finalize`, VibeVoice save — and manifest durations are measured
+post-trim, so s5/s6/§17.4 timing follows automatically. Kill switch:
+`lnvox s4 --no-trim` / `LNVOX_S4_NO_TRIM=1`.
+
 **Beat length matters.** Empirically Dramabox renders best on shorter beats —
 longer text raises its noise floor and can slur into unintelligible speech. The
 Director's merge pass caps fused beats at 375 chars (~30 s) and the prompt
@@ -1563,3 +1574,439 @@ validate these ratios on the 5090.
 - **Changing voice or sampling params.** cfg/stg/seed/duration logic is
   byte-for-byte the monolithic recipe — this section is plumbing, not
   quality tuning.
+
+## 16. VibeVoice TTS backend (session-mode second TTS engine)
+
+Add `microsoft/VibeVoice-Large` as an alternative Stage-4 engine, selected
+the same way the third LLM backend was (§14): an env var + launcher flag
+and a parallel client class. Unlike Dramabox's beat-at-a-time rendering,
+this backend uses VibeVoice's headline feature — **long-form multi-speaker
+generation** — rendering whole scene *sessions* (up to 4 voices per call)
+so dialogue turn-taking and prosody flow continuously. Output goes to a
+new `05_audio_v2/` tree so both engines' renders coexist per book for A/B
+listening. Dramabox and `05_audio/` stay the default and are untouched.
+
+### 16.1 What & why
+
+VibeVoice-Large is Microsoft's long-form conversational TTS: a Qwen2.5-7B
+LLM backbone over 7.5 Hz continuous acoustic/semantic tokenizers with a
+lightweight diffusion head (~10 steps). MIT-licensed. One generation
+session supports up to 4 distinct speakers, ~45 min of audio, 32 K context.
+Voice identity comes **entirely from a reference WAV** (zero-shot cloning) —
+there is no text style-descriptor channel like Dramabox's screenplay prompt.
+
+Why a second engine:
+
+- **Multi-speaker sessions.** A scene rendered in one call gets natural
+  turn-to-turn pacing and consistent prosody — the thing per-beat
+  concatenation can never give.
+- **Voice cloning is first-class.** The voicebank clip assigned by
+  `voice cast` becomes the voice, directly — and later, *emotion variants*
+  of that clip become the emotion channel (§16.7).
+- **Single model resident** (~18 GB bf16) vs Dramabox's four-model
+  `TTSServer` — simpler VRAM story, no §15 staging needed, and different
+  failure modes to de-risk whole-book renders.
+
+Sourcing caveat: Microsoft pulled the original inference code; the
+maintained code is the community fork
+([vibevoice-community/VibeVoice](https://github.com/vibevoice-community/VibeVoice),
+MIT). Weights are on ModelScope (`microsoft/VibeVoice-Large`) and mirrored
+on HF (`microsoft/VibeVoice-Large`, `aoi-ot/VibeVoice-Large`).
+
+### 16.2 Backend selection & artifact layout
+
+- `LNVOX_TTS_BACKEND` ∈ {`dramabox` (default), `vibevoice`} + a
+  `--tts-backend` option on `lnvox s4` (flag wins over env).
+- **`05_audio_v2/`**: the vibevoice backend writes
+  `05_audio_v2/<chapter>/<session_id>.wav` + `manifest.json`, never
+  touching `05_audio/`. The manifest reuses the existing
+  `ChapterAudio`/`RenderedBeat` schema with one entry per *session*
+  (`beat_id` = session id), so Stage 5 consumes it unchanged.
+- `lnvox s5 --v2` mixes from `05_audio_v2/` instead of `05_audio/`.
+  Everything else in s5 (silence pads, loudnorm, m4b mux) is identical:
+  consecutive sessions of the same scene get the intra-scene pad,
+  scene changes the inter-scene pad — pacing *inside* a session is
+  VibeVoice's own turn-taking.
+- `run_pipeline.sh --tts-backend vibevoice` dispatches
+  `prepare_vibevoice_env` (instead of `install_dramabox_reqs`), runs s4
+  with the flag under the same `s4_retry.sh` loop, and passes `--v2` to s5.
+- `--staged` + vibevoice is a **hard error** (launcher and CLI): §15
+  exists because Dramabox holds four models and crashes mid-run;
+  VibeVoice is one checkpoint with a ~30–60 s boot, so monolithic +
+  retry (restart cost = that boot) is the whole crash story.
+- **s6 sync does not run for v2 audio** in this iteration: a session WAV
+  has no per-beat timestamps, so beat-level highlighting has nothing to
+  anchor to. Recovering beat times via forced alignment is future work
+  (§16.10).
+
+### 16.3 Session planning
+
+The unit of generation is a **session**: a consecutive run of beats
+inside one scene. The planner walks each scene's beats in order and
+greedily accumulates, closing the session when the next beat would
+
+- introduce a **5th distinct speaker** (model limit is 4), or
+- push the session past **`--max-session-chars`** (default 3000 ≈ 3–4 min
+  of speech — the cache-granularity vs. prosody-continuity tradeoff; one
+  edited line re-renders its session, not the chapter).
+
+Sessions never span scenes (scene boundaries are where s5 inserts real
+silence). A single beat longer than the cap gets its own session — beats
+are never split (the Director already caps them at 375 chars anyway).
+
+Within a session, characters are numbered `Speaker 1..N` **in order of
+first appearance**, and `voice_samples` is passed in that same order —
+exactly the fork's expected mapping. The script is one line per beat:
+
+```
+Speaker 1: It was the last day of summer vacation, and Kamijou Touma had…
+Speaker 2: You've got to be kidding me.
+Speaker 1: The girl on his balcony did not look like she was kidding.
+```
+
+(`DirectedBeat.text` verbatim, whitespace collapsed to single spaces —
+the screenplay `prompt`/`direction` strings are Dramabox-only; VibeVoice
+would read the direction prefix aloud.)
+
+**Refs are mandatory** (no descriptor fallback exists): speaker's
+assigned clip → Narrator's assigned clip → error telling the user to
+re-run `lnvox voice cast`. Deterministic — the chosen filenames land in
+the cache key.
+
+**Cache**: key = `hash(script, ordered ref filenames, MODEL_VERSION)`,
+same `cache/tts/<key>.wav` pool as Dramabox (keys can't collide across
+engines — `MODEL_VERSION` differs). Manifest entries carry
+`scene_id`, `speaker` = the joined speaker list, `type` = `dialogue` if
+any beat is dialogue else `narration`.
+
+### 16.4 Client & generation
+
+New `src/lnvox/tts/vibevoice_client.py`. Unlike Dramabox it's a real
+package: env prep does `uv pip install -e external/VibeVoice`, no
+`sys.path` games.
+
+```python
+class VibeVoiceClient:
+    MODEL_VERSION = "vibevoice-large-cfg1.3-ddpm10-48k"
+    DEFAULT_PARAMS = {"cfg_scale": 1.3, "ddpm_steps": 10, "seed": 42}
+
+    def __init__(self, device="cuda", model_path=None): ...
+    def generate_session(self, *, script, voice_refs, output_path,
+                         seed=None, cfg_scale=None): ...
+```
+
+- Loading: `VibeVoiceProcessor.from_pretrained(model_path)` +
+  `VibeVoiceForConditionalGenerationInference.from_pretrained(...)` with
+  the §16.5 dtype/attention knobs, then `set_ddpm_inference_steps(10)`.
+  `model_path` resolution: explicit arg → `LNVOX_VIBEVOICE_MODEL` →
+  `models/VibeVoice-Large/` if present → HF id `microsoft/VibeVoice-Large`.
+- Generation: `processor(text=[script], voice_samples=[refs], …)` →
+  `model.generate(cfg_scale=…, tokenizer=processor.tokenizer,
+  generation_config={"do_sample": False})`, with `torch.manual_seed(seed)`
+  per session so re-rolls are reproducible (and a different `seed` is the
+  re-roll lever).
+- **Sample-rate normalization**: VibeVoice emits 24 kHz mono; the whole
+  downstream chain assumes 48 kHz stereo (s5 silence pads + concat
+  demuxer need homogeneous inputs). The client resamples to 48 kHz and
+  duplicates to stereo at save time via `soxr` (added to the `tts`
+  extra); the cache stores the normalized WAV. Upsampling adds no
+  quality, only uniformity — making s5 rate-aware was rejected because a
+  book mixing engines must still concat cleanly.
+
+### 16.5 Per-device knobs
+
+Same philosophy as §11.3 — per-device defaults, explicit args win:
+
+| Device | dtype | attention | Notes |
+|---|---|---|---|
+| CUDA x86_64 (5090) | bf16 | `flash_attention_2` if importable, else `sdpa` | ~18 GB weights; fits 24 GB+ cards. |
+| CUDA aarch64 (Spark) | bf16 | `sdpa` (no flash-attn aarch64 wheel; source build optional) | torch 2.10 cu130 path already in place. |
+| MPS | fp32 | `sdpa` | Fork's MPS branch is fp32-only (fp16 artifacts). ~36 GB+ unified needed — experimental. |
+| CPU | fp32 | `sdpa` | Works; glacial. Smoke tests only. |
+
+`_default_tts_device()` ([cli.py:474](src/lnvox/cli.py#L474)) is reused
+as-is. Long sessions raise per-call VRAM vs. Dramabox's short beats;
+if OOM shows up on 24 GB cards, lowering `--max-session-chars` is the
+release valve (more, shorter sessions).
+
+### 16.6 Install & weights
+
+`scripts/setup_vibevoice.sh` mirrors `setup_dramabox.sh`:
+
+1. Clone the community fork to `external/VibeVoice/`, pinned to a
+   known-good commit (recorded in the script; `main` as of 2026-06-12 is
+   `07cb79fe`). Override with `LNVOX_VIBEVOICE_REF`.
+2. `uv pip install -e external/VibeVoice` into the tts-phase venv. torch
+   is whatever the platform installer already put there (2.8 x86_64 /
+   2.10 aarch64 / ≥2.10 Darwin — all sufficient). **transformers is a
+   real conflict, not a coexistence** (found the hard way, 2026-07-23):
+   the fork pins `transformers==4.51.3`, while Dramabox's Gemma encoder
+   calls the `.model` submodule that only exists in transformers ≥4.52
+   ([base_encoder.py:44](external/DramaBox/ltx2/ltx_core/text_encoders/gemma/encoders/base_encoder.py#L44))
+   — and Dramabox's own `>=4.45` spec never pulls it back up. One venv
+   therefore serves ONE engine at a time: `prepare_vibevoice_env`
+   installs the pin, `prepare_tts_env` explicitly restores
+   `transformers>=4.52`, and the Studio's TTS Lab warns on Load which
+   engine the current venv supports (one engine per Studio session).
+3. Weights (~18 GB): default `uvx modelscope download
+   microsoft/VibeVoice-Large` into `models/VibeVoice-Large/` (no
+   permanent modelscope dep); `--hf` flag uses the HF mirror via
+   `hf download` instead. `LNVOX_VIBEVOICE_MODEL` overrides with any
+   local path or HF repo id.
+
+### 16.7 Emotion-expanded voicebank (designed, deferred)
+
+The gamble in v1 is that cloning + text punctuation carries enough
+affect. If sessions come out **monotonous**, the fix is not a new model —
+it's better refs, manufactured with the engine we already have:
+
+- New command `lnvox voice emote <book>`: for each cast (character,
+  clip) pair, render **7 emotion variants** of the clip with *Dramabox*,
+  prompting `<snapped descriptor>, <emotion>, "<calibration text>"` for
+  emotion ∈ {calm, joy, sadness, anger, fear, surprise, disgust}.
+  Output: `voicebank/emotions/<clip_id>/<emotion>.wav` + a manifest
+  extension. Dramabox's descriptor channel *acts* the emotion;
+  VibeVoice's cloning then *transfers* it — each engine doing the one
+  thing the other can't.
+- Calibration text: the clip's `sample_sentences` when present, else a
+  fixed neutral paragraph. `license: personal_use_only` flags propagate
+  to the variants (§6 rule).
+- Stage 3 gains a per-beat `emotion` field (same 7-value enum, default
+  `calm`) emitted by the Director alongside the existing `direction`.
+- The session planner then picks each speaker's ref by their **dominant
+  emotion within the session**; strong emotion swings become an
+  additional session-split trigger. Emotion variant filenames land in
+  the cache key for free (refs are already hashed by filename).
+
+Not implemented until v2 renders are judged by ear — deliberately.
+
+**Listening verdict (2026-07-23, first real render):** VibeVoice wins on
+pronunciation accuracy, generation speed, and hallucination rate; it
+loses on pacing — turns land like two or more people talking *at* each
+other rather than a scene, and the judgment is that emotion refs alone
+won't fully fix that. Dramabox stays the preferred default; VibeVoice
+ships as the alternative for ears that weigh accuracy over acting (the
+Studio's TTS Lab can audition both). This section stays deferred.
+
+### 16.8 Code surface affected
+
+| Area | Change |
+|---|---|
+| `src/lnvox/tts/vibevoice_client.py` (new) | Model wrapper per §16.4. |
+| `src/lnvox/stages/s4_vibevoice.py` (new) | Session planner + renderer → `05_audio_v2/` (§16.3); reuses `ChapterAudio` schema and s4_tts's hash/duration/clip-map helpers. |
+| `src/lnvox/stages/s4_tts.py` | Move-only: extract the `--limit` slicing into a shared helper. No behavior change. |
+| `src/lnvox/cli.py` | s4: `--tts-backend` (+env default), `--max-session-chars`, staged guard, vibevoice dispatch. s5: `--v2`. |
+| `scripts/setup_vibevoice.sh` (new) | Clone pinned fork + editable install + weight download (§16.6). |
+| `scripts/run_pipeline.sh` | `--tts-backend` flag, `prepare_vibevoice_env`, s5 `--v2` pass-through, staged+vibevoice guard. |
+| `pyproject.toml` | `soxr>=0.5` in the `tts` extra. No torch changes. |
+| `tests/test_sessions.py` (new) | Planner invariants + renderer/cache with a fake client (no model needed). |
+| `scripts/voicebank_studio.py` | TTS Lab: engine selector (dramabox/vibevoice), one-engine-per-session transformers warning on Load (§16.6), `Speaker N:` script auditions with the selected clip as every speaker's ref. |
+| `src/lnvox/tts/staged*.py`, `s5_mix.py`, s6, voices | **No change.** |
+
+### 16.9 Quality risks (accepted for v1)
+
+- **Language coverage.** Trained on English + Chinese. Japanese names
+  (the toaru corpus) may mispronounce; no text normalization is performed
+  by the model, so numerals/abbreviations render as-is.
+- **Ref-clip quality dominates.** Common Voice clips are noisy and
+  short; cloning inherits the noise. Curating 5–15 s clean refs (Studio,
+  §12) is the lever — and §16.7 raises the ceiling further.
+- **Monotony.** No descriptor channel means `direction` cues are unused;
+  affect rides on punctuation + cloning. This is exactly what §16.7
+  exists for — listen first, then decide.
+- **Session-level cache granularity.** One edited line re-renders a
+  ~3000-char session, not a 375-char beat. Bounded by
+  `--max-session-chars`.
+- **Occasional hallucinated fillers / speaker drift** on long sessions (a
+  known VibeVoice quirk, worse above ~4 speakers or very long scripts).
+  Re-roll the session with a different seed; cap keeps sessions modest.
+
+### 16.10 What's explicitly **not** in this section
+
+- **Per-beat VibeVoice mode.** Rendering beat-by-beat forfeits the
+  model's long-form strength while keeping all its weaknesses — Dramabox
+  already owns that regime.
+- **s6 sync for v2 audio.** Needs forced alignment (e.g. WhisperX or
+  aeneas) to recover per-beat timestamps inside session WAVs — a design
+  of its own, do it when a v2 book needs the reader.
+- **Implementing §16.7 now.** Ears first.
+- **VibeVoice-1.5B / Realtime-0.5B variants.** The client accepts any
+  compatible checkpoint via `LNVOX_VIBEVOICE_MODEL`, but only Large is
+  tested/documented.
+- **Auto-fallback between TTS backends** (same rationale as §14.6) and
+  **LoRA hooks** (`load_lora_assets` exists in the fork; ignored until
+  needed).
+
+## 17. Scenario mode (theater scripts → timed sync file + full-cast audio)
+
+A third pipeline mode next to narration and lecture (§13): the input is a
+**theater script** (a troupe's working document, not a book), and the
+primary deliverable is not an audiobook but a **sync file** — one timed
+entry per spoken line, `{timing, speaker, text, direction}` — plus the
+full-cast TTS audio that timeline is measured against. Same skeleton,
+same voicebank machinery, same engines; new ingest, a verbatim-preserving
+structure pass, and a sync emitter.
+
+**IP constraint (hard rule).** The test scripts under `scenarios/` are
+protected IP. No verbatim script content — lines, staging, cues,
+character names, titles — may appear in this document, in code, in
+prompt templates, or in test fixtures; all examples below are invented.
+`scenarios/` and `data/` are gitignored. Script text is sent only to the
+locally-served LLM and the local TTS engines; it never leaves the machine.
+
+### 17.1 What & why
+
+The test corpus is `scenarios/*.md` — four real French scripts of very
+different kinds (short comedy sketches; an ensemble piece; a *conduite*
+/ tech run sheet; a full-length play). Use cases the sync file serves:
+
+- **Line learning / rehearsal companion**: hear the whole play with cast
+  voices; follow along per line; know who speaks when.
+- **Régie cueing**: two of the four scripts embed sound/light cues.
+  Cue entries with timestamps give the régisseur a dry-run conduite
+  without actors.
+- **French**: validated — the user has already confirmed both the LLM
+  stages and the TTS engines handle French acceptably (prompts stay
+  English; outputs follow the script's language). A dedicated **French
+  voicebank** is seeded from the French Common Voice corpus now in
+  `data/` (§17.5).
+
+### 17.2 Input reality — why ingest is LLM-structured, not a regex
+
+The four scripts share concepts but not syntax (all syntax shown with
+invented placeholder names):
+
+| Script | Dialogue syntax | Structure | Extras |
+|---|---|---|---|
+| A | `**Nom** \- ligne` (+ variants/typos: trailing dash glued to the name, `:` instead of `-`, inconsistent spacing in `**Rôle 1 (Prénom)**` labels) | `Séquence N – Titre` | italic staging lines AND italic staging *inside* dialogue lines |
+| B | `Nom : ligne` | `### N. TITRE` | a characters section mapping **several roles → one actor**; bold one-word tech cues; group lines spoken by everyone |
+| C | bold CAPS name alone on a line, text block follows | bold number + bold quoted title | it's a *conduite*: color-coded bold music/light cues interleaved throughout |
+| D | `NOM : ligne` | period/act headers + numbered scenes | characters section with prose bios + role→actor mapping; voice-over speaker; sound/light cues |
+
+Hand-writing a parser per troupe-formatting-quirk is a losing game. The
+design mirrors lecture mode's deterministic-first philosophy (§13.2) but
+inverts the ratio: scene/sequence headers are detected deterministically
+where possible (they chunk the LLM's work), and a **structuring LLM pass**
+classifies each chunk's lines into items. The non-negotiable invariant is
+**verbatim text**: every dialogue item's `text` must be an exact substring
+of its source chunk (after markdown unescaping) — validated in code, with
+per-chunk retry, then a loud per-line fallback (kept as `staging` so
+nothing silently disappears). The LLM structures; it never rewrites.
+
+### 17.3 Pipeline & artifact layout
+
+`lnvox ingest-scenario scenarios/<file>.md --id <id>` (needs the LLM
+server — structuring is an LLM pass), then the existing `voice cast`,
+then `lnvox scenario <id>` (the direction pass; needs casting for the
+descriptors, mirroring the s2→cast→s3 order of narration mode), then
+s4 / s5, then `lnvox scenario-sync <id>`.
+
+| Step | Reuse | Output under `artifacts/<id>/` |
+|---|---|---|
+| Ingest + structure | new (`ingest/scenario.py` + `scenario_structure.jinja`) | `00_script.json` — scenes of ordered items `{type: dialogue\|staging\|cue, speaker?, text}` + the characters roster (name, bio, actor) when the script has one; also `00_text.jsonl` (one chapter per scene) so s5 picks up scene titles for chapter markers |
+| Characters | s1 schemas reused | `01_characters.json` — roster is script-given; the same pass merges speaker-label variants (spacing/typos/parenthesized first names) and LLM-fills gender/age/description gaps for casting |
+| Casting | `voice cast` **unchanged** | `04_voice_assignments.json`. Role-collapsing onto one actor's voice is done by hand in the Voicebank Studio's Casting tab — no `--by-actor` flag (decision 2026-07-24) |
+| Direction | s3 machinery reused; new prompt | `03_directed/*.json` — `DirectedBeat` per line, `text` verbatim, + new `emotion` field (the §16.7 7-enum), `direction` = short cue **in the script's language** (for humans/sync), Dramabox `prompt` composed in English as today |
+| TTS | s4 **unchanged** (both engines, `--tts-backend`) | `05_audio/<scene>/…` |
+| Mix | s5 **unchanged** | `06_final/<id>.m4b` with scene chapter markers |
+| Sync | new emitter | `07_sync/<scene>.json` + `07_sync/play.json` (+ `.srt` export) |
+
+**Ingest is content-cached** (same philosophy as the s4 beat cache,
+§2.6): every structuring/roster/characters LLM call is cached under
+`cache/scenario/` keyed on the hash of the *rendered prompt* + schema +
+model — so a re-run or crash-resume only pays for scenes whose text
+actually changed, and editing a prompt template or switching models
+re-keys automatically (stale entries can't survive by construction).
+`--no-cache` bypasses it to re-roll the structuring.
+
+Mapping onto existing stage shapes: one `ChapterDirected` per script
+scene/sequence; within it, one `DirectedScene` per staging-delimited
+run of dialogue — so s5's existing inter-scene pad lands exactly where
+a staged action happens, and becomes the "staging pause" with zero new
+s5 code. One beat per spoken line; the s3 375-char split still applies
+for TTS *rendering* (long monologues), with the beat's
+`source_paragraph` field (already on the schema for lecture mode)
+carrying the script-line index so the sync emitter re-groups split
+chunks into **one entry per script line**.
+
+### 17.4 The sync file
+
+Deterministic timing — the same cursor math s5/s6 already use (beat WAV
+durations + the same pad values passed to both stages), not audio
+probing. Example (invented content):
+
+```json
+{
+  "scene_id": "01_sequence-1",
+  "entries": [
+    {"start": 12.34, "end": 15.20, "type": "dialogue",
+     "speaker": "Gardien", "text": "Qui va là ?",
+     "direction": "méfiant, voix basse", "emotion": "fear"},
+    {"start": 16.20, "end": 18.20, "type": "staging",
+     "text": "Il lève sa lanterne vers la porte."},
+    {"start": 18.20, "end": 18.20, "type": "cue", "text": "SON 3"}
+  ]
+}
+```
+
+- **dialogue**: timed span of the line's rendered audio.
+- **staging** (didascalies): a configurable pause on the timeline
+  (default = s5's inter-scene pad, 1.0 s; the action takes stage time)
+  and an entry in the sync file; never spoken.
+- **cue** (sound/light/other): zero-duration marker at its position —
+  the régie timeline for free.
+- The m4b and the sync file are computed from the same plan and pad
+  values, so they agree by construction (same stance as s6, §2.7).
+
+### 17.5 French voicebank
+
+The French Common Voice corpus now lives under `data/` alongside the
+English one. Seeding stays the existing `voice seed-cv` flow pointed at
+the French locale dir; the bank lands in a **separate voicebank
+directory** so English and French casts don't mix. Plumbing:
+`_voicebank_dir()` honors a new `LNVOX_VOICEBANK` env var (default
+`voicebank`), read by `voice *`, `s4`, and the Studio (which already
+takes `--voicebank`). A French project sets `LNVOX_VOICEBANK=voicebank-fr`
+once; no per-command flags.
+
+### 17.6 Decisions (confirmed 2026-07-24)
+
+- **Group lines** (everyone speaks): rendered with the Narrator-fallback
+  voice, group label kept in the sync `speaker` field. Choral audio is
+  out of scope.
+- **Voice-over / offstage speakers**: normal characters — cast them.
+- **Direction language**: script language (French) in `direction` for
+  humans; English descriptor composition stays internal to the TTS
+  prompt. The `emotion` enum is language-neutral and shared with §16.7 —
+  scenario mode is where that field enters the schema.
+- **Actor mapping**: parsed and stored in the roster when the script has
+  one (it informs manual casting in the Studio); no automatic collapsing.
+- **Numbers/text normalization**: scripts are spoken-register already;
+  prices/numerals are the known TTS hazard (§16.9) — accepted for v1.
+- **SRT/VTT export**: included (subtitle-shaped tooling is everywhere;
+  it's ~30 lines).
+
+### 17.7 Code surface (planned)
+
+| Area | Change |
+|---|---|
+| `src/lnvox/ingest/scenario.py` (new) | Markdown chunking, LLM structure pass, verbatim validation → `00_script.json` + `00_text.jsonl`. |
+| `src/lnvox/llm/prompts/scenario_structure.jinja` (new) | Classify lines: dialogue/staging/cue + speaker labels, verbatim text. Invented examples only (IP rule). |
+| `src/lnvox/llm/prompts/scenario_directions.jinja` (new) | Per-line emotion (7-enum) + short direction cue in the script's language. |
+| `src/lnvox/stages/scenario.py` (new) | Direction pass → `03_voice_profiles.json` + `03_directed/*.json` (reuses s3's descriptor snap, split, prompt format). |
+| `src/lnvox/stages/scenario_sync.py` (new) | Timing plan from manifests + script items → `07_sync/*.json` + SRT. |
+| `src/lnvox/llm/schemas.py` | `DirectedBeat.emotion: str = "calm"`, scenario script schemas (roster, items). |
+| `src/lnvox/cli.py` | `ingest-scenario`, `scenario`, `scenario-sync`; `_voicebank_dir()` honors `LNVOX_VOICEBANK`. |
+| `scripts/run_pipeline.sh` | `--mode scenario` (LLM phase: ingest-scenario + voice cast + scenario; then s4/s5 + scenario-sync; skips s6). |
+| `tests/test_scenario.py` (new) | Chunker, verbatim validation, sync timing math — on an invented French fixture script (IP rule). |
+| s4, s5, voices matcher, TTS clients | **No change.** |
+
+### 17.8 What's explicitly **not** in this section
+
+- **Choral/unison rendering** for group lines.
+- **Music/lighting playback** — sync carries cue timestamps; firing them
+  is the régie tool's job, not ours.
+- **Automatic role→actor voice collapsing** — the Studio's Casting tab
+  is the tool for that (decision 2026-07-24).
+- **A rehearsal app/UI** — the sync file is the contract; consumers are
+  out of scope (same stance as the ln-reader split).
