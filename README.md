@@ -41,6 +41,12 @@ Stage 5 runs on CPU/ffmpeg only.
 > **lecture mode** that reads the text as written (no dramatization) and shows
 > code/tables/figures as images instead of narrating them. Jump to
 > [Lecture mode](#lecture-mode-non-fiction--technical-books).
+>
+> **Theater scripts?** For plays there's a **scenario mode** that keeps every
+> line verbatim, renders a full-cast performance, and emits a timed **sync
+> file** per scene (who says what, when, with which emotion) — plus the
+> sound/light cues on the same timeline. Jump to
+> [Scenario mode](#scenario-mode-theater-scripts--timed-sync--full-cast-audio).
 
 ---
 
@@ -286,6 +292,101 @@ renderer. Pass `--no-render` to `ingest-epub` to skip rasterization explicitly.
 `--ingest-classifier` controls the block classifier: `fallback` (default — the
 LLM is consulted *only* for untagged/ambiguous blocks) or `none` (rules-only,
 no LLM in ingest at all).
+
+---
+
+## Scenario mode (theater scripts → timed sync + full-cast audio)
+
+The third mode. The input is a **theater script** (a troupe's working
+markdown, not a book), and the primary deliverable is not the audiobook but a
+**sync file** — one timed entry per line: `{start, end, speaker, text,
+direction, emotion}` — plus the full-cast audio that timeline is measured
+against. Use it to learn lines, rehearse against cast voices, or drive the
+régie: staging gets a timed pause, sound/light cues become zero-duration
+markers on the same timeline. See [DESIGN.md §17](DESIGN.md) for the design.
+
+What it does differently:
+
+- **The LLM structures, it never rewrites.** Ingest classifies every line
+  into dialogue / staging (didascalies) / cue, and every dialogue line must
+  be an **exact substring of the source** — lines that fail validation are
+  kept as staging with a loud warning, never paraphrased or dropped.
+  Validated on real scripts: 2 demotions across ~700 lines.
+- **Formats are tolerated, not required.** Speaker labels as `**Nom** - ligne`,
+  `NAME: line`, or bold CAPS on their own line; cast sections titled
+  `PERSONNAGES` / `CHARACTERS` / `CAST`; scene headers like `Séquence 3`,
+  `SCENE 1`, `ACT II` (a headerless one-act works too). Label variants and
+  typos are canonicalized into one character.
+- **Per-line acting direction.** The director adds an `emotion` (calm, joy,
+  sadness, anger, fear, surprise, disgust) and a short cue *in the script's
+  language*; parenthetical cues printed inside a line (`(whispering) …`) are
+  kept in the script/sync but stripped from what the TTS speaks.
+- **Languages:** validated in French and English. For a French cast, seed a
+  separate voicebank from the French Common Voice tarball and point the
+  pipeline at it with `LNVOX_VOICEBANK=voicebank-fr` (all `voice` commands,
+  `s4` and the Studio honor it; a casting made against one bank refuses to
+  render against another).
+- **Privacy:** `scenarios/` and `data/` are gitignored; script text goes only
+  to the locally-served LLM and the local TTS — it never leaves the machine.
+
+### Script format
+
+Anything close to this works (invented example — real scripts are messier and
+that's fine):
+
+```markdown
+CHARACTERS
+
+- GUARD
+- TRAVELLER
+
+SCENE 1
+
+[A city gate, at night. A lantern swings in the wind.]
+
+GUARD: Who goes there?
+
+TRAVELLER: (whispering) It's me. Open up.
+```
+
+### Launch the whole pipeline in scenario mode
+
+```bash
+./scripts/run_pipeline.sh myplay \
+    --mode scenario \
+    --scenario-file "scenarios/My Play.md" \
+    --book-title "My Play"
+# French cast? prefix with:  LNVOX_VOICEBANK=voicebank-fr
+```
+
+The launcher runs: ingest-scenario → voice cast → scenario direction (all on
+the LLM server it manages) → s4 TTS → s5 mix → **scenario-sync**. Stage 6
+(EPUB sync) is skipped — scenario mode has its own sync emitter.
+
+### Scenario-mode stages (advanced / re-runs)
+
+| Stage | Command | Notes |
+|---|---|---|
+| 0 | `lnvox ingest-scenario scenarios/<play>.md --id <id> [--no-cache]` | LLM structure + roster + characters → `00_script.json`, `01_characters.json`. Content-cached under `cache/scenario/` — re-runs only re-pay scenes whose text changed; `--no-cache` re-rolls. |
+| V | `lnvox voice cast <id>` | Same casting as narration mode. **Check it by ear in the Studio** — the matcher may assign the same clip to two characters who share scenes; recast by hand where it matters. |
+| S | `lnvox scenario <id>` | Direction pass (emotion + cue per line) → `03_directed/*.json`. Idempotent per scene. |
+| 4–5 | `lnvox s4 <id>` / `lnvox s5 <id>` | Unchanged (Dramabox, `--staged` fine). VibeVoice renders audio too, but session WAVs carry no per-line timing, so scenario-sync requires the per-beat Dramabox path. |
+| Y | `lnvox scenario-sync <id>` | Timing plan → `07_sync/<scene>.json` + `play.json` + `play.srt`. |
+
+### Outputs
+
+- `artifacts/<id>/06_final/<title>.m4b` — the full-cast performance, one
+  chapter marker per scene.
+- `artifacts/<id>/07_sync/play.json` — every line/staging/cue with absolute
+  timestamps. Computed from the same plan as the mix, so **the sync total and
+  the m4b duration match exactly**; the timing survives edits because the
+  content-hash cache re-renders only changed lines.
+- `artifacts/<id>/07_sync/play.srt` — the same timeline as subtitles
+  (dialogue as `SPEAKER: text`, staging bracketed, cues double-bracketed) for
+  any player that takes SRT.
+
+Group lines (`Tous :` / `All:`) render with the narrator's voice; the sync
+file keeps the group label.
 
 ---
 
@@ -566,17 +667,30 @@ artifacts/<series>/<volume-NN>/
 ├── 03_directed/*.json                   Dramabox-ready beat prompts
 ├── 04_voice_assignments.json            Character → ref clip mapping
 ├── 05_audio/<chapter>/                  Rendered beat WAVs + manifest.json
+├── 05_audio_v2/<chapter>/               VibeVoice session renders (s4 --tts-backend vibevoice)
 ├── 06_final/<title>.m4b                 Final audiobook + timings.json
 └── 07_sync/                             Synced EPUB + sync_manifest.json + unmatched.json
 
-voicebank/
+artifacts/<scenario-id>/                 Scenario mode (theater scripts)
+├── 00_script.json                       Structured verbatim script (scenes → dialogue/staging/cue)
+├── 01_characters.json                   Roster (script-given + LLM gap-fill)
+├── 03_directed/*.json                   Directed beats (emotion + cue per line)
+├── 05_audio/ · 06_final/                Same as narration mode
+└── 07_sync/                             play.json + <scene>.json + play.srt (timed lines & cues)
+
+scenarios/*.md                           Theater scripts (gitignored — private)
+
+voicebank/                               English bank (default)
+voicebank-fr/                            French bank (select with LNVOX_VOICEBANK=voicebank-fr)
 ├── manifest.json                        Indexed voice clips
 └── clips/cv_<id>.wav                    Reference clips (10–20 s each)
 
 cache/tts/<sha256>.wav                   Content-addressed TTS cache (survives book deletions)
+cache/scenario/<sha256>.json             Scenario-ingest LLM cache (keyed on prompt + model)
 
 external/DramaBox/                       Cloned Dramabox repo (sys.path-injected)
-data/<cv-corpus-…>/                      Raw Common Voice extraction
+external/VibeVoice/                      Community fork (pip -e; scripts/setup_vibevoice.sh)
+data/<cv-corpus-…>/                      Raw Common Voice extraction (EN + FR)
 ```
 
 
