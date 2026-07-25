@@ -143,6 +143,11 @@ case "$LLM_BACKEND" in
         usage 2
         ;;
 esac
+# Export for the python stages: LLMClient disables Gemma's thinking channel
+# on llama-server (client.py) keyed on this env var — with only the
+# --llm-backend flag set, the client would otherwise never learn the backend
+# and structured calls burn their whole budget in reasoning tokens.
+export LNVOX_LLM_BACKEND="$LLM_BACKEND"
 
 case "$TTS_BACKEND" in
     dramabox|vibevoice) ;;

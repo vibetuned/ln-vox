@@ -46,7 +46,7 @@ STRUCTURE_SYSTEM = (
 _HEADER_PATTERNS = [
     re.compile(r"^#{1,6}\s*\d+\s*[.\\)]?\s*\S"),
     re.compile(
-        r"(?i)^\s*\**\s*(s[ée]quence|sc[èe]ne|acte|p[ée]riode|tableau|partie)\s+[\divxlc]+"
+        r"(?i)^\s*\**\s*(s[ée]quence|sc[èe]ne|acte?|p[ée]riode|tableau|partie)\s+[\divxlc]+"
     ),
     re.compile(r"^\*\*\s*\d+\s*\\?\.?\s*\*\*\s*$"),
     # Bare numbered headers: `3 – TITLE` / `**3 - Title**` (speaker labels are
@@ -54,8 +54,12 @@ _HEADER_PATTERNS = [
     re.compile(r"^\*{0,2}\s*\d+\s*[–—-]\s+\S"),
 ]
 
-# A heading that introduces the script's own cast list.
-_ROSTER_HEADER = re.compile(r"(?i)^\s*(les\s+)?personnages?\b.{0,40}$")
+# A heading that introduces the script's own cast list (FR + EN forms).
+_ROSTER_HEADER = re.compile(
+    r"(?i)^\s*(les\s+)?"
+    r"(personnages?|characters?|cast|distribution|dramatis\s+person(ae|æ))"
+    r"\b.{0,40}$"
+)
 
 # Group-speaker labels rendered with the Narrator fallback voice (§17.6).
 _GROUP_STEMS = {"tous", "toutes", "tous ensemble", "ensemble", "all", "choeur"}

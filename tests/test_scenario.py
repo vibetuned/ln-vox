@@ -136,6 +136,23 @@ def test_validate_items_demotes_rewritten_dialogue():
     assert validated[2].text == "Une phrase inventée."  # kept, never dropped
 
 
+# ---- spoken text (parenthetical acting cues) -------------------------------------
+
+
+def test_spoken_text_strips_parenthetical_cues():
+    from lnvox.stages.scenario import spoken_text
+
+    assert spoken_text("(haughtily, turning) Sir! Are you addressing me?") == (
+        "Sir! Are you addressing me?"
+    )
+    assert spoken_text("Ye look it. (Taking his arm kindly) See here, me lad.") == (
+        "Ye look it. See here, me lad."
+    )
+    # A line that is nothing but a cue is left unchanged, not emptied.
+    assert spoken_text("(un long silence)") == "(un long silence)"
+    assert spoken_text("Pas de didascalie ici.") == "Pas de didascalie ici."
+
+
 # ---- LLM cache -----------------------------------------------------------------
 
 

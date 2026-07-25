@@ -14,6 +14,7 @@ Per line the LLM adds an `emotion` (the §16.7 7-value enum) and a short
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -39,6 +40,23 @@ from lnvox.stages.s3_director import (
 )
 from lnvox.ingest.scenario import is_group_label
 from lnvox.voices.schema import BookCasting, Voicebank
+
+
+_PARENTHETICAL = re.compile(r"\s*\([^()]*\)\s*")
+
+
+def spoken_text(text: str) -> str:
+    """Strip parenthetical acting cues from a dialogue line's SPOKEN text.
+
+    English-play convention puts per-line directions in parentheses inside
+    the line (`(haughtily) Sir!`) — they are cues for the actor, not speech,
+    so the TTS must not read them. They stay verbatim in `00_script.json`
+    and the sync file (same text-vs-source split lecture mode uses), and the
+    direction LLM still sees them in its scene context. A line that is
+    NOTHING BUT a parenthetical is returned unchanged rather than emptied.
+    """
+    cleaned = " ".join(_PARENTHETICAL.sub(" ", text).split())
+    return cleaned or text
 
 
 def group_dialogue_runs(scene: ScriptScene) -> list[list[int]]:
@@ -129,7 +147,7 @@ def direct_scene(
             else:
                 render_speaker = item.speaker
                 descriptor = profile_map.get(item.speaker) or narrator_descriptor
-            for chunk in _split_long_text(item.text):
+            for chunk in _split_long_text(spoken_text(item.text)):
                 beats.append(
                     DirectedBeat(
                         type="dialogue",
