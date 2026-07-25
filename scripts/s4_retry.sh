@@ -5,7 +5,7 @@
 set -uo pipefail
 
 BOOK="${1:-toaru-volume-1}"
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-30}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-100}"
 LOG="artifacts/$BOOK/_s4_full.log"
 mkdir -p "artifacts/$BOOK"
 

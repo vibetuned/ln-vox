@@ -97,6 +97,16 @@ class DramaboxClient:
         from model_downloader import get_all_paths  # type: ignore[import-not-found]
         from inference_server import TTSServer  # type: ignore[import-not-found]
 
+        # MPS-specific defaults (DESIGN.md §11.3). bitsandbytes is CUDA-only,
+        # torch.compile is flaky on MPS for diffusion models, and bfloat16
+        # has materially worse MPS coverage than fp16. Use `setdefault` so a
+        # caller who explicitly passes one of these keeps that choice — only
+        # the unset knobs get the per-device default.
+        if device.startswith("mps"):
+            kwargs.setdefault("dtype", "fp16")
+            kwargs.setdefault("bnb_4bit", False)
+            kwargs.setdefault("compile_model", False)
+
         paths = get_all_paths()
         self.device = device
         self.server = TTSServer(

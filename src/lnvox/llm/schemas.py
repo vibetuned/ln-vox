@@ -48,6 +48,33 @@ class CharacterList(BaseModel):
     )
 
 
+class CharacterMergeGroup(BaseModel):
+    """One set of draft-cast entries the merge LLM judges to be the same person.
+
+    The LLM returns only these groups (not a rewritten cast); Stage 1 applies
+    them to its own clean clusters, so no descriptions or aliases come back from
+    the model. See `s1_characters.merge_clusters`."""
+
+    canonical: str = Field(
+        description="Preferred display name for the merged character (one of `names`)"
+    )
+    names: list[str] = Field(
+        default_factory=list,
+        description="Two or more names from the provided list that denote ONE person",
+    )
+
+    _coerce_names = field_validator("names", mode="before")(_coerce_str_to_list)
+
+
+class CharacterMergeProposal(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    merges: list[CharacterMergeGroup] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("merges", "groups", "merge_groups"),
+        json_schema_extra={"maxItems": 60},
+    )
+
+
 BeatType = Literal["narration", "dialogue"]
 
 
@@ -158,9 +185,20 @@ class DirectedBeat(BaseModel):
     type: BeatType
     text: str
     speaker: str  # always set — "Narrator" for narration
-    direction: str  # stage-direction body that goes inside the [ ... ] brackets
-    prompt: str  # final Dramabox-ready string: [direction]\n"text"
+    direction: str  # voice + performance descriptor that prefixes the line
+    prompt: str  # final Dramabox-ready string: `<direction>, "<text>"`
     source_span: str = ""  # carried through from Stage 2 for the sync stage
+    # Chapter-global paragraph index this beat was split from (lecture mode
+    # only; -1 in narration mode). Lets Stage 6 place ingest-extracted visual
+    # elements (code/table/figure), which carry an `after_paragraph`, against
+    # the beat that covers that paragraph. See DESIGN.md §13.2/§13.5.
+    # Scenario mode (§17) reuses it as the chapter-global dialogue-line index
+    # so the sync emitter can re-group a long line's split chunks.
+    source_paragraph: int = -1
+    # Scenario mode (§17) / emotion voicebank (§16.7): one of the 7-value
+    # Emotion enum. "calm" everywhere else — a plain str so old artifacts
+    # and non-scenario paths validate unchanged.
+    emotion: str = "calm"
 
 
 class DirectedScene(BaseModel):
@@ -172,3 +210,110 @@ class DirectedScene(BaseModel):
 class ChapterDirected(BaseModel):
     chapter_id: str
     scenes: list[DirectedScene]
+
+
+# ---------- Lecture mode (DESIGN.md §13) ----------
+
+
+# Block kinds the lecture-mode ingest classifier emits. `prose` (and headings,
+# folded into prose) is narrated; `drop` is excised entirely; the rest become
+# reader-side visual elements (§13.2).
+BlockKind = Literal[
+    "prose", "code", "table", "figure", "footnote", "equation", "drop"
+]
+
+
+class BlockClass(BaseModel):
+    """LLM-fallback classification of ONE untagged block (§13.2a step 2).
+
+    Only blocks the deterministic rules can't classify reach the LLM, so this
+    is a tiny, cheap call. `reason` is kept for debugging the classifier's
+    judgment on messy publisher markup."""
+
+    kind: BlockKind
+    reason: str = ""
+
+
+class NormalizedBeat(BaseModel):
+    """One beat's speech-normalized text, keyed back by its 0-indexed position
+    in the batch sent to the normalize pass (§13.6)."""
+
+    index: int
+    text: str
+
+
+class NormalizedBeats(BaseModel):
+    # maxItems caps a runaway model in the guided schema only (see Character).
+    beats: list[NormalizedBeat] = Field(json_schema_extra={"maxItems": 200})
+
+
+# ---------- Scenario mode (DESIGN.md §17) ----------
+
+
+# Shared with the §16.7 emotion-voicebank plan: 7 language-neutral values.
+Emotion = Literal["calm", "joy", "sadness", "anger", "fear", "surprise", "disgust"]
+
+ScriptItemType = Literal["dialogue", "staging", "cue"]
+
+
+class ScriptItem(BaseModel):
+    """One structured line of a theater script (verbatim text, never rewritten)."""
+
+    type: ScriptItemType
+    speaker: str = Field(
+        default="",
+        description="Speaker label as printed (markdown stripped); '' unless dialogue",
+    )
+    text: str = Field(description="Verbatim line text, markdown markers/escapes removed")
+
+
+class SceneStructure(BaseModel):
+    """LLM output for one scene chunk of a script (§17.2)."""
+
+    items: list[ScriptItem] = Field(json_schema_extra={"maxItems": 300})
+
+
+class RosterEntry(BaseModel):
+    """One entry of the script's own characters section, when present."""
+
+    name: str
+    description: str = ""
+    actor: str = Field(
+        default="",
+        description="Performer this role maps to when the script lists one; else ''",
+    )
+
+
+class RosterList(BaseModel):
+    entries: list[RosterEntry] = Field(
+        default_factory=list, json_schema_extra={"maxItems": 80}
+    )
+
+
+class ScriptScene(BaseModel):
+    scene_id: str  # "01", "02", … (also the s4/s5 chapter id)
+    title: str = ""
+    items: list[ScriptItem] = Field(default_factory=list)
+
+
+class ScenarioScript(BaseModel):
+    """artifacts/<id>/00_script.json — the structured, verbatim script."""
+
+    scenario_id: str
+    title: str = ""
+    language: str = ""
+    roster: list[RosterEntry] = Field(default_factory=list)
+    scenes: list[ScriptScene] = Field(default_factory=list)
+
+
+class ScenarioCue(BaseModel):
+    line: int = Field(description="1-indexed dialogue-line number from the prompt")
+    emotion: Emotion = "calm"
+    cue: str = Field(
+        default="",
+        description="Short performance cue (2-6 words) in the script's language",
+    )
+
+
+class ScenarioDirections(BaseModel):
+    directions: list[ScenarioCue] = Field(json_schema_extra={"maxItems": 300})

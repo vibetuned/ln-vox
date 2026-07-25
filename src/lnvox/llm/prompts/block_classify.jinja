@@ -1,0 +1,23 @@
+You classify ONE block of an EPUB page for an audiobook pipeline.
+
+Decide what the block actually IS, so the pipeline knows whether to narrate it
+or show it as a visual element. Choose exactly one `kind`:
+
+- "prose"    — ordinary readable text (paragraphs, headings, quotes, lists).
+               This is the default; choose it unless the block is clearly one
+               of the below.
+- "code"     — a source-code listing / command transcript (even if the markup
+               is just a styled paragraph rather than <pre>).
+- "table"    — tabular data.
+- "figure"   — an image/figure with or without a caption.
+- "equation" — a standalone mathematical equation/formula.
+- "footnote" — a footnote / endnote.
+- "drop"     — boilerplate that should NOT be narrated or shown (page numbers,
+               running headers, a stray table-of-contents fragment).
+
+Output JSON: {"kind": "<one of the above>", "reason": "<short>"}.
+Do NOT wrap the output in markdown code fences.
+
+---
+Block HTML:
+{{ block_html }}

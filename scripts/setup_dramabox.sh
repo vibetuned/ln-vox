@@ -3,12 +3,19 @@
 # Dramabox is not pip-installable; we vendor it at external/DramaBox.
 #
 # Platform handling:
-#   - x86_64           → install Dramabox's requirements.txt verbatim (pins torch==2.8.0+cu128).
-#   - aarch64 (DGX Spark / Grace Hopper / Jetson)
+#   - x86_64 Linux     → install Dramabox's requirements.txt verbatim (pins torch==2.8.0+cu128).
+#   - aarch64 Linux (DGX Spark / Grace Hopper / Jetson)
 #                      → install Dramabox's requirements MINUS torch/torchaudio
 #                        (the pinned 2.8.0 has no CUDA-enabled aarch64 wheel),
 #                        then pull torch>=2.10 from the cu130 index which DOES
 #                        ship aarch64+sbsa builds with CUDA.
+#   - Darwin (Apple Silicon, secondary target — see DESIGN.md §11)
+#                      → install Dramabox's requirements MINUS torch/torchaudio
+#                        AND minus bitsandbytes (CUDA-only, no macOS wheel);
+#                        let pip pull the default MPS-capable torch wheel and
+#                        verify torch.backends.mps instead of torch.cuda.
+#                        DramaboxClient sets bnb_4bit=False on MPS, so the
+#                        missing bitsandbytes doesn't break the warm Gemma load.
 #
 # The DramaboxClient wrapper monkey-patches torchaudio.save so version drift
 # between Dramabox's expected 2.8 and the 2.10+ we install on aarch64 doesn't
@@ -18,6 +25,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXTERNAL="$ROOT/external/DramaBox"
 ARCH="$(uname -m)"
+OS="$(uname -s)"
 
 if [ ! -d "$EXTERNAL" ]; then
     echo "==> Cloning Dramabox into $EXTERNAL"
@@ -44,39 +52,108 @@ fi
 
 cd "$ROOT"
 
-case "$ARCH" in
-    x86_64)
-        echo "==> x86_64 → installing $REQ_FILE verbatim"
-        uv pip install -r "$REQ_FILE"
-        ;;
+# Darwin (Apple Silicon) must be matched BEFORE the arm64 leg of the case
+# below — `uname -m` on M-series Macs also returns "arm64", and the existing
+# branch assumes Linux+CUDA wheels exist on the cu130 index.
+if [ "$OS" = "Darwin" ]; then
+    echo "==> Darwin detected (Apple Silicon, secondary target)"
+    echo "    Filtering torch* and bitsandbytes out of Dramabox's requirements"
+    echo "    (bitsandbytes is CUDA-only; default PyPI torch is MPS-capable)."
+    FILTERED="$(mktemp)"
+    trap 'rm -f "$FILTERED"' EXIT
+    grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision|bitsandbytes)([[:space:]]|=|<|>|~|!|$)' \
+        "$REQ_FILE" > "$FILTERED"
+    echo "    Installing filtered Dramabox requirements…"
+    uv pip install -r "$FILTERED"
+    echo "    Installing torch + torchaudio from default PyPI (MPS-capable)…"
+    uv pip install "torch>=2.10,<2.12" "torchaudio>=2.10,<2.12"
+else
+    case "$ARCH" in
+        x86_64)
+            echo "==> x86_64 → installing $REQ_FILE (mamba kernels via prebuilt wheels)"
+            # mamba-ssm / causal-conv1d ship only sdists on PyPI. Building them
+            # under uv's isolated build env links selective_scan_cuda against
+            # the build env's (latest) torch, not the pinned 2.8 — the .so then
+            # fails to import ("undefined symbol") and RE-USE silently drops to
+            # its kernel-free fallback (~5-10x slower denoise). Filter them out
+            # and install the ABI-matched prebuilt wheels from the upstream
+            # GitHub releases instead. Mirrors run_pipeline.sh's
+            # install_mamba_kernel_wheels.
+            FILTERED="$(mktemp)"
+            trap 'rm -f "$FILTERED"' EXIT
+            grep -v -i -E '^[[:space:]]*(mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' \
+                "$REQ_FILE" > "$FILTERED"
+            uv pip install -r "$FILTERED"
+            PYTAG="$(.venv/bin/python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+            ABI="cu12torch2.8cxx11abiTRUE"
+            MAMBA_SSM_VERSION="2.3.1"
+            CAUSAL_CONV1D_VERSION="1.6.2.post1"
+            uv pip install --no-deps \
+                "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_x86_64.whl" \
+                "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_x86_64.whl"
+            ;;
 
-    aarch64|arm64)
-        echo "==> aarch64 detected (DGX Spark / Grace Hopper / Jetson)"
-        echo "    Filtering torch / torchaudio out of Dramabox's requirements"
-        echo "    (no CUDA-enabled aarch64 wheel exists for torch 2.8.0)."
-        FILTERED="$(mktemp)"
-        trap 'rm -f "$FILTERED"' EXIT
-        # Drop any line that pins torch / torchaudio / torchvision regardless
-        # of the operator (==, >=, <=, ~=, !=).
-        grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision)([[:space:]]|=|<|>|~|!|$)' "$REQ_FILE" > "$FILTERED"
-        echo "    Installing filtered Dramabox requirements…"
-        uv pip install -r "$FILTERED"
-        echo "    Installing torch + torchaudio from the cu130 aarch64+sbsa wheels…"
-        uv pip install \
-            --index-url https://download.pytorch.org/whl/cu130 \
-            "torch>=2.10,<2.12" \
-            "torchaudio>=2.10,<2.12"
-        ;;
+        aarch64|arm64)
+            echo "==> aarch64 detected (DGX Spark / Grace Hopper / Jetson)"
+            echo "    Filtering torch / torchaudio + mamba kernels out of Dramabox's requirements"
+            echo "    (no CUDA-enabled aarch64 wheel exists for torch 2.8.0; mamba"
+            echo "    sdist builds link the wrong torch ABI under build isolation)."
+            FILTERED="$(mktemp)"
+            trap 'rm -f "$FILTERED"' EXIT
+            # Drop any line that pins torch / torchaudio / torchvision /
+            # mamba-ssm / causal-conv1d regardless of the operator.
+            grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision|mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' "$REQ_FILE" > "$FILTERED"
+            echo "    Installing filtered Dramabox requirements…"
+            uv pip install -r "$FILTERED"
+            echo "    Installing torch + torchaudio from the cu130 aarch64+sbsa wheels…"
+            # ==2.10.* (not >=2.10,<2.12): the newest prebuilt mamba kernel
+            # wheels are keyed cu13torch2.10. Bump both together when upstream
+            # adds torch2.11 wheels. Mirrors run_pipeline.sh.
+            uv pip install \
+                --index-url https://download.pytorch.org/whl/cu130 \
+                "torch==2.10.*" \
+                "torchaudio==2.10.*"
+            echo "    Installing prebuilt mamba kernel wheels (cu13torch2.10, aarch64)…"
+            PYTAG="$(.venv/bin/python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+            ABI="cu13torch2.10cxx11abiTRUE"
+            MAMBA_SSM_VERSION="2.3.1"
+            CAUSAL_CONV1D_VERSION="1.6.2.post1"
+            uv pip install --no-deps \
+                "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_aarch64.whl" \
+                "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${ABI}-${PYTAG}-${PYTAG}-linux_aarch64.whl"
+            ;;
 
-    *)
-        echo "==> Unknown arch '$ARCH'. Trying Dramabox's requirements verbatim and praying." >&2
-        uv pip install -r "$REQ_FILE"
-        ;;
-esac
+        *)
+            echo "==> Unknown arch '$ARCH'. Trying Dramabox's requirements verbatim and praying." >&2
+            uv pip install -r "$REQ_FILE"
+            ;;
+    esac
+fi
 
 echo ""
-echo "==> Verifying torch.cuda is usable…"
-if uv run python - <<'PY'
+if [ "$OS" = "Darwin" ]; then
+    echo "==> Verifying torch.backends.mps is usable…"
+    if uv run python - <<'PY'
+import sys
+import torch
+print(f"   torch={torch.__version__}  mps_available={torch.backends.mps.is_available()}")
+if not torch.backends.mps.is_available():
+    sys.exit(1)
+PY
+    then
+        echo "==> ✓ Dramabox ready at $EXTERNAL (MPS backend)"
+        echo "    First model run will auto-download weights from HuggingFace (~15 GB)."
+        echo "    Expect 5-10x real-time render on Apple Silicon — see DESIGN.md §11.3."
+    else
+        echo "" >&2
+        echo "==> ⚠  torch is installed but MPS is NOT available." >&2
+        echo "    Are you running on Apple Silicon (M-series)? Intel Macs have no" >&2
+        echo "    MPS backend. uv run python -c 'import torch; print(torch.__version__)'" >&2
+        exit 1
+    fi
+else
+    echo "==> Verifying torch.cuda is usable…"
+    if uv run python - <<'PY'
 import sys
 import torch
 print(f"   torch={torch.__version__}  cuda_available={torch.cuda.is_available()}")
@@ -84,16 +161,17 @@ if not torch.cuda.is_available():
     sys.exit(1)
 print(f"   device={torch.cuda.get_device_name(0)}")
 PY
-then
-    echo "==> ✓ Dramabox ready at $EXTERNAL"
-    echo "    First model run will auto-download weights from HuggingFace (~15 GB)."
-else
-    echo "" >&2
-    echo "==> ⚠  torch is installed but CUDA is NOT available." >&2
-    echo "    On aarch64 this usually means the wheel index didn't have a" >&2
-    echo "    CUDA-enabled build for the requested version. Try:" >&2
-    echo "       uv pip install --force-reinstall \\" >&2
-    echo "           --index-url https://download.pytorch.org/whl/cu130 \\" >&2
-    echo "           torch torchaudio" >&2
-    exit 1
+    then
+        echo "==> ✓ Dramabox ready at $EXTERNAL"
+        echo "    First model run will auto-download weights from HuggingFace (~15 GB)."
+    else
+        echo "" >&2
+        echo "==> ⚠  torch is installed but CUDA is NOT available." >&2
+        echo "    On aarch64 this usually means the wheel index didn't have a" >&2
+        echo "    CUDA-enabled build for the requested version. Try:" >&2
+        echo "       uv pip install --force-reinstall \\" >&2
+        echo "           --index-url https://download.pytorch.org/whl/cu130 \\" >&2
+        echo "           torch torchaudio" >&2
+        exit 1
+    fi
 fi

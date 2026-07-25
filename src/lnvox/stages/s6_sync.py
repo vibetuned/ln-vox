@@ -38,6 +38,7 @@ from typing import Callable
 from xml.etree import ElementTree as ET
 
 from bs4 import BeautifulSoup, NavigableString
+from bs4.element import PreformattedString
 
 
 # ---- constants --------------------------------------------------------------
@@ -92,8 +93,14 @@ def _normalize_with_map(text: str) -> tuple[str, list[int]]:
             orig.append(i)
             continue
         in_ws = False
-        out.append(ch.lower())
-        orig.append(i)
+        low = ch.lower()
+        # A handful of codepoints lowercase to MORE than one char ('İ' →
+        # 'i̇'). Emit one map entry per output char, all pointing at the
+        # same original index, so len(normalized) == len(map) always holds —
+        # otherwise every wrap offset after that char shifts.
+        for c in low:
+            out.append(c)
+            orig.append(i)
     return "".join(out), orig
 
 
@@ -125,18 +132,35 @@ def _build_shadow(
 ) -> tuple[str, list[_NodeSegment], list[_ImageMark]]:
     """Concatenate every visible text node into a normalized shadow string.
 
-    Walks the DOM in document order (``descendants``) so interleaved ``<img>``
+    Walks the ``<body>`` subtree in document order so interleaved ``<img>``
     elements can be recorded at the shadow position where they fall — that's
     what lets Stage 6 emit "this image appears before beat X". A single space
     is inserted between adjacent text nodes so two nodes can't accidentally
     match across the boundary (e.g. ``</p><p>`` with no actual whitespace).
+
+    The walk is scoped to ``<body>`` (not the whole soup) because BS4's
+    ``html.parser`` exposes the ``<?xml … ?>`` declaration's content as a
+    document-level NavigableString. A whole-soup walk used to pick that text
+    up, the matcher could then wrap it in a ``<span>``, and the resulting
+    serialized XHTML had stray spans BEFORE ``<html>`` — well-formed in
+    permissive HTML viewers but rejected by strict XML parsers with
+    "junk after document element".
     """
+    body = soup.find("body") or soup
     parts: list[str] = []
     segments: list[_NodeSegment] = []
     images: list[_ImageMark] = []
     cursor = 0
-    for node in soup.descendants:
+    for node in body.descendants:
         if isinstance(node, NavigableString):
+            # Comments / CDATA / processing instructions / doctypes are all
+            # NavigableString subclasses (via PreformattedString). Their text
+            # is invisible in a reader — letting it into the shadow both
+            # misplaces matches AND, if a match lands inside one, the wrap
+            # step replaces the comment node with a plain-text span, making
+            # previously hidden text visible in the synced EPUB.
+            if isinstance(node, PreformattedString):
+                continue
             if any(p.name in _SKIP_NODE_PARENTS for p in node.parents if p.name):
                 continue
             raw = str(node)
@@ -437,7 +461,14 @@ def _wrap_matches(
         if cursor < len(text):
             new_parts.append(NavigableString(text[cursor:]))
 
-        idx = list(parent.contents).index(node)
+        # Find the node's position by IDENTITY. list.index() compares with
+        # ==, and NavigableString == is string equality — with two identical
+        # text nodes under one parent (repeated phrases around inline tags)
+        # it returns the FIRST twin, and the replacement parts get inserted
+        # there, reordering the chapter text.
+        idx = next(
+            i for i, c in enumerate(parent.contents) if c is node
+        )
         node.extract()
         for offset, part in enumerate(new_parts):
             parent.insert(idx + offset, part)
@@ -512,6 +543,35 @@ def _write_modified_epub(
                 dst.writestr(new_item, modifications[item.filename])
             else:
                 dst.writestr(item, src.read(item.filename))
+
+
+# ---- visual-element placement (lecture mode) --------------------------------
+
+
+def place_visual_element(
+    after_paragraph: int,
+    seq: list[tuple[str, int, float, float]],
+) -> tuple[str | None, str | None, float | None]:
+    """Map a block's `after_paragraph` to neighbouring matched beats.
+
+    `seq` is the chapter's matched beats in playback order, each
+    ``(beat_id, source_paragraph, start_seconds, end_seconds)``. Returns
+    ``(after_beat_id, before_beat_id, trigger_seconds)`` — the element appears
+    after the last beat whose paragraph is ≤ `after_paragraph` and before the
+    first beat whose paragraph is greater. `trigger_seconds` is that before-beat's
+    start (or, for an end-of-chapter element, the after-beat's end). See §13.5.
+    """
+    after_beat = before_beat = None
+    after_end = before_start = None
+    for beat_id, sp, s_sec, e_sec in seq:
+        if sp <= after_paragraph:
+            after_beat, after_end = beat_id, e_sec
+    for beat_id, sp, s_sec, e_sec in seq:
+        if sp > after_paragraph:
+            before_beat, before_start = beat_id, s_sec
+            break
+    trigger = before_start if before_start is not None else after_end
+    return after_beat, before_beat, trigger
 
 
 # ---- timing accumulation ----------------------------------------------------
@@ -624,9 +684,9 @@ def run(
     matched_beats: list[dict] = []
     unmatched: list[dict] = []
     image_marks: list[dict] = []
-    # chapter_id → (first_matched_beat_id, last_matched_beat_id) for spine
-    # image placement.
-    chapter_first_last: dict[str, tuple[str, str]] = {}
+    # chapter_id → [(beat_id, source_paragraph, start_s, end_s)] in playback
+    # order, for placing lecture-mode visual elements (DESIGN.md §13.5).
+    chapter_matched_seq: dict[str, list[tuple[str, int, float, float]]] = {}
     confidence_counts: dict[str, int] = {
         "span-exact": 0,
         "exact": 0,
@@ -815,14 +875,8 @@ def run(
                     "end_seconds": timing[1],
                     "match_confidence": conf,
                 })
-
-            # Record first/last matched beat (in source position order) for
-            # spine-level image placement after the chapter loop.
-            if chapter_matches:
-                by_pos = sorted(chapter_matches, key=lambda m: m.shadow_start)
-                chapter_first_last[chapter_id] = (
-                    by_pos[0].beat_id,
-                    by_pos[-1].beat_id,
+                chapter_matched_seq.setdefault(chapter_id, []).append(
+                    (beat_id, beat.get("source_paragraph", -1), timing[0], timing[1])
                 )
 
             # ---- Map INLINE images to neighbouring beats --------------------
@@ -966,6 +1020,35 @@ def run(
                     "trigger_seconds": trigger,
                 })
 
+    # ---- Lecture-mode visual elements (code/table/figure/…) ----------------
+    # Ingest (§13.2) recorded each non-prose block with the chapter-global
+    # `after_paragraph` it follows. Map that to the surrounding matched beats
+    # (which carry `source_paragraph`) so the reader can trigger the element at
+    # the right playback offset — the paragraph-space analog of the inline-image
+    # placement above.
+    ingest_visual_elements: list[dict] = []
+    for ve in epub_meta.get("visual_elements", []):
+        cid = ve.get("chapter_id", "")
+        after_p = ve.get("after_paragraph", -1)
+        seq = chapter_matched_seq.get(cid, [])
+        after_beat, before_beat, trigger = place_visual_element(after_p, seq)
+        ingest_visual_elements.append({
+            "kind": ve.get("kind", ""),
+            "src": ve.get("src", ""),
+            "html": ve.get("html", ""),
+            "language": ve.get("language", ""),
+            "chapter_id": cid,
+            "spine_page": ve.get("spine_page", ""),
+            "after_beat_id": after_beat,
+            "before_beat_id": before_beat,
+            "trigger_seconds": trigger,
+        })
+
+    # Unified visual-elements list (§13.5): illustrations discovered by walking
+    # the EPUB (kind="image") + ingest-extracted code/table/figure/etc.
+    visual_elements = [{**im, "kind": im.get("kind", "image")} for im in image_marks]
+    visual_elements += ingest_visual_elements
+
     # Write the modified EPUB.
     safe_book_id = book_id.replace("/", "_")
     output_epub = output_dir / f"{safe_book_id}.epub"
@@ -986,6 +1069,7 @@ def run(
             "inter_chapter_seconds": inter_chapter_silence,
         },
         "images": image_marks,
+        "visual_elements": visual_elements,
         "beats": matched_beats,
     }
     (output_dir / "sync_manifest.json").write_text(
@@ -999,9 +1083,14 @@ def run(
     pct = (
         100.0 * len(matched_beats) / max(1, len(matched_beats) + len(unmatched))
     )
+    ve_note = (
+        f", {len(ingest_visual_elements)} non-prose element(s)"
+        if ingest_visual_elements
+        else ""
+    )
     progress(
         f"Done. {len(matched_beats)}/{len(matched_beats) + len(unmatched)} "
-        f"beats matched ({pct:.1f}%), {len(image_marks)} image(s) located. "
-        f"EPUB: {output_epub}"
+        f"beats matched ({pct:.1f}%), {len(image_marks)} image(s) located"
+        f"{ve_note}. EPUB: {output_epub}"
     )
     return manifest

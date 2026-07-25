@@ -46,8 +46,23 @@ DEFAULT_NARRATOR_AGE = "adult"
 DEFAULT_NARRATOR_ACCENT = "england"
 
 # Dramabox recommends 20-60 seconds per generation; English narration runs
-# roughly 12 chars/second so we cap merged beats at ~500 chars (~40s audio).
-MAX_MERGED_BEAT_CHARS = 500
+# roughly 12 chars/second. We cap merged beats at 375 chars (~30s audio):
+# beyond that Dramabox's denoise quality drops — noise rises and the voice can
+# slur into unintelligible speech — so we stay well under the upper bound.
+MAX_MERGED_BEAT_CHARS = 375
+
+
+def format_prompt(direction: str, text: str) -> str:
+    """Compose the Dramabox-ready prompt string.
+
+    Empirically (via the Voicebank Studio TTS Lab) Dramabox reads the direction
+    aloud unless it's phrased a specific way: lowercased, with its commas turned
+    into ' - ', and wrapped in parentheses. The spoken `text` keeps its own
+    punctuation untouched. Used by both the Director (s3) and lecture mode so
+    the format stays single-sourced.
+    """
+    spoken_direction = re.sub(r"\s*,\s*", " - ", direction.lower()).strip()
+    return f'({spoken_direction}) "{text}"'
 
 
 # ---------------- voice profiles ----------------
@@ -435,7 +450,7 @@ def direct_scene(
             descriptor = profile_map.get(speaker, "voice unknown")
             cue = cues_by_line.get(line_no, "").strip()
             direction = f"{descriptor}, {cue}" if cue else descriptor
-        prompt = f'[{direction}]\n"{b.text}"'
+        prompt = format_prompt(direction, b.text)
         directed_beats.append(
             DirectedBeat(
                 type=b.type,

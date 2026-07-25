@@ -32,6 +32,7 @@ cache/
 
 # Voicebank — large audio files (10s+ of audio per clip)
 voicebank/
+voicebank-fr/
 
 # Downloaded datasets — multi-GB, never commit
 data/
@@ -42,3 +43,6 @@ data/
 *.swp
 .DS_Store
 .claude/
+
+models/
+scenarios/

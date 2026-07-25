@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 from typing import Callable, Type, TypeVar
@@ -118,6 +119,17 @@ class LLMClient:
         extra_body: dict = {"guided_json": schema.model_json_schema()}
         if self.settings.llm.repetition_penalty != 1.0:
             extra_body["repetition_penalty"] = self.settings.llm.repetition_penalty
+        # Llama-server + Gemma 4: the GGUF's chat template enables thinking by
+        # default (`thinking = 1` at server init, format `peg-gemma4`). For
+        # structured-JSON tasks the model burns the entire token budget in the
+        # <|channel>thought block and never reaches <|channel>final — `content`
+        # stays empty even on trivial prompts. Override per-request with the
+        # `enable_thinking` kwarg (confirmed via curl: thinking:false was
+        # ignored, enable_thinking:false yields clean JSON in 11 tokens with
+        # finish=stop). vLLM/mlx-lm templates with no equivalent variable
+        # silently ignore the field, so this is safe to send always.
+        if os.environ.get("LNVOX_LLM_BACKEND") == "llama":
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
         last_error: Exception | None = None
         last_raw = ""
         diag = ""
@@ -136,7 +148,15 @@ class LLMClient:
                 timeout=self._timeout_for(effective_max),
             )
             choice = response.choices[0]
-            last_raw = choice.message.content or ""
+            # Fall back to reasoning_content when content is empty. Some
+            # llama.cpp configurations (--jinja + chat templates that declare
+            # a reasoning channel) route the entire response there, leaving
+            # `content` empty and the original error message a useless
+            # "completion_tokens=N, raw_chars=0". Reading both fixes the
+            # mystery and recovers the data when it's the only thing populated.
+            content = choice.message.content or ""
+            reasoning = getattr(choice.message, "reasoning_content", None) or ""
+            last_raw = content if content else reasoning
             try:
                 return schema.model_validate_json(_extract_json(last_raw))
             except Exception as e:
@@ -152,7 +172,7 @@ class LLMClient:
                 diag = (
                     f"finish_reason={finish}, prompt_tokens={ptok}, "
                     f"completion_tokens={ctok}, max_tokens={effective_max}, "
-                    f"raw_chars={len(last_raw)}"
+                    f"content_chars={len(content)}, reasoning_chars={len(reasoning)}"
                 )
                 if finish == "length":
                     # Retrying won't help a hard length cut; fail fast.

@@ -1,0 +1,14 @@
+Below are the speaking roles of a theater script, each with its bio from the script (may be empty) and up to two sample lines. For each role, produce a casting entry.
+
+Fields per character:
+- "name": copy the given role name EXACTLY (it is the casting key — do not normalize it).
+- "gender": "male" | "female" | "nonbinary" | "unknown" — infer from the bio, the name, grammatical gender in the samples; "unknown" when genuinely unclear.
+- "approx_age": "child" | "teen" | "young_adult" | "adult" | "elder" | "unknown".
+- "description": 1-2 sentences usable to pick a voice (personality, energy, register). Write it in the script's language; base it on the bio and samples, do not invent biography.
+- "aliases": [] (leave empty).
+- "evidence": [] (leave empty).
+
+Roles:
+{{ speakers_json }}
+
+Output JSON only, matching the schema {"characters": [{"name": ..., "aliases": [], "gender": ..., "approx_age": ..., "description": ..., "evidence": []}]}.

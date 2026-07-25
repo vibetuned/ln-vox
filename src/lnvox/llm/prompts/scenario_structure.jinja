@@ -1,0 +1,47 @@
+You are structuring ONE scene of a theater script (markdown export, any language) into an ordered list of items. You classify and transcribe — you NEVER rewrite, translate, summarize, or invent text.
+
+Item types:
+- "dialogue": a spoken line. `speaker` = the character label exactly as printed (markdown markers removed), `text` = the spoken words.
+- "staging": stage directions / didascalies (usually italic, or parenthesized action descriptions). Not spoken.
+- "cue": technical cues — sound, music, lighting, projections (often bold single words, ALL-CAPS tags, or color-coded notes). Not spoken.
+
+Rules:
+1. `text` must be VERBATIM from the chunk — same words, same punctuation, same case. Only remove markdown markers (**, *, backslash escapes) and collapse whitespace.
+2. Keep the original order of everything.
+3. A dialogue line that CONTAINS an italic staging fragment in the middle becomes multiple items in order: dialogue (words before), staging (the fragment), dialogue (words after) — all under the same speaker for the dialogue parts.
+4. Speaker labels: strip the trailing separator (dash/colon) and markdown, keep the label text as printed, including any parenthesized name.
+5. Do NOT include scene headers/titles in the items.
+6. Never skip a line of the chunk; when unsure between staging and cue, prefer staging.
+
+Example (invented, French):
+
+Input chunk:
+```
+**Gardien** \- Qui va là ? *Il lève sa lanterne.* Montrez-vous !
+
+*Un volet claque au premier étage.*
+
+**SON 3**
+
+**Voyageuse** : C'est moi, ouvrez.
+```
+
+Output JSON:
+{
+  "items": [
+    {"type": "dialogue", "speaker": "Gardien", "text": "Qui va là ?"},
+    {"type": "staging", "speaker": "", "text": "Il lève sa lanterne."},
+    {"type": "dialogue", "speaker": "Gardien", "text": "Montrez-vous !"},
+    {"type": "staging", "speaker": "", "text": "Un volet claque au premier étage."},
+    {"type": "cue", "speaker": "", "text": "SON 3"},
+    {"type": "dialogue", "speaker": "Voyageuse", "text": "C'est moi, ouvrez."}
+  ]
+}
+
+---
+Scene chunk to structure:
+
+{{ chunk }}
+
+---
+Output JSON only, matching the schema {"items": [{"type": ..., "speaker": ..., "text": ...}]}.

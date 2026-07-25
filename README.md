@@ -1,4 +1,14 @@
-# ln-vox
+# Lectures and Narrations
+
+Lectures and Narrations (LN) This project was born out of a small AI experiment in book understanding and knowledge presentation. By using language models to analyze narrative structures, identify character traits, and map scene dynamics, it quickly became clear that this deep-text comprehension could be repurposed. The experiment naturally evolved into a complete, end-to-end pipeline for creating highly immersive, multi-voice audiobooks.
+
+Today, the Lectures and Narrations ecosystem consists of two halves:
+
+> ln-vox (The Creator): An offline, self-hosted AI pipeline that ingests raw text or EPUBs. It orchestrates LLMs to cast characters and direct emotional delivery, then uses local TTS to generate a fully acted, multi-voice .m4b audiobook complete with text-to-audio sync markers.
+
+> ln-reader (The Consumer): A custom Android application built specifically to play these enhanced audiobooks. It features chapter-relative scrubbing, sleep timers, and an EPUB companion reader that automatically highlights the text in sync with the audio.
+
+## ln-vox in a nutshell
 
 A self-hosted pipeline that turns a text novel into a multi-voice audiobook
 (`.m4b`) with character-appropriate voices, emotionally-acted delivery, and
@@ -26,6 +36,11 @@ the VRAM):
 - **Dramabox phase** — local TTS serves s4.
 
 Stage 5 runs on CPU/ffmpeg only.
+
+> **Non-fiction?** For technical / reference books there's a single-voice
+> **lecture mode** that reads the text as written (no dramatization) and shows
+> code/tables/figures as images instead of narrating them. Jump to
+> [Lecture mode](#lecture-mode-non-fiction--technical-books).
 
 ---
 
@@ -145,6 +160,10 @@ The launcher manages vLLM and Dramabox transparently:
 2. Runs ingest → s1 → s2 → voice cast → s3 against the local vLLM.
 3. **Stops vLLM** to free the GPU.
 4. Runs s4 (Dramabox, with auto-retry) → s5 (mix to .m4b).
+5. Runs s6 (sync layer) when the source EPUB is present — produces the synced
+   EPUB + `sync_manifest.json`. Skipped automatically for a `.txt`-only book;
+   pass `--skip-sync` to opt out, or `--epub <path>` to point at a non-default
+   EPUB location.
 
 If you already have a vLLM serving (e.g. on a separate GPU), pass
 `--vllm-url http://host:8000/v1` to skip auto-start..gitignore
@@ -191,14 +210,96 @@ outputs.
 
 ---
 
-## Stage 6 — sync layer (optional, post-stage-5)
+## Lecture mode (non-fiction / technical books)
 
-For players that highlight the current beat in sync with audio playback
-(WebKit-based reader apps, Plex audiobooks, Audiobookshelf, a custom front-end)
-the pipeline can re-align the Stage-3 beats back onto the original EPUB's
+Narration mode (above) is built for novels: multi-voice, character casting,
+emotionally-acted delivery. **Lecture mode** is the opposite — a single steady
+narrator reading the text *as written*, for non-fiction and technical books.
+No characters, no scene segmentation, no dramatization. See
+[DESIGN.md §13](DESIGN.md) for the full design.
+
+What it does differently:
+
+- **Collapses s1 + s2 + s3 into one `lnvox lecture` stage.** No character or
+  scene LLM passes. The text is split into TTS-sized narration beats; each
+  beat's `source_span` stays verbatim (so Stage-6 sync is near-perfect).
+- **Speech-normalizes** each beat for the ear (`1973` → "nineteen
+  seventy-three", `Fig. 3` → "Figure three", `42%` → "forty-two percent")
+  without rewriting or dramatizing. `--no-normalize` reads the text byte-literal
+  and skips the LLM entirely.
+- **Never narrates code / tables / figures.** During EPUB import they're
+  classified out of the prose, **rendered to PNG** (code is syntax-highlighted),
+  and surfaced by Stage 6 as *visual elements* the reader displays at the right
+  timestamp — exactly like illustrations. Boilerplate (TOC, copyright, index)
+  is dropped.
+
+### Launch the whole pipeline in lecture mode
+
+One command, same launcher as narration — just add `--mode lecture`:
+
+```bash
+# 1. Import the EPUB in lecture mode (classify blocks, drop boilerplate,
+#    render code/tables to images). Needs the `render` extra (see below).
+uv run lnvox ingest-epub epubs/nonfiction/book.epub novels/nonfiction/book --mode lecture
+
+# 2. Run the full pipeline: ingest → voice cast → lecture → s4 → s5 → s6.
+#    s1/s2/s3 are skipped automatically. Pick a narrator clip by ear (lecture
+#    mode is 100% narrator, so this matters most here).
+./scripts/run_pipeline.sh nonfiction/book \
+    --mode lecture \
+    --narrator-clip cv_051e865815e5 \
+    --book-title "Book Title — Subtitle"
+```
+
+Flags specific to lecture mode:
+
+- `--mode lecture` — required; routes ingest → voice cast → `lnvox lecture`,
+  skipping s1/s2/s3.
+- `--no-normalize` — read the text verbatim (no speech-normalize LLM pass).
+  Combined with `--narrator-clip`, the launcher makes **zero** LLM calls and
+  **skips vLLM entirely** — the run is ingest → cast → split → TTS → mix.
+
+### The `render` extra (code/table images)
+
+Rendering code and tables to PNG uses Pygments + headless Chromium, kept out of
+the core install:
+
+```bash
+uv sync --extra render
+uv run playwright install chromium   # one-time browser download (~115 MB)
+```
+
+Without it, lecture ingest still works — code/table blocks are recorded as
+HTML-only visual elements (no PNG), and the pipeline never fails on a missing
+renderer. Pass `--no-render` to `ingest-epub` to skip rasterization explicitly.
+
+### Lecture-mode stages (advanced / re-runs)
+
+| Stage | Command | Notes |
+|---|---|---|
+| 0a | `lnvox ingest-epub <epub> <out> --mode lecture [--no-render] [--ingest-classifier none]` | Classifies blocks, drops boilerplate, renders code/tables → `images/`, records `visual_elements` in `.epub_meta.json`. |
+| 0 | `lnvox ingest novels/<book> --book-id <book> --mode lecture` | Writes `00_text.jsonl` + a Narrator-only `01_characters.json` stub (no s1). |
+| V | `lnvox voice cast <book> --narrator-clip cv_…` | Casts only the Narrator. |
+| L | `lnvox lecture <book> [--no-normalize]` | Split + speech-normalize → `03_directed/*.json`. **Replaces s1/s2/s3.** |
+| 4–6 | (unchanged) | `s4_retry.sh`, `lnvox s5`, `lnvox s6` run exactly as in narration mode. |
+
+`--ingest-classifier` controls the block classifier: `fallback` (default — the
+LLM is consulted *only* for untagged/ambiguous blocks) or `none` (rules-only,
+no LLM in ingest at all).
+
+---
+
+## Stage 6 — sync layer
+
+The launcher runs this automatically as its final step whenever the source
+EPUB is present (skip it with `--skip-sync`, or run it standalone with
+`lnvox s6 <book>`). For players that highlight the current beat in sync with
+audio playback (WebKit-based reader apps, Plex audiobooks, Audiobookshelf, a
+custom front-end) it re-aligns the Stage-3 beats back onto the original EPUB's
 XHTML. The output is a copy of the EPUB with `<span id="<beat_id>">` wrappers
 around each beat's text plus a sidecar JSON mapping `beat_id → span_id →
-audio timing`.
+audio timing`. In lecture mode the same `sync_manifest.json` also carries the
+`visual_elements` (rendered code/tables/figures) with their `trigger_seconds`.
 
 ### Algorithm
 
@@ -257,7 +358,7 @@ The matcher runs in **two passes per chapter** (all of a chapter's
      top-level `match_confidence` histogram. Audio timings are cumulative
      through the Stage-5 silence layout (the silence flags must match Stage 5).
    - `images[]` in the same manifest — one entry per embedded illustration,
-     including light-novel insert/color/bonus pages that live as their own
+     including novel insert/color/bonus pages that live as their own
      spine items: `{src, xhtml, spine_page, after_chapter, before_chapter,
        after_beat_id, before_beat_id, trigger_seconds}`. The player flips to
      `src` when playback reaches `trigger_seconds` (= the start of
@@ -365,9 +466,10 @@ beat.
 
 ### Beat length
 
-Empirically Dramabox sounds best on 20–60 s beats (~250–700 chars). The
-Director's merge pass caps at ~500 chars. If a source narration paragraph
-is itself longer than that, it's auto-split at sentence boundaries before
+Empirically Dramabox sounds best on shorter beats — longer text raises its
+noise floor and can slur into unintelligible speech. The Director's merge pass
+caps at 375 chars (~30 s; `MAX_MERGED_BEAT_CHARS` in `s3_director.py`); a source
+narration paragraph longer than that is auto-split at sentence boundaries before
 TTS.
 
 ### Disk
@@ -404,6 +506,43 @@ on cloned-from-living-people references without explicit consent.
 | Narrator voice doesn't match descriptor | Stage order pre-dates the v2 fix | Re-run s3 with `--regen-profiles` AFTER voice cast |
 | Empty `accent` distribution in voicebank | TSV had pipe-separated accents | Fix `_normalize_accent` (already in `voices/common_voice.py`); re-seed |
 | Dramabox renders sound rushed | Long beats (>60 s) | Lower `MAX_MERGED_BEAT_CHARS` in `s3_director.py`, re-run s3 |
+| `No module named 'av'` / `requires accelerate` / `mamba-ssm` build fails when loading Dramabox | Dramabox env mixed with `--extra serve` (torch 2.8 vs 2.11 conflict), or `uv sync` pruned Dramabox's deps | Use a TTS-only env: `uv sync --extra voice --extra tts && ./scripts/setup_dramabox.sh` (see [Voicebank Studio & TTS Lab](#voicebank-studio--tts-lab)) |
+
+---
+
+## Voicebank Studio & TTS Lab
+
+`scripts/voicebank_studio.py` is a standalone PySide6 GUI for curating the
+voicebank by ear (listen, import from Common Voice, add/erase clips, cast
+characters) and, in its **TTS Lab** tab, auditioning Dramabox prompts — handy
+for finding how to phrase a direction so Dramabox *performs* it instead of
+reading it aloud. See [DESIGN.md §12](DESIGN.md).
+
+The first three tabs need only the `voice` extra:
+
+```bash
+uv pip install PySide6                       # GUI toolkit (dev-only, not a project dep)
+uv run python scripts/voicebank_studio.py
+```
+
+### TTS Lab — set up the Dramabox env
+
+The **TTS Lab** tab loads the Dramabox model (only when you click its
+**"⚙ Load model"** button — never on startup or when using the other tabs), so
+it needs Dramabox's runtime installed. Set it up in the **TTS environment**:
+
+```bash
+uv sync --extra voice --extra tts            # NOT --extra serve
+./scripts/setup_dramabox.sh                  # installs Dramabox + its deps
+```
+
+**Don't combine it with `--extra serve`.** vLLM (the `serve` extra) needs
+`torch>=2.11`, Dramabox pins `torch==2.8`, and they can't share a venv — which
+is exactly why the pipeline runs the LLM and TTS phases as separate stages with
+separate environments (`run_pipeline.sh` swaps between them). Mixing them is
+what causes `No module named 'av'` and the `mamba-ssm` build failures. Use the
+TTS env above for the Studio; run `uv sync --extra serve …` again when you go
+back to the LLM stages.
 
 ---
 
@@ -442,3 +581,4 @@ data/<cv-corpus-…>/                      Raw Common Voice extraction
 
 
 
+ ./scripts/run_pipeline.sh ascendance/volume-06 --skip-llm --book-title 'Ascendance of a Bookworm - Part 2 Apprentice Shrine Maiden v03'
