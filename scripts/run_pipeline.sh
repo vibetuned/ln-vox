@@ -20,13 +20,14 @@
 #     --vllm-url <url>         Use an already-running LLM server at this URL
 #                              (skip auto start/stop). Flag name is historical;
 #                              applies to whichever backend you've selected.
-#     --llm-backend <name>     Which LLM server to launch: vllm | mlx | llama.
-#                              Default: mlx on Darwin, vllm elsewhere. See
-#                              DESIGN.md §14 for the llama-server (GGUF) path.
-#                              Honors $LNVOX_LLM_BACKEND.
+#     --llm-backend <name>     Which LLM server to launch: llama | vllm | mlx.
+#                              Default: llama (llama.cpp, every platform).
+#                              See DESIGN.md §14. Honors $LNVOX_LLM_BACKEND.
 #     --llm-model <id>         Model id for the selected backend (HF repo,
 #                              GGUF repo, or local path depending on backend).
-#                              Default: google/gemma-4-E4B-it for vllm.
+#                              Defaults: google/gemma-4-12B-it-qat-q4_0-gguf
+#                              (llama), google/gemma-4-E4B-it (vllm),
+#                              mlx-community/gemma-4-E4B-it-4bit (mlx).
 #     --max-model-len <N>      Override vLLM context window (default: model-dependent).
 #     --skip-llm               Skip s1..s3 + voice cast (assume already done).
 #     --skip-tts               Skip s4 (assume already rendered).
@@ -50,9 +51,9 @@
 # Pass --vllm-url to skip this if you already have a server running.
 #
 # Backends (DESIGN.md §4 / §11 / §14):
-#   - vllm  : scripts/serve_vllm.sh   (Linux + CUDA, default on Linux)
-#   - mlx   : scripts/serve_mlx.sh    (Apple Silicon, default on Darwin)
-#   - llama : scripts/serve_llama.sh  (native llama-server, GGUF, either OS)
+#   - llama : scripts/serve_llama.sh  (native llama-server, GGUF, either OS — DEFAULT)
+#   - vllm  : scripts/serve_vllm.sh   (Linux + CUDA)
+#   - mlx   : scripts/serve_mlx.sh    (Apple Silicon)
 # Pick one with --llm-backend or $LNVOX_LLM_BACKEND. The TTS phase uses
 # Dramabox by default; pick VibeVoice sessions with --tts-backend vibevoice
 # (DESIGN.md §16). --device mps is auto-selected on Darwin.
@@ -128,13 +129,11 @@ if [ -z "$BOOK_ID" ]; then
 fi
 
 # Resolve LLM backend: explicit --llm-backend / $LNVOX_LLM_BACKEND wins;
-# otherwise default to mlx on Darwin and vllm everywhere else. See §14.
+# otherwise llama (llama.cpp) — promoted to default on every platform
+# 2026-07-25 after the scenario-mode validation (DESIGN.md §14/§17). vllm
+# and mlx remain first-class via --llm-backend.
 if [ -z "$LLM_BACKEND" ]; then
-    if [ "$OS" = "Darwin" ]; then
-        LLM_BACKEND="mlx"
-    else
-        LLM_BACKEND="vllm"
-    fi
+    LLM_BACKEND="llama"
 fi
 case "$LLM_BACKEND" in
     vllm|mlx|llama) ;;
@@ -195,6 +194,17 @@ fi
 LNVOX_VLLM_BASE="${LNVOX_LLM__ENDPOINT:-http://localhost:8000/v1}"
 
 # Propagate model + max-model-len to whichever serve script we picked.
+# Per-backend model default when --llm-model is omitted. Always exported:
+# the serve script loads it AND the python client sends it as the request's
+# model name (vLLM validates that name strictly; llama/mlx serve whatever
+# is loaded).
+if [ -z "$LLM_MODEL" ]; then
+    case "$LLM_BACKEND" in
+        llama) LLM_MODEL="google/gemma-4-12B-it-qat-q4_0-gguf" ;;
+        vllm)  LLM_MODEL="google/gemma-4-E4B-it" ;;
+        mlx)   LLM_MODEL="mlx-community/gemma-4-E4B-it-4bit" ;;
+    esac
+fi
 if [ -n "$LLM_MODEL" ]; then
     export LNVOX_LLM_MODEL="$LLM_MODEL"
     echo "Using LLM model: $LLM_MODEL"

@@ -128,7 +128,11 @@ class LLMClient:
         # ignored, enable_thinking:false yields clean JSON in 11 tokens with
         # finish=stop). vLLM/mlx-lm templates with no equivalent variable
         # silently ignore the field, so this is safe to send always.
-        if os.environ.get("LNVOX_LLM_BACKEND") == "llama":
+        # llama is the pipeline-wide default backend (2026-07-25), so an
+        # UNSET env var must behave like llama — a standalone stage run
+        # against llama-server without the launcher would otherwise burn its
+        # whole budget in the thinking channel.
+        if os.environ.get("LNVOX_LLM_BACKEND", "llama") == "llama":
             extra_body["chat_template_kwargs"] = {"enable_thinking": False}
         last_error: Exception | None = None
         last_raw = ""

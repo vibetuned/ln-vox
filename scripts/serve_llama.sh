@@ -57,7 +57,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-MODEL="${LNVOX_LLM_MODEL:-google/gemma-4-E4B-it-qat-q4_0-gguf}"
+# Default promoted to the 12B QAT after the scenario-mode validation
+# (2026-07-25) — the pipeline-wide default backend is llama now.
+MODEL="${LNVOX_LLM_MODEL:-google/gemma-4-12B-it-qat-q4_0-gguf}"
 PORT="${LNVOX_LLM_PORT:-8000}"
 HOST="${LNVOX_LLM_HOST:-127.0.0.1}"
 N_GPU_LAYERS="${LNVOX_LLM_N_GPU_LAYERS:-999}"

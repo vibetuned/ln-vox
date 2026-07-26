@@ -32,7 +32,9 @@ ingest → s1 cast → s2 scenes → voice cast → s3 director → s4 tts → s
 
 Two GPU phases that **cannot run simultaneously** (they each want most of
 the VRAM):
-- **vLLM phase** — Gemma 4 serves s1, s2, voice cast, s3.
+- **LLM phase** — Gemma 4 serves s1, s2, voice cast, s3. Default backend is
+  **llama.cpp** (`google/gemma-4-12B-it-qat-q4_0-gguf`, 64k context);
+  vLLM and mlx are one `--llm-backend` flag away.
 - **Dramabox phase** — local TTS serves s4.
 
 Stage 5 runs on CPU/ffmpeg only.
@@ -54,28 +56,38 @@ Stage 5 runs on CPU/ffmpeg only.
 
 ```bash
 # 1. Python deps
-uv sync --extra serve --extra voice --extra tts
+uv sync --extra voice --extra tts
 
-# 2. Clone & install Dramabox
+# 2. Install llama.cpp (the default LLM backend — a native binary)
+#    macOS:  brew install llama.cpp
+#    Linux:  build from https://github.com/ggerganov/llama.cpp (CUDA build)
+#    The default model (google/gemma-4-12B-it-qat-q4_0-gguf, ~8 GB) is
+#    auto-downloaded by llama-server on first run.
+
+# 3. Clone & install Dramabox
 ./scripts/setup_dramabox.sh
 
-# 3. Download Mozilla Common Voice (the EN tarball, ~96 GB)
+# 4. Download Mozilla Common Voice (the EN tarball, ~96 GB)
 #    https://commonvoicedata.mozilla.org/ → download → extract to ./data/
 
-# 4. Seed the voicebank (~30 min for 400 speakers, CPU/ffmpeg work)
+# 5. Seed the voicebank (~30 min for 400 speakers, CPU/ffmpeg work)
 uv run lnvox voice seed-cv \
     data/<cv-corpus-NN.N-YYYY-MM-DD>/en/ \
     --max-speakers 400
 
-# 5. Browse the seeded voicebank
+# 6. Browse the seeded voicebank
 uv run lnvox voice list
 ```
 
 Notes:
 - Python is pinned to 3.13 via `.python-version`. uv will install it if you
   don't already have it.
-- `serve` pulls `vllm>=0.19` + `torch` from PyTorch's cu130 wheel index.
-  Replace with the appropriate cu* version for your driver if needed.
+- **LLM backend default is llama.cpp** with
+  `google/gemma-4-12B-it-qat-q4_0-gguf` at a 65,536-token context — validated
+  across narration, lecture and scenario runs. `--llm-backend vllm` (Linux,
+  needs `uv sync --extra serve`, pulls `vllm>=0.19` + cu130 torch) and
+  `--llm-backend mlx` (Apple Silicon, `--extra mlx`) remain available; pick a
+  model with `--llm-model`.
 - Dramabox auto-downloads ~15 GB of weights from HuggingFace on first run.
 - The voicebank seed only needs to be done once per language. Re-running it
   with a higher `--max-speakers` adds more speakers to the existing bank.

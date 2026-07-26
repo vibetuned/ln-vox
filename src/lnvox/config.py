@@ -7,7 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class LLMConfig(BaseModel):
     endpoint: str = "http://localhost:8000/v1"
-    model: str = "google/gemma-4-E4B-it"
+    # Matches the default backend (llama.cpp, serve_llama.sh). llama-server
+    # and mlx ignore the request's model name; vLLM validates it strictly —
+    # the launcher exports the right LNVOX_LLM_MODEL per backend.
+    model: str = "google/gemma-4-12B-it-qat-q4_0-gguf"
     api_key: str = "EMPTY"
     temperature: float = 0.2
     max_tokens: int = 8192

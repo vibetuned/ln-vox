@@ -1312,6 +1312,17 @@ designated fallback when mlx-lm doesn't have an MLX-quantized build of the
 model you want — or when you want to A/B test specific quantization
 recipes against the same prompts.
 
+> **Update 2026-07-25 — llama is now the DEFAULT backend, every platform.**
+> After the scenario-mode validation (§17: five plays, FR + EN, zero
+> structural failures), the launcher, serve script, and `LLMConfig` all
+> default to llama.cpp with `google/gemma-4-12B-it-qat-q4_0-gguf` at a
+> 65,536-token context. The launcher exports `LNVOX_LLM_BACKEND` and a
+> per-backend `LNVOX_LLM_MODEL` so the client's model name and the
+> thinking-channel override (§14.4) always match the server; an unset
+> `LNVOX_LLM_BACKEND` now behaves as llama in `LLMClient` too. vLLM and
+> mlx stay first-class via `--llm-backend` — §14.6's "manual recovery"
+> framing below predates this flip.
+
 ### 14.1 Topology
 
 The LLM-phase serve script is selected at launch time:
