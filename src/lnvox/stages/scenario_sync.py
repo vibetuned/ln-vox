@@ -30,6 +30,19 @@ from lnvox.llm.schemas import ChapterDirected, ScenarioScript, ScriptScene
 from lnvox.tts.schema import ChapterAudio
 
 
+# Pad between script scenes (s5's --inter-chapter in scenario mode). The book
+# default (2.0 s) reads right between novel chapters but drags between play
+# scenes — user-tested 2026-07-24, 0.75 s keeps sketch pacing (§17.4). The
+# launcher passes the matching value to s5 so m4b and sync stay in agreement.
+SCENARIO_INTER_SCENE = 0.75
+
+# Extra silence prepended to EVERY beat in a scenario mix (s5 --lead-in). The
+# 2reply reader app polls playback position every ~0.300 s on older devices;
+# a dialogue entry's `start` points at the *beginning of the lead-in*, so the
+# highlight always lands during silence, never after speech began (§17.4).
+SCENARIO_LEAD_IN = 0.35
+
+
 class SyncEntry(BaseModel):
     start: float
     end: float
@@ -54,7 +67,8 @@ class PlaySync(BaseModel):
     total_duration_seconds: float = 0.0
     intra_silence: float = 0.25
     staging_pause: float = 1.0
-    inter_scene_silence: float = 2.0  # between script scenes (s5 inter-chapter)
+    inter_scene_silence: float = SCENARIO_INTER_SCENE  # between scenes (s5 inter-chapter)
+    lead_in_silence: float = 0.0  # per-beat lead-in (s5 --lead-in)
     scenes: list[SceneSync] = Field(default_factory=list)
 
 
@@ -65,12 +79,15 @@ def _beat_times(
     offset: float,
     intra: float,
     staging_pause: float,
+    lead_in: float = 0.0,
 ) -> tuple[dict[int, tuple[float, float]], float]:
     """Replay s5's concat plan → {dialogue line index: (start, end)}, chapter end.
 
     Manifest beats are in playback order and correspond 1:1 with the directed
     beats (per-beat rendering). A line split into chunks spans from its first
-    chunk's start to its last chunk's end.
+    chunk's start to its last chunk's end. `lead_in` silence precedes every
+    beat in the mix; a line's `start` is the start of its FIRST chunk's
+    lead-in — the app's poll margin (§17.4) — while `end` is where speech ends.
     """
     flat = [
         (ds.scene_id, b.source_paragraph)
@@ -90,8 +107,8 @@ def _beat_times(
     for (group_id, line_idx), rendered in zip(flat, manifest.beats):
         if prev_group is not None:
             cursor += intra if group_id == prev_group else staging_pause
-        start = cursor
-        cursor += rendered.duration_seconds
+        start = cursor  # start of the lead-in, not of speech
+        cursor += lead_in + rendered.duration_seconds
         s0, _ = line_times.get(line_idx, (start, start))
         line_times[line_idx] = (min(s0, start), cursor)
         prev_group = group_id
@@ -106,10 +123,16 @@ def build_scene_sync(
     offset: float = 0.0,
     intra: float = 0.25,
     staging_pause: float = 1.0,
+    lead_in: float = 0.0,
 ) -> SceneSync:
     """Timed entries for one script scene, at absolute offset `offset`."""
     line_times, scene_end = _beat_times(
-        chapter, manifest, offset=offset, intra=intra, staging_pause=staging_pause
+        chapter,
+        manifest,
+        offset=offset,
+        intra=intra,
+        staging_pause=staging_pause,
+        lead_in=lead_in,
     )
     # direction/emotion per line, from the first directed chunk of that line.
     line_meta: dict[int, tuple[str, str]] = {}
@@ -182,7 +205,8 @@ def build_play_sync(
     *,
     intra: float = 0.25,
     staging_pause: float = 1.0,
-    inter_scene: float = 2.0,
+    inter_scene: float = SCENARIO_INTER_SCENE,
+    lead_in: float = 0.0,
 ) -> PlaySync:
     """Absolute-time sync for the whole play (scenes in script order)."""
     scenes: list[SceneSync] = []
@@ -202,6 +226,7 @@ def build_play_sync(
             offset=cursor,
             intra=intra,
             staging_pause=staging_pause,
+            lead_in=lead_in,
         )
         scenes.append(scene_sync)
         cursor = scene_sync.end + inter_scene
@@ -213,6 +238,7 @@ def build_play_sync(
         intra_silence=intra,
         staging_pause=staging_pause,
         inter_scene_silence=inter_scene,
+        lead_in_silence=lead_in,
         scenes=scenes,
     )
 
@@ -249,7 +275,8 @@ def run(
     *,
     intra: float = 0.25,
     staging_pause: float = 1.0,
-    inter_scene: float = 2.0,
+    inter_scene: float = SCENARIO_INTER_SCENE,
+    lead_in: float = SCENARIO_LEAD_IN,
     progress: Callable[[str], None] = print,
 ) -> PlaySync:
     """Read artifacts, emit 07_sync/<scene>.json + play.json + play.srt."""
@@ -277,6 +304,7 @@ def run(
         intra=intra,
         staging_pause=staging_pause,
         inter_scene=inter_scene,
+        lead_in=lead_in,
     )
 
     sync_dir = book_dir / "07_sync"

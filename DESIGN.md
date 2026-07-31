@@ -1960,12 +1960,25 @@ probing. Example (invented content):
 }
 ```
 
-- **dialogue**: timed span of the line's rendered audio.
+- **dialogue**: timed span of the line's rendered audio, *including its
+  lead-in* (below): `start` marks the beginning of the lead-in silence,
+  speech begins `lead_in` later, `end` is where speech ends.
 - **staging** (didascalies): a configurable pause on the timeline
   (default = s5's inter-scene pad, 1.0 s; the action takes stage time)
   and an entry in the sync file; never spoken.
 - **cue** (sound/light/other): zero-duration marker at its position —
   the régie timeline for free.
+- **Between script scenes**: 0.75 s (`SCENARIO_INTER_SCENE`), not the
+  2 s book default — user-tested 2026-07-24: 2 s reads right between
+  novel chapters but drags between play scenes. The launcher passes the
+  matching `--inter-chapter 0.75` to s5 in scenario mode; books keep 2 s.
+- **Per-line lead-in**: 0.35 s (`SCENARIO_LEAD_IN`, s5 `--lead-in`)
+  prepended to every beat in the scenario mix. The 2reply reader app
+  polls playback position only every ~0.300 s on older devices; since a
+  dialogue entry's `start` points at the lead-in (not at speech), the
+  poll always fires while the line is still silent — the highlight can
+  never arrive after the words. Especially needed post-trim (§2.6):
+  trimmed beats start speaking immediately. Books keep 0.
 - The m4b and the sync file are computed from the same plan and pad
   values, so they agree by construction (same stance as s6, §2.7).
 

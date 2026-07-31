@@ -106,6 +106,100 @@ SYSTEM = (
 )
 
 
+def _norm_name(s: str) -> str:
+    return " ".join(s.lower().strip().split())
+
+
+class PriorCastIndex:
+    """Cross-volume casting memory: identity keys → most recent prior casting.
+
+    s1's canonical names drift between volumes ("Kamijou Touma" / "Kamijou" /
+    "Touma Kamijou"), and series casts rotate so characters routinely skip a
+    volume. Exact-name matching against only the latest volume loses the voice
+    on either event. This index folds EVERY prior volume in (call `add_volume`
+    oldest → newest; newer entries win per key) and keys each casting by every
+    name and alias the character was known by, plus token-sorted variants so a
+    flipped name order still matches.
+    """
+
+    def __init__(self) -> None:
+        # key → (casting, key_is_the_entry's_canonical_name)
+        self._by_key: dict[str, tuple[CharacterCasting, bool]] = {}
+
+    @staticmethod
+    def _keys(name: str, aliases: Iterable[str] = ()) -> list[tuple[str, bool]]:
+        """(key, from_canonical_name) pairs in priority order: the canonical
+        name (and its token-sorted form, so "mikoto misaka" == "misaka mikoto")
+        first, then each alias."""
+        keys: list[tuple[str, bool]] = []
+        seen: set[str] = set()
+        for i, nm in enumerate((name, *aliases)):
+            base = _norm_name(nm)
+            if not base:
+                continue
+            for k in (base, " ".join(sorted(base.split()))):
+                if k not in seen:
+                    seen.add(k)
+                    keys.append((k, i == 0))
+        return keys
+
+    def add_volume(
+        self, casting: BookCasting, cast: Iterable[Character] = ()
+    ) -> None:
+        """Fold one prior volume's assignments in.
+
+        `cast` is that volume's character list — the only source of aliases
+        (casting entries store just the canonical name). A key claimed by two
+        different characters in the same volume identifies neither, so it's
+        dropped for that volume rather than resolved arbitrarily.
+        """
+        aliases_by_name: dict[str, list[str]] = {c.name: c.aliases for c in cast}
+        claimed: dict[str, str] = {}
+        volume_keys: dict[str, tuple[CharacterCasting, bool]] = {}
+        ambiguous: set[str] = set()
+        for entry in casting.castings:
+            if not entry.assigned_clip_id:
+                continue  # unresolved casting: nothing worth inheriting
+            keys = self._keys(
+                entry.character_name, aliases_by_name.get(entry.character_name, [])
+            )
+            for k, canonical in keys:
+                owner = claimed.get(k)
+                if owner is not None and owner != entry.character_name:
+                    ambiguous.add(k)
+                    continue
+                claimed[k] = entry.character_name
+                volume_keys[k] = (entry, canonical)
+        for k in ambiguous:
+            volume_keys.pop(k, None)
+        self._by_key.update(volume_keys)
+
+    def __len__(self) -> int:
+        return len(self._by_key)
+
+    def lookup(
+        self, name: str, aliases: Iterable[str] = (), gender: str = ""
+    ) -> CharacterCasting | None:
+        """Most recent prior casting for this identity, or None.
+
+        A match is trusted as-is only when the key is the canonical name on
+        BOTH sides. Any alias-mediated match requires explicit gender
+        agreement instead: s1 sometimes attaches a companion's name as an
+        alias, and a cross-gender "match" through such an alias is exactly how
+        one character steals another's voice.
+        """
+        for k, cur_canonical in self._keys(name, aliases):
+            hit = self._by_key.get(k)
+            if hit is None:
+                continue
+            entry, prior_canonical = hit
+            if cur_canonical and prior_canonical:
+                return entry
+            if gender in ("male", "female") and entry.target.gender == gender:
+                return entry
+        return None
+
+
 def infer_target(
     client: LLMClient,
     character: Character,
@@ -204,24 +298,20 @@ def cast_book(
     profiles: VoiceProfileList | None = None,
     top_n: int = 3,
     max_candidates_per_char: int = 60,
-    prior_casting: BookCasting | None = None,
+    prior_index: PriorCastIndex | None = None,
     narrator_clip_override: str | None = None,
     on_character_done=None,
 ) -> BookCasting:
     """Cast each character to a voicebank clip.
 
     Args:
-        prior_casting: If supplied (typically from a previous volume in the
-            same series), characters whose canonical name matches a prior
+        prior_index: If supplied (built from ALL prior volumes in the same
+            series), characters whose name or aliases match a prior
             assignment keep that prior clip without an LLM call. Narrator
             also inherits unless `narrator_clip_override` is set.
         narrator_clip_override: Explicit clip id for the Narrator. Overrides
             both the LLM auto-cast AND any prior-volume Narrator assignment.
     """
-    # Build a lookup of prior assignments by character name.
-    prior_by_name: dict[str, CharacterCasting] = {}
-    if prior_casting:
-        prior_by_name = {c.character_name: c for c in prior_casting.castings}
 
     profiles_by_name: dict = {}
     if profiles is not None:
@@ -242,12 +332,12 @@ def cast_book(
         n_gender = DEFAULT_NARRATOR_GENDER
         n_age = DEFAULT_NARRATOR_AGE
         n_desc = "Neutral audiobook narrator for a modern action/fantasy young-adult novel."
+        prior_n = prior_index.lookup("Narrator") if prior_index else None
         if narrator_clip_override and narrator_clip_override in clip_by_id:
             override_clip = clip_by_id[narrator_clip_override]
             n_gender = override_clip.gender
             n_age = override_clip.age_band
-        elif "Narrator" in prior_by_name:
-            prior_n = prior_by_name["Narrator"]
+        elif prior_n is not None:
             n_gender = prior_n.target.gender or n_gender
             n_age = prior_n.target.age_band or n_age
         elif "Narrator" in profiles_by_name:
@@ -297,8 +387,23 @@ def cast_book(
             continue
 
         # --- Reuse prior-volume assignment if available ---------------------
-        prior = prior_by_name.get(character.name)
-        if prior and prior.assigned_clip_id and prior.assigned_clip_id in clip_by_id:
+        prior = (
+            prior_index.lookup(character.name, character.aliases, character.gender)
+            if prior_index
+            else None
+        )
+        if prior and prior.assigned_clip_id in clip_by_id:
+            clip = clip_by_id[prior.assigned_clip_id]
+            # A clip whose gender contradicts BOTH the current character and
+            # the prior target is an internally-inconsistent assignment (e.g.
+            # a hand-edit pointed at the wrong clip) — recast rather than
+            # propagate it through the whole series.
+            known = {character.gender, prior.target.gender} & {"male", "female"}
+            if known and clip.gender not in known:
+                prior = None
+        else:
+            prior = None
+        if prior:
             clip = clip_by_id[prior.assigned_clip_id]
             # Prefer the prior's voice_descriptor if it was set there,
             # otherwise (legacy assignments) derive one from the clip.

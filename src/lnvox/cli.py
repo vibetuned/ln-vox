@@ -15,7 +15,7 @@ from lnvox.llm.schemas import (
     ScenarioScript,
     VoiceProfileList,
 )
-from lnvox.series import find_prior_volumes, latest_prior_volume
+from lnvox.series import find_prior_volumes
 from lnvox.stages import (
     s1_characters,
     s2_scenes,
@@ -24,6 +24,7 @@ from lnvox.stages import (
     s4_vibevoice,
     s5_mix,
     s6_sync,
+    scenario_sync,
 )
 from lnvox.voices import manifest as voice_manifest
 from lnvox.voices import matcher as voice_matcher
@@ -613,8 +614,19 @@ def stage_scenario_sync(
         help="Pause where staging happens — MUST match `lnvox s5 --inter-scene`.",
     ),
     inter_scene: float = typer.Option(
-        2.0,
-        help="Pad between script scenes — MUST match `lnvox s5 --inter-chapter`.",
+        scenario_sync.SCENARIO_INTER_SCENE,
+        help=(
+            "Pad between script scenes — MUST match `lnvox s5 --inter-chapter`. "
+            "Play default 0.75 s: the 2 s book pad drags between scenes (§17.4)."
+        ),
+    ),
+    lead_in: float = typer.Option(
+        scenario_sync.SCENARIO_LEAD_IN,
+        "--lead-in",
+        help=(
+            "Per-beat lead-in silence — MUST match `lnvox s5 --lead-in`. "
+            "0.35 s covers the reader app's ~0.3 s playback poll (§17.4)."
+        ),
     ),
 ):
     """Scenario mode sync emitter (DESIGN.md §17.4).
@@ -624,8 +636,6 @@ def stage_scenario_sync(
     computed from the same plan as the s5 mix so both agree. Requires
     per-beat rendering (dramabox backend).
     """
-    from lnvox.stages import scenario_sync
-
     out_dir = _book_dir(book_id)
     if not (out_dir / "00_script.json").exists():
         console.print(f"[red]Missing {out_dir / '00_script.json'}. Run `lnvox ingest-scenario`.[/]")
@@ -636,6 +646,7 @@ def stage_scenario_sync(
             intra=intra,
             staging_pause=staging_pause,
             inter_scene=inter_scene,
+            lead_in=lead_in,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )
     except (ValueError, FileNotFoundError) as e:
@@ -907,6 +918,15 @@ def stage5(
     intra: float = typer.Option(0.25, help="Intra-scene silence in seconds."),
     inter_scene: float = typer.Option(1.0, help="Inter-scene silence in seconds."),
     inter_chapter: float = typer.Option(2.0, help="Inter-chapter silence in seconds."),
+    lead_in: float = typer.Option(
+        0.0,
+        "--lead-in",
+        help=(
+            "Extra silence before EVERY beat. Scenario mode uses 0.35 so the "
+            "reader app's ~0.3 s playback poll lands in silence before each "
+            "line (DESIGN.md §17.4); books keep 0."
+        ),
+    ),
     lufs: float = typer.Option(-18.0, help="Target loudness in LUFS."),
     kbps: int = typer.Option(96, help="AAC bitrate (kbps)."),
     cover: Optional[Path] = typer.Option(
@@ -1046,6 +1066,7 @@ def stage5(
         intra_silence=intra,
         inter_scene_silence=inter_scene,
         inter_chapter_silence=inter_chapter,
+        lead_in_silence=lead_in,
         target_lufs=lufs,
         aac_kbps=kbps,
         cover_image=cover_image,
@@ -1317,11 +1338,19 @@ def voice_cast(
         "--narrator-clip",
         help="Voicebank clip id to use for the Narrator (overrides auto-cast + any prior-volume reuse).",
     ),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Ignore this volume's existing 04_voice_assignments.json (re-cast "
+        "characters with no prior-volume match instead of keeping their clip).",
+    ),
 ):
     """LLM-match each character to a voicebank clip; write 04_voice_assignments.json.
 
-    Auto-detects prior volumes in the same series. Characters with the same
-    canonical name in a prior volume's assignments keep that clip (no LLM call).
+    Auto-detects ALL prior volumes in the same series. Characters matching a
+    prior volume's assignment — by canonical name or alias, newest volume wins
+    — keep that clip (no LLM call), so voices stay stable even when s1 renames
+    a character ("Kamijou Touma" → "Kamijou") or the character skips a volume.
     The Narrator is also reused unless --narrator-clip is provided.
     """
     vb_dir = _voicebank_dir()
@@ -1346,20 +1375,53 @@ def voice_cast(
         else None
     )
 
-    # Cross-volume reuse: load the most-recent prior volume's casting.
+    # Cross-volume reuse: fold EVERY prior volume's assignments into an
+    # identity index (names + aliases, newest volume wins). A single-volume
+    # lookback loses characters that skip a volume; exact-name matching loses
+    # them on s1 canonical-name drift — both silently recast established
+    # voices mid-series.
     artifacts_dir = Settings().artifacts_dir
-    prior_dir = latest_prior_volume(artifacts_dir, book_id)
-    prior_casting = None
-    if prior_dir is not None:
+    prior_index = None
+    prior_vols: list[str] = []
+
+    # Weakest layer: this volume's own existing assignments (if any). Prior
+    # volumes fold in AFTER and therefore override it, so continuity chains
+    # win — but a first-appearance character keeps its already-cast clip
+    # instead of being re-rolled by the LLM. Makes re-casting idempotent and
+    # keeps already-generated audio stable. `--fresh` opts out.
+    own_assign = out_dir / "04_voice_assignments.json"
+    if not fresh and own_assign.exists():
+        prior_index = voice_matcher.PriorCastIndex()
+        prior_index.add_volume(
+            BookCasting.model_validate_json(own_assign.read_text(encoding="utf-8")),
+            cast.characters,
+        )
+        prior_vols.append(f"{book_id.rsplit('/', 1)[-1]} (existing)")
+
+    for prior_dir in find_prior_volumes(artifacts_dir, book_id):
         prior_assign = prior_dir / "04_voice_assignments.json"
-        if prior_assign.exists():
-            prior_casting = BookCasting.model_validate_json(
-                prior_assign.read_text(encoding="utf-8")
-            )
-            console.print(
-                f"[dim]Reusing assignments from prior volume: {prior_dir.name} "
-                f"({len(prior_casting.castings)} cast entries)[/]"
-            )
+        if not prior_assign.exists():
+            continue
+        prior_casting = BookCasting.model_validate_json(
+            prior_assign.read_text(encoding="utf-8")
+        )
+        prior_chars_file = prior_dir / "01_characters.json"
+        prior_chars = (
+            CharacterList.model_validate_json(
+                prior_chars_file.read_text(encoding="utf-8")
+            ).characters
+            if prior_chars_file.exists()
+            else []
+        )
+        if prior_index is None:
+            prior_index = voice_matcher.PriorCastIndex()
+        prior_index.add_volume(prior_casting, prior_chars)
+        prior_vols.append(prior_dir.name)
+    if prior_index is not None:
+        console.print(
+            f"[dim]Reusing assignments from prior volume(s) "
+            f"{', '.join(prior_vols)} ({len(prior_index)} identity keys)[/]"
+        )
 
     client = LLMClient()
     console.print(
@@ -1381,12 +1443,12 @@ def voice_cast(
         # Highlight reused vs freshly cast.
         marker = "[green]✓[/]"
         suffix = ""
-        if prior_casting and any(
-            c.character_name == character.name
-            and c.assigned_clip_id == casting.assigned_clip_id
-            for c in prior_casting.castings
-        ):
-            suffix = " [dim](reused from prior volume)[/]"
+        if prior_index is not None:
+            prior = prior_index.lookup(
+                character.name, character.aliases, character.gender
+            )
+            if prior and prior.assigned_clip_id == casting.assigned_clip_id:
+                suffix = " [dim](reused from prior volume)[/]"
         console.print(
             f"  {marker} {character.name} → {casting.assigned_clip_id} "
             f"({casting.candidates_considered} cand.){suffix}"
@@ -1399,7 +1461,7 @@ def voice_cast(
         vb,
         profiles=profiles,
         top_n=top_n,
-        prior_casting=prior_casting,
+        prior_index=prior_index,
         narrator_clip_override=narrator_clip,
         on_character_done=_progress,
     )

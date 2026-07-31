@@ -117,8 +117,15 @@ def _build_chapter_concat_items(
     beats_root: Path,
     silence_intra: Path,
     silence_inter_scene: Path,
+    silence_lead: Path | None = None,
 ) -> list[Path]:
-    """Order beats with the appropriate silence between them."""
+    """Order beats with the appropriate silence between them.
+
+    `silence_lead`, when given, is prepended to EVERY beat (including the
+    chapter's first): scenario mode's per-line lead-in so the reader app's
+    ~0.3 s playback poll always lands in silence before speech (DESIGN.md
+    §17.4). Books don't pass it.
+    """
     items: list[Path] = []
     prev_scene: str | None = None
     for beat in chapter.beats:
@@ -136,6 +143,8 @@ def _build_chapter_concat_items(
         if items:
             pad = silence_inter_scene if beat.scene_id != prev_scene else silence_intra
             items.append(pad)
+        if silence_lead is not None:
+            items.append(silence_lead)
         items.append(wav)
         prev_scene = beat.scene_id
     return items
@@ -269,6 +278,7 @@ def mix(
     intra_silence: float = 0.25,
     inter_scene_silence: float = 1.0,
     inter_chapter_silence: float = 2.0,
+    lead_in_silence: float = 0.0,
     target_lufs: float = -18.0,
     aac_kbps: int = 96,
     cover_image: Path | None = None,
@@ -287,6 +297,10 @@ def mix(
     _make_silence(silence_intra, intra_silence)
     _make_silence(silence_scene, inter_scene_silence)
     _make_silence(silence_chapter, inter_chapter_silence)
+    silence_lead: Path | None = None
+    if lead_in_silence > 0:
+        silence_lead = work_dir / f"sil_lead_{int(lead_in_silence * 1000)}ms.wav"
+        _make_silence(silence_lead, lead_in_silence)
 
     progress("Concatenating per-chapter audio…")
     chapter_wavs: list[Path] = []
@@ -294,7 +308,7 @@ def mix(
     cursor = 0.0
     for i, ch in enumerate(chapters_audio):
         ch_items = _build_chapter_concat_items(
-            ch, beats_root, silence_intra, silence_scene
+            ch, beats_root, silence_intra, silence_scene, silence_lead
         )
         ch_wav = work_dir / f"chapter_{ch.chapter_id}.wav"
         _concat_to_wav(ch_items, ch_wav, work_dir)
@@ -366,6 +380,7 @@ def mix(
                 "intra_silence": intra_silence,
                 "inter_scene_silence": inter_scene_silence,
                 "inter_chapter_silence": inter_chapter_silence,
+                "lead_in_silence": lead_in_silence,
                 "chapters": [
                     {
                         "chapter_id": t.chapter_id,

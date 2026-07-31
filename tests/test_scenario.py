@@ -294,6 +294,25 @@ def test_scene_sync_timing():
     assert e[0].direction == "cue-fr" and e[0].emotion == "joy"
 
 
+def test_lead_in_shifts_speech_not_starts():
+    # 0.35 s lead-in before every beat (app poll margin, §17.4): the entry's
+    # `start` marks the lead-in start, speech begins 0.35 later, `end` is
+    # end-of-speech. Line 2: 2.35 + 0.25 intra = 2.6 → speech 2.95-4.95.
+    d = lambda t: ScriptItem(type="dialogue", speaker="A", text=t)
+    scene = _scene([d("un"), d("deux")])
+    chapter = ChapterDirected(
+        chapter_id="01",
+        scenes=[DirectedScene(scene_id="01_g00", beats=[_beat(1), _beat(2)])],
+    )
+    sync = build_scene_sync(
+        scene, chapter, _manifest(chapter), intra=0.25, staging_pause=1.0, lead_in=0.35
+    )
+    e = sync.entries
+    assert (e[0].start, e[0].end) == (0.0, 2.35)
+    assert (e[1].start, e[1].end) == (2.6, 4.95)
+    assert sync.end == 4.95
+
+
 def test_split_line_regroups_and_leading_staging_is_zero_width():
     scene = _scene(
         [

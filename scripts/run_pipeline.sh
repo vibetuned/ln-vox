@@ -691,11 +691,19 @@ if [ "$SKIP_MIX" -eq 1 ]; then
     banner "Skipping mix phase (--skip-mix)"
 else
     banner "Stage 5: mix → m4b"
+    MIX_ARGS=(--title "$BOOK_TITLE")
     if [ "$TTS_BACKEND" = "vibevoice" ]; then
-        run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE" --v2
-    else
-        run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" --title "$BOOK_TITLE"
+        MIX_ARGS+=(--v2)
     fi
+    if [ "$MODE" = "scenario" ]; then
+        # Play pacing (user-tested, DESIGN.md §17.4): 0.75 s between scenes
+        # (the 2 s book pad drags), plus a 0.35 s lead-in before every line so
+        # the 2reply reader app's ~0.3 s playback poll lands in silence.
+        # MUST equal scenario-sync's SCENARIO_INTER_SCENE / SCENARIO_LEAD_IN
+        # so m4b and sync agree.
+        MIX_ARGS+=(--inter-chapter 0.75 --lead-in 0.35)
+    fi
+    run_step - "Stage 5 (mix)" uv run lnvox s5 "$BOOK_ID" "${MIX_ARGS[@]}"
 fi
 
 # ----- Sync phase (Stage 6, CPU-only) ----------------------------------------
