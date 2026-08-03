@@ -42,8 +42,7 @@ check can't judge speech quality; see F10's process note).
   prior DramaBox install (they're unmanaged `uv pip` overlays). The launcher's
   `prepare_tts_env` is what restores them before s4.
 - All 7 pure-logic tests pass (`tests/test_*.py` run with plain python).
-- Voicebank already present at `voicebank/` (408 clips: 402 common_voice +
-  6 manual) — no transfer needed.
+- Voicebank already present at `voicebank/` (402 clips: 402 common_voice).
 - Narrator clip for the smoke test: `cv_002cb63172eb` (male/adult).
 
 ## Test book
@@ -53,12 +52,6 @@ check can't judge speech quality; see F10's process note).
   `novels/test/alice/` to the first 3 files: Gutenberg boilerplate page
   (334 chars — see finding F4), Chapter I (11.9k chars), Chapter II
   (11.3k chars). `--skip-sync` passed since the book is truncated.
-- Also tested `ingest-epub` on the user-supplied Little Prince EPUB
-  (`epubs/little_prince/`): extraction works, but that EPUB's whole body is a
-  single spine section, so it lands as one 77k-char "chapter" + a 204-char
-  title page. Fine as an extractor test, wrong shape for a pipeline smoke
-  test — Alice used instead. (Not a bug: chaptering is keyed to EPUB spine
-  structure by design.)
 
 ## Phase 1 — mlx_lm.server standalone
 
