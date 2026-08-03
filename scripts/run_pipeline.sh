@@ -27,7 +27,7 @@
 #                              GGUF repo, or local path depending on backend).
 #                              Defaults: google/gemma-4-12B-it-qat-q4_0-gguf
 #                              (llama), google/gemma-4-E4B-it (vllm),
-#                              mlx-community/gemma-4-E4B-it-4bit (mlx).
+#                              mlx-community/gemma-4-31B-it-qat-4bit (mlx).
 #     --max-model-len <N>      Override vLLM context window (default: model-dependent).
 #     --skip-llm               Skip s1..s3 + voice cast (assume already done).
 #     --skip-tts               Skip s4 (assume already rendered).
@@ -61,6 +61,17 @@
 set -uo pipefail
 
 OS="$(uname -s)"
+
+# macOS power management throttles / sleeps long renders (s4 is hours of
+# sustained GPU work). Re-exec the whole pipeline under caffeinate so the
+# display may sleep-lock but the system (-i idle, -s system-on-AC) and disk
+# stay awake for the duration. -d keeps the display assertion too so the GPU
+# isn't demoted by display sleep on some configurations. Guarded by an env
+# var so the re-exec happens exactly once.
+if [ "$OS" = "Darwin" ] && [ -z "${LNVOX_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    export LNVOX_CAFFEINATED=1
+    exec caffeinate -dis "$0" "$@"
+fi
 
 BOOK_ID=""
 MODE="narration"
@@ -202,7 +213,7 @@ if [ -z "$LLM_MODEL" ]; then
     case "$LLM_BACKEND" in
         llama) LLM_MODEL="google/gemma-4-12B-it-qat-q4_0-gguf" ;;
         vllm)  LLM_MODEL="google/gemma-4-E4B-it" ;;
-        mlx)   LLM_MODEL="mlx-community/gemma-4-E4B-it-4bit" ;;
+        mlx)   LLM_MODEL="mlx-community/gemma-4-12B-it-qat-4bit" ;;
     esac
 fi
 if [ -n "$LLM_MODEL" ]; then

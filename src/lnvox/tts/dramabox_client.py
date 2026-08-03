@@ -77,6 +77,26 @@ def _patch_torchaudio_save() -> None:
     torchaudio._lnvox_save_patched = True  # type: ignore[attr-defined]
 
 
+# DramaBox's downloader only ever fetches the PRE-QUANTIZED encoder
+# (unsloth/gemma-3-12b-it-bnb-4bit). Its packed 4-bit weights are stored as
+# flattened [N, 1] uint8 blobs that only bitsandbytes (CUDA-only) can load —
+# on the bnb_4bit=False path (MPS) they fail with per-layer size-mismatch
+# errors. Upstream's own `--no-bnb-4bit` help text says to point
+# `--gemma-root` at an unquantized checkpoint, so that's what we do:
+# unsloth's ungated fp16/bf16 mirror of the same model (~24 GB, one-time
+# download into the standard HF cache).
+_GEMMA_UNQUANTIZED_REPO = "unsloth/gemma-3-12b-it"
+
+
+def resolve_gemma_root(default_root: str, use_bnb_4bit: bool) -> str:
+    """Pick the Gemma encoder checkpoint that matches the bnb setting."""
+    if use_bnb_4bit:
+        return default_root
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(_GEMMA_UNQUANTIZED_REPO)
+
+
 class DramaboxClient:
     """One Dramabox server instance held in VRAM for the duration of stage 4."""
 
@@ -109,10 +129,15 @@ class DramaboxClient:
 
         paths = get_all_paths()
         self.device = device
+        # TTSServer's own default is bnb_4bit=True, so "not in kwargs" means
+        # the quantized path.
+        gemma_root = resolve_gemma_root(
+            paths["gemma_root"], kwargs.get("bnb_4bit", True)
+        )
         self.server = TTSServer(
             checkpoint=paths["transformer"],
             full_checkpoint=paths["audio_components"],
-            gemma_root=paths["gemma_root"],
+            gemma_root=gemma_root,
             device=device,
             **kwargs,
         )
