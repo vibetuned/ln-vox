@@ -80,7 +80,14 @@ def run_staged(
     # Intermediates are content-keyed, so a rebuilt plan re-uses everything
     # already on disk. attempts.json persists across runs as diagnostics.
     plan = build_plan(
-        book_id, chapters, casting, voicebank, voicebank_root, cache_dir, limit=limit
+        book_id,
+        chapters,
+        casting,
+        voicebank,
+        voicebank_root,
+        cache_dir,
+        limit=limit,
+        device=device,
     )
     write_plan(root, plan)
     cached = sum(1 for r in plan.renders if r.cached)

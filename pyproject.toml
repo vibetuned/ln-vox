@@ -84,6 +84,14 @@ prerelease = "allow"
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
 ]
+# Unreleased upstream fix: every mlx-community Gemma 4 12B conversion ships
+# model_type `gemma4_unified`, which no PyPI mlx-lm release supports
+# (≤0.31.3 raises "Model type gemma4_unified not supported" and the server
+# then hangs the request — MAC_TEST_REPORT.md F7). The fix merged in
+# ml-explore/mlx-lm#1349 (2026-06-05) but git main still self-reports
+# 0.31.3, so pin the commit, not a version. DROP this pin (and this
+# comment) at the first mlx-lm release published after the PR.
+mlx-lm = { git = "https://github.com/ml-explore/mlx-lm", rev = "8239c72de5a0e42c539e30489021db73c7fe258c" }
 # Linux-only: pull vLLM from its nightly wheel index (cu130 variant to
 # match torch above). Marker-gated so `uv sync` on macOS is unaffected.
 vllm = [

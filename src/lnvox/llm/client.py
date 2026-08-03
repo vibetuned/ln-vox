@@ -132,20 +132,55 @@ class LLMClient:
         # UNSET env var must behave like llama — a standalone stage run
         # against llama-server without the launcher would otherwise burn its
         # whole budget in the thinking channel.
-        if os.environ.get("LNVOX_LLM_BACKEND", "llama") == "llama":
+        # mlx-lm has the same failure mode (mlx-community Gemma 4 templates
+        # default enable_thinking on; confirmed on mlx-lm 0.31.3: 100% of the
+        # budget lands in `reasoning`, content empty, finish=length) and
+        # honors the same per-request kwarg. Only vLLM keeps the model's
+        # template defaults untouched here.
+        if os.environ.get("LNVOX_LLM_BACKEND", "llama") in ("llama", "mlx"):
             extra_body["chat_template_kwargs"] = {"enable_thinking": False}
         last_error: Exception | None = None
         last_raw = ""
         diag = ""
         attempt = 0
         for attempt in range(attempts):
+            # Escalate temperature on retries. Backends without guided_json
+            # (mlx, llama) can sample a *schema-invalid but low-perplexity*
+            # completion — observed on mlx-lm 0.31.3: a characterless front-
+            # matter chapter yields bare `{}`, and at the configured temp the
+            # retry re-samples the identical degenerate output, so all
+            # attempts (and the launcher's whole-stage retries around them)
+            # fail the same way. A hotter retry breaks the loop; attempt 0 is
+            # unchanged on every backend.
+            temperature = min(
+                1.0, self.settings.llm.temperature + 0.4 * attempt
+            )
+            # Retries must not replay a byte-identical prompt: mlx-lm 0.31.3
+            # seeds its sampler deterministically per request, so the same
+            # prompt returns the same (invalid) completion at ANY temperature
+            # — verified with 3 identical requests at --temp 1.2. Appending
+            # the previous attempt's validation error both breaks that
+            # determinism and gives the model a corrective signal (helps the
+            # unguided llama/mlx backends; vLLM's guided_json rarely gets
+            # here at all).
+            user_msg = user
+            if attempt > 0 and last_error is not None:
+                err_summary = str(last_error).splitlines()[0][:300]
+                user_msg = (
+                    f"{user}\n\n"
+                    f"IMPORTANT (retry {attempt}): your previous response "
+                    f"failed JSON schema validation with: {err_summary}\n"
+                    f"Return a corrected, complete JSON object that "
+                    f"satisfies the schema. Escape all double quotes inside "
+                    f"string values."
+                )
             response = self.client.chat.completions.create(
                 model=self.settings.llm.model,
                 messages=[
                     {"role": "system", "content": system},
-                    {"role": "user", "content": user},
+                    {"role": "user", "content": user_msg},
                 ],
-                temperature=self.settings.llm.temperature,
+                temperature=temperature,
                 max_tokens=effective_max,
                 response_format={"type": "json_object"},
                 extra_body=extra_body,

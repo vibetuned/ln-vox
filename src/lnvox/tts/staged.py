@@ -22,6 +22,7 @@ skipped: crash-recovery policy lives in the driver (staged_driver.py).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -231,6 +232,36 @@ def _slice_to_limit(chapters, limit: int):
     return sliced
 
 
+def _force_split_oversize(
+    text: str,
+    max_duration_s: float,
+    target_duration_s: float,
+    duration_multiplier: float,
+) -> list[str]:
+    """Word-boundary split for a chunk text_chunker could not get under the
+    cap (typically one long quoted utterance). Preserves a leading
+    "(voice direction)" header and one layer of surrounding quotes on every
+    piece so each remains a well-formed beat prompt."""
+    import math
+    import re
+
+    est = _estimate_duration(text, duration_multiplier)
+    if est <= max_duration_s:
+        return [text]
+    m = re.match(r"^\s*(\([^)]*\)\s*)(.*)$", text, re.DOTALL)
+    header, body = (m.group(1), m.group(2)) if m else ("", text)
+    body = body.strip()
+    quoted = len(body) >= 2 and body[0] in "\"“" and body[-1] in "\"”"
+    inner = body[1:-1] if quoted else body
+    words = inner.split()
+    if len(words) < 2:
+        return [text]  # nothing to split on; let it fail loudly downstream
+    n_parts = max(2, math.ceil(est / target_duration_s))
+    k = math.ceil(len(words) / n_parts)
+    parts = [" ".join(words[i : i + k]) for i in range(0, len(words), k)]
+    return [header + (f'"{p}"' if quoted else p) for p in parts]
+
+
 def build_plan(
     book_id: str,
     chapters,
@@ -239,11 +270,28 @@ def build_plan(
     voicebank_root: Path,
     cache_dir: Path,
     limit: Optional[int] = None,
+    device: str = "cuda",
 ) -> StagedPlan:
     _ensure_ltx_path()
     from text_chunker import chunk_prompt_for_duration
 
     params = PlanParams(**DramaboxClient.DEFAULT_PARAMS)
+    # MPS: torch's boolean-index assignment misbehaves on the DiT's (T, T)
+    # self-attention mask once T×T reaches ~2.6M elements (beats ≳25 s):
+    # `bias[positive] = ...` inside DramaBox's transformer_args raises
+    # "shape mismatch: value tensor of shape [N] cannot be broadcast to
+    # indexing result of shape [M]" with N and M from the SAME mask.
+    # We can't patch DramaBox (DESIGN.md §11.3), but chunking is planner
+    # policy: cap chunks well below the failure zone so the mask never gets
+    # that large. 22 s ≈ 1.3M mask elements — 2× safety margin. The decode
+    # phase already crossfades chunk seams, and shorter chunks also skip
+    # DramaBox's >20.5 s end-of-clip silence-prior path.
+    # NOTE: item_ids are `{cache_key}_cNN` — chunk boundaries are NOT part
+    # of the id, so any change to these caps invalidates single-chunk
+    # latents of beats that would now be split (see MAC_TEST_REPORT.md F11).
+    if device.startswith("mps"):
+        params.max_chunk_duration = 22.0
+        params.target_chunk_duration = 18.0
     model_version = DramaboxClient.MODEL_VERSION
     speaker_to_clip = _build_speaker_to_clip_path(casting, voicebank, voicebank_root)
     if limit is not None:
@@ -302,11 +350,40 @@ def build_plan(
                         ]
                     else:
                         texts = [beat.prompt]
+                    if device.startswith("mps"):
+                        # text_chunker splits on sentence boundaries INSIDE
+                        # the prompt's quoted body, and treats a fully
+                        # parenthesized+quoted beat as one unit — so a long
+                        # single utterance can come back whole, still over
+                        # the cap. Over the cap means the DiT's (T, T) mask
+                        # enters MPS's broken boolean-indexing zone (F11), a
+                        # hard failure. Force a word-boundary split as a last
+                        # resort, replicating the "(voice direction)" header
+                        # on every piece; the decode crossfade smooths the
+                        # mid-sentence seam.
+                        texts = [
+                            t2
+                            for t in texts
+                            for t2 in _force_split_oversize(
+                                t,
+                                params.max_chunk_duration,
+                                params.target_chunk_duration,
+                                params.duration_multiplier,
+                            )
+                        ]
                     for ci, text in enumerate(texts):
                         gd = _estimate_duration(text, params.duration_multiplier)
+                        # The chunk TEXT is part of the item identity. With a
+                        # bare positional id ({key}_c00), any change in chunk
+                        # policy silently reuses stale ctx/latents rendered
+                        # from DIFFERENT text — observed as "the whole beat
+                        # spoken fast, then the tail again slow": c00's ctx
+                        # was the old full-text encoding squeezed into the
+                        # new shorter n_frames, c01 was the fresh tail.
+                        text_h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
                         chunks.append(
                             PlanChunk(
-                                item_id=f"{cache_key}_c{ci:02d}",
+                                item_id=f"{cache_key}_c{ci:02d}-{text_h}",
                                 text=text,
                                 gen_duration=gd,
                                 n_frames=_n_frames(gd, params.fps),
@@ -536,9 +613,19 @@ def _phase_ctx(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -> No
     paths = get_all_paths()
     dev = torch.device(device)
     dtype, bnb_4bit, _ = _knobs(device)
+    # Gemma is bf16-trained and its activations OVERFLOW fp16: on MPS the
+    # fp16 encoder returns all-NaN encodings (verified via --keep-staged:
+    # neg.safetensors was 100% NaN, which silently propagated through dit →
+    # silent audio, exit code 0). bf16 on MPS is fine on torch ≥2.10/M-series
+    # for this transformer stack; fp32 would need ~48 GB. CUDA path already
+    # uses bf16 via _knobs().
+    if device.startswith("mps"):
+        dtype = torch.bfloat16
+    from lnvox.tts.dramabox_client import resolve_gemma_root
+
     encoder = PromptEncoder(
         checkpoint_path=paths["audio_components"],
-        gemma_root=paths["gemma_root"],
+        gemma_root=resolve_gemma_root(paths["gemma_root"], bnb_4bit),
         dtype=dtype,
         device=dev,
         warm=True,
@@ -766,6 +853,14 @@ def _phase_decode(plan: StagedPlan, root: Path, cache_dir: Path, device: str) ->
         paths = get_all_paths()
         dev = torch.device(device)
         dtype, _, _ = _knobs(device)
+        # MPS: the vocoder hits "Input type (float) and bias type (c10::Half)"
+        # in fp16 — an op inside AudioDecoder silently upcasts an intermediate
+        # to fp32 on MPS, which then meets fp16 conv weights. Decode is cheap
+        # relative to dit (and latents are already rendered), so run the whole
+        # phase in fp32 there instead of chasing the individual op. CUDA keeps
+        # the _knobs() dtype.
+        if device.startswith("mps"):
+            dtype = torch.float32
         decoder = AudioDecoder(
             checkpoint_path=paths["audio_components"], dtype=dtype, device=dev, warm=True
         )
@@ -852,7 +947,20 @@ def _finalize(plan: StagedPlan, root: Path, cache_dir: Path) -> None:
         for b in chapter_beats:
             wav_path = chapter_dir / f"{b.beat_id}.wav"
             cache_path = cache_dir / f"{b.cache_key}.wav"
-            if not wav_path.exists():
+            # Refresh the chapter copy when missing OR when the cache entry
+            # was re-rendered after it was placed ("exists → skip" left 45
+            # stale beat wavs in 05_audio after a cache re-render, and s5
+            # silently mixed the old audio). mtime ordering self-stabilizes
+            # with the trim-upgrade below: the refreshed copy is always newer
+            # than its cache source.
+            refresh = not wav_path.exists()
+            if (
+                not refresh
+                and cache_path.exists()
+                and cache_path.stat().st_mtime > wav_path.stat().st_mtime
+            ):
+                refresh = True
+            if refresh:
                 if not cache_path.exists():
                     raise RuntimeError(
                         f"Content cache missing for beat {b.beat_id} ({b.cache_key}) — "
