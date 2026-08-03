@@ -704,7 +704,3 @@ external/DramaBox/                       Cloned Dramabox repo (sys.path-injected
 external/VibeVoice/                      Community fork (pip -e; scripts/setup_vibevoice.sh)
 data/<cv-corpus-…>/                      Raw Common Voice extraction (EN + FR)
 ```
-
-
-
- ./scripts/run_pipeline.sh ascendance/volume-06 --skip-llm --book-title 'Ascendance of a Bookworm - Part 2 Apprentice Shrine Maiden v03'
