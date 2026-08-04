@@ -88,7 +88,10 @@ Notes:
   needs `uv sync --extra serve`, pulls `vllm>=0.19` + cu130 torch) and
   `--llm-backend mlx` (Apple Silicon, `--extra mlx`) remain available; pick a
   model with `--llm-model`.
-- Dramabox auto-downloads ~15 GB of weights from HuggingFace on first run.
+- Dramabox auto-downloads ~15 GB of weights from HuggingFace on first run,
+  plus a ~23 GB unquantized Gemma encoder on the first s4 render (the
+  default high-quality recipe — see
+  [Render quality](#render-quality-defaults-and-the-lighter-fallback)).
 - The voicebank seed only needs to be done once per language. Re-running it
   with a higher `--max-speakers` adds more speakers to the existing bank.
 
@@ -133,9 +136,10 @@ What the Mac path does automatically:
   Gemma prompt-encoder in bf16 (fp16 overflows to NaN → silent audio),
   DiT in fp16, vocoder in fp32. The first run downloads the **unquantized**
   encoder checkpoint (~23 GB) because the bnb-4bit one is CUDA-only.
-- **Render chunks are capped at 22 s** (an MPS boolean-indexing bug breaks
-  the DiT mask on longer beats) — a change that blind-tested *better* than
-  long chunks, see the render-quality flags below.
+- **Render chunks are capped at 22 s** — originally an MPS necessity (a
+  boolean-indexing bug breaks the DiT mask on longer beats), now the
+  default everywhere after blind-testing *better* than long chunks; see
+  [Render quality](#render-quality-defaults-and-the-lighter-fallback).
 - **The launcher re-execs under `caffeinate -dis`** so multi-hour renders
   survive macOS power management.
 
@@ -648,35 +652,42 @@ caps at 375 chars (~30 s; `MAX_MERGED_BEAT_CHARS` in `s3_director.py`); a source
 narration paragraph longer than that is auto-split at sentence boundaries before
 TTS.
 
-### Render-quality flags (blind-test winner on CUDA)
+### Render quality (defaults, and the lighter fallback)
 
-Three opt-in s4 env flags backport the Mac path's render config to CUDA.
-The bundle **won a blind A/B against the CUDA defaults** (baseline had
-audible artifacts; this config had none — `MAC_TEST_REPORT.md`) and
-measured **~20% faster** in denoise (short chunks beat long ones — DiT
-attention is quadratic in chunk length):
+Since 2026-08-04 the staged s4 path (the launcher default) renders with the
+**high-quality recipe** on every platform — it **won a blind A/B** against
+the original recipe (which had audible artifacts — `MAC_TEST_REPORT.md`)
+and is even **~20% faster** in denoise, because short chunks beat long ones
+(DiT attention is quadratic in chunk length):
+
+- **Unquantized bf16 Gemma prompt-encoder** instead of bnb-4bit. Costs a
+  one-time ~23 GB download; the staged ctx phase loads it with the GPU to
+  itself, so it fits a 32 GB card.
+- **Denoise chunks capped at 22 s** (target 18 s), word-boundary fallback
+  split, crossfaded seams.
+- **Vocoder in fp32.**
+
+No flags needed — this is what `run_pipeline.sh` does now. Each knob can be
+reverted individually (all of them cost quality; useful for smaller GPUs,
+tight disk, or reproducing an old render byte-for-byte):
 
 ```bash
-LNVOX_S4_ENCODER_PRECISION=bf16 \
-LNVOX_S4_CHUNK_CAP=22 \
-LNVOX_S4_DECODE_DTYPE=fp32 \
-./scripts/run_pipeline.sh novel-name/volume-01 --book-title "…" …
+LNVOX_S4_ENCODER_PRECISION=bnb4  # quantized encoder: no 23 GB download,
+                                 # less VRAM — audibly worse conditioning
+LNVOX_S4_CHUNK_CAP=none          # restore the 45 s chunker (the artifact
+                                 # source in the blind test; also slower)
+LNVOX_S4_DECODE_DTYPE=auto       # vocoder back to per-device dtype (bf16
+                                 # on CUDA)
 ```
 
-- `LNVOX_S4_ENCODER_PRECISION=bf16` — unquantized Gemma prompt-encoder
-  instead of bnb-4bit (one-time ~23 GB download; the staged ctx phase
-  loads it with the GPU to itself, so it fits a 32 GB card).
-- `LNVOX_S4_CHUNK_CAP=22` — caps denoise chunks at 22 s (target 18 s)
-  with a word-boundary fallback split; seams are crossfaded.
-- `LNVOX_S4_DECODE_DTYPE=fp32` — vocoder in fp32.
-
-Active flags append a variant tag to the TTS cache key (e.g.
-`+enc-bf16+cap22+dec-fp32`), so flagged and default renders never collide
-in `cache/tts/` — but that also means flipping flags mid-book re-renders
-everything. Pick a config per book and keep it. The cap and decode flags
-need the staged path (the launcher default); `lnvox s4` without `--staged`
-refuses them. If this config keeps winning on full books it will become
-the CUDA default via a `MODEL_VERSION` bump.
+The effective recipe is part of the TTS cache key (default runs are tagged
+`+enc-bf16+cap22+dec-fp32`; the old recipe is untagged), so renders from
+different recipes never collide in `cache/tts/` — which also means changing
+the recipe mid-book re-renders everything. Pick a recipe per book and keep
+it. Two scope notes: the cap and decode knobs exist only on the staged
+path (`lnvox s4` without `--staged` refuses explicit values), and the
+monolithic path keeps the old `bnb4` encoder default because the bf16
+encoder doesn't fit alongside the DiT + vocoder in one process.
 
 ### Disk
 

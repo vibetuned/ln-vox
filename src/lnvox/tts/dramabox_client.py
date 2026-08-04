@@ -98,23 +98,35 @@ def resolve_gemma_root(default_root: str, use_bnb_4bit: bool) -> str:
     return snapshot_download(_GEMMA_UNQUANTIZED_REPO)
 
 
-# Opt-in render-quality overrides (MAC_TEST_REPORT.md "CUDA backport
-# candidates"). Each changes the rendered audio, so any active override MUST
-# re-key the content cache — otherwise an A/B silently mixes variants.
+# Render-quality knobs. The Mac-path recipe (unquantized bf16 encoder, 22 s
+# chunk cap, fp32 vocoder) beat the original recipe in a blind A/B on CUDA —
+# no audible artifacts AND ~20% faster denoise (MAC_TEST_REPORT.md) — and is
+# the DEFAULT for the staged path since 2026-08-04. Env overrides:
 #
-#   LNVOX_S4_ENCODER_PRECISION  bnb4 (default) | bf16 (unquantized encoder,
-#                               ~24 GB checkpoint — staged ctx phase fits it
-#                               alone in VRAM; monolithic may OOM)
-#   LNVOX_S4_CHUNK_CAP          seconds; staged planner caps chunk duration
-#                               (target = cap - 4) with word-split fallback
-#   LNVOX_S4_DECODE_DTYPE       fp32; staged vocoder phase dtype override
+#   LNVOX_S4_ENCODER_PRECISION  bf16 (default: unquantized encoder, one-time
+#                               ~23 GB download) | bnb4 (old quantized
+#                               encoder — lighter on disk/VRAM, audibly
+#                               worse; still the MONOLITHIC-path default,
+#                               which can't fit the bf16 encoder alongside
+#                               the DiT + vocoder in one process)
+#   LNVOX_S4_CHUNK_CAP          seconds (default 22, target = cap - 4, with
+#                               word-split fallback) | 0/none/off to restore
+#                               the chunker's 45 s (staged only)
+#   LNVOX_S4_DECODE_DTYPE       fp32 (default) | auto = per-device knobs,
+#                               the old behavior (staged only)
 #
-# MPS note: the Mac defaults (bf16 encoder, 22 s cap, fp32 decode) are
-# device-gated, not env-driven, and keep their untagged cache keys.
+# Cache keys: s4_variant_tag() encodes deviations from the ORIGINAL v1
+# recipe, NOT from the current defaults — so the tag is stable across
+# default flips. Default staged runs are tagged +enc-bf16+cap22+dec-fp32
+# (byte-identical keys to renders made when these were opt-in flags),
+# old-recipe renders stay untagged, and MODEL_VERSION never needs a
+# compatibility bump.
 
 
-def s4_encoder_precision() -> str:
-    val = os.environ.get("LNVOX_S4_ENCODER_PRECISION", "bnb4").strip().lower() or "bnb4"
+def s4_encoder_precision(staged: bool = True) -> str:
+    val = os.environ.get("LNVOX_S4_ENCODER_PRECISION", "").strip().lower()
+    if not val:
+        return "bf16" if staged else "bnb4"
     if val not in ("bnb4", "bf16"):
         raise ValueError(
             f"LNVOX_S4_ENCODER_PRECISION must be 'bnb4' or 'bf16' (got {val!r})"
@@ -123,28 +135,39 @@ def s4_encoder_precision() -> str:
 
 
 def s4_chunk_cap() -> float | None:
-    val = os.environ.get("LNVOX_S4_CHUNK_CAP", "").strip()
-    return float(val) if val else None
+    val = os.environ.get("LNVOX_S4_CHUNK_CAP", "").strip().lower()
+    if val in ("0", "none", "off"):
+        return None
+    if not val:
+        return 22.0
+    return float(val)
 
 
 def s4_decode_dtype() -> str | None:
     val = os.environ.get("LNVOX_S4_DECODE_DTYPE", "").strip().lower()
-    if val and val != "fp32":
-        raise ValueError(f"LNVOX_S4_DECODE_DTYPE only supports 'fp32' (got {val!r})")
-    return val or None
+    if val == "auto":
+        return None
+    if not val:
+        return "fp32"
+    if val != "fp32":
+        raise ValueError(
+            f"LNVOX_S4_DECODE_DTYPE must be 'fp32' or 'auto' (got {val!r})"
+        )
+    return val
 
 
-def s4_variant_tag() -> str:
-    """Cache-key suffix encoding the active overrides; empty when none are
-    set, so default renders keep their existing keys."""
+def s4_variant_tag(staged: bool = True) -> str:
+    """Cache-key suffix for the effective render recipe, relative to the
+    original v1 recipe (empty = v1). Stable across default changes."""
     parts = []
-    if s4_encoder_precision() != "bnb4":
-        parts.append(f"enc-{s4_encoder_precision()}")
-    cap = s4_chunk_cap()
-    if cap is not None:
-        parts.append(f"cap{cap:g}")
-    if s4_decode_dtype():
-        parts.append(f"dec-{s4_decode_dtype()}")
+    if s4_encoder_precision(staged) != "bnb4":
+        parts.append(f"enc-{s4_encoder_precision(staged)}")
+    if staged:
+        cap = s4_chunk_cap()
+        if cap is not None:
+            parts.append(f"cap{cap:g}")
+        if s4_decode_dtype():
+            parts.append(f"dec-{s4_decode_dtype()}")
     return ("+" + "+".join(parts)) if parts else ""
 
 
@@ -177,7 +200,10 @@ class DramaboxClient:
             kwargs.setdefault("dtype", "fp16")
             kwargs.setdefault("bnb_4bit", False)
             kwargs.setdefault("compile_model", False)
-        if s4_encoder_precision() == "bf16":
+        # staged=False: the monolithic path defaults to the quantized encoder
+        # (bf16 + DiT + vocoder don't fit one process on a 32 GB card); an
+        # explicit LNVOX_S4_ENCODER_PRECISION=bf16 is still honored.
+        if s4_encoder_precision(staged=False) == "bf16":
             kwargs.setdefault("bnb_4bit", False)
 
         paths = get_all_paths()

@@ -296,8 +296,11 @@ def build_plan(
     if device.startswith("mps"):
         params.max_chunk_duration = 22.0
         params.target_chunk_duration = 18.0
-    # Opt-in cap override (CUDA backport A/B — see s4_variant_tag). Wins over
-    # the MPS default when both apply.
+    # Chunk cap — default 22 s on every device since the blind A/B
+    # (s4_variant_tag has the story); LNVOX_S4_CHUNK_CAP=none restores the
+    # chunker's 45 s. An explicit value wins over the MPS block above; an
+    # opt-out leaves the MPS 22/18 in place (the kernel bug is a hard
+    # failure there, not a preference).
     chunk_cap = s4_chunk_cap()
     if chunk_cap is not None:
         params.max_chunk_duration = chunk_cap
@@ -634,9 +637,10 @@ def _phase_ctx(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -> No
     # uses bf16 via _knobs().
     if device.startswith("mps"):
         dtype = torch.bfloat16
-    # Opt-in unquantized encoder on CUDA (A/B backport of the Mac path's
-    # accidental upgrade — see s4_variant_tag). ctx is the only phase that
-    # loads the encoder, so the ~24 GB bf16 checkpoint gets the GPU alone.
+    # Unquantized encoder — the staged-path default since the blind A/B
+    # (see s4_variant_tag; LNVOX_S4_ENCODER_PRECISION=bnb4 reverts). ctx is
+    # the only phase that loads the encoder, so the ~23 GB bf16 checkpoint
+    # gets the GPU alone.
     if s4_encoder_precision() == "bf16":
         bnb_4bit = False
     from lnvox.tts.dramabox_client import resolve_gemma_root

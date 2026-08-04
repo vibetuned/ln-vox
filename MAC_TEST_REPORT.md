@@ -555,10 +555,19 @@ config on CUDA, measured: **~20% FASTER denoise** (218 s → 174 s —
 in chunk length), ctx encode comparable (~12 s vs ~10 s), decode/mix
 unchanged; the only real costs are the one-time 23 GB encoder download
 (+~3 min first load) and the ctx phase's ~24 GB VRAM appetite (fine
-staged, risky monolithic). Recommended path: run the next full book
-with the three env flags set, and if it holds up, promote them to CUDA
-defaults via a deliberate MODEL_VERSION bump (not the variant tag) +
-update DESIGN §11.3/§2.6.
+staged, risky monolithic).
+
+**PROMOTED TO DEFAULT (2026-08-04):** after the config held up on full
+books (user ran an entire series with the flags), it became the staged-
+path default on every platform. Instead of the originally-planned
+MODEL_VERSION bump, the variant tag now encodes deviations from the
+ORIGINAL v1 recipe — default runs are tagged `+enc-bf16+cap22+dec-fp32`,
+byte-identical to the opt-in-era keys, so every existing flagged render
+stays cached; old-recipe renders stay untagged. Reverting (lower
+quality): `LNVOX_S4_ENCODER_PRECISION=bnb4`, `LNVOX_S4_CHUNK_CAP=none`,
+`LNVOX_S4_DECODE_DTYPE=auto`. The monolithic path keeps the bnb4
+encoder default (bf16 doesn't fit beside DiT + vocoder in one process).
+DESIGN §11.3/§2.6 doc updates remain open items.
 
 ## Stale-doc call-outs
 
