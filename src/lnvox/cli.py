@@ -862,7 +862,24 @@ def stage4(
         )
         return
 
-    from lnvox.tts.dramabox_client import DramaboxClient
+    from lnvox.tts.dramabox_client import (
+        DramaboxClient,
+        s4_chunk_cap,
+        s4_decode_dtype,
+        s4_variant_tag,
+    )
+
+    # Chunk cap and decode dtype are staged-planner policies; the monolithic
+    # path delegates chunking/decoding to DramaBox's TTSServer internals.
+    # Refusing beats rendering DEFAULT audio under a variant-tagged cache key
+    # (which would poison any A/B against the staged path).
+    if s4_chunk_cap() is not None or s4_decode_dtype() is not None:
+        console.print(
+            "[red]LNVOX_S4_CHUNK_CAP / LNVOX_S4_DECODE_DTYPE need the staged "
+            "path — re-run with --staged (LNVOX_S4_ENCODER_PRECISION works on "
+            "both).[/]"
+        )
+        raise typer.Exit(1)
 
     s4_tts.run(
         chapters_loaded,
@@ -872,7 +889,7 @@ def stage4(
         audio_dir,
         cache_dir,
         client_factory=_factory,
-        model_version=DramaboxClient.MODEL_VERSION,
+        model_version=DramaboxClient.MODEL_VERSION + s4_variant_tag(),
         progress=_progress,
         limit=limit,
     )

@@ -13,6 +13,7 @@ which fetches three artifacts from HuggingFace:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,56 @@ def resolve_gemma_root(default_root: str, use_bnb_4bit: bool) -> str:
     return snapshot_download(_GEMMA_UNQUANTIZED_REPO)
 
 
+# Opt-in render-quality overrides (MAC_TEST_REPORT.md "CUDA backport
+# candidates"). Each changes the rendered audio, so any active override MUST
+# re-key the content cache — otherwise an A/B silently mixes variants.
+#
+#   LNVOX_S4_ENCODER_PRECISION  bnb4 (default) | bf16 (unquantized encoder,
+#                               ~24 GB checkpoint — staged ctx phase fits it
+#                               alone in VRAM; monolithic may OOM)
+#   LNVOX_S4_CHUNK_CAP          seconds; staged planner caps chunk duration
+#                               (target = cap - 4) with word-split fallback
+#   LNVOX_S4_DECODE_DTYPE       fp32; staged vocoder phase dtype override
+#
+# MPS note: the Mac defaults (bf16 encoder, 22 s cap, fp32 decode) are
+# device-gated, not env-driven, and keep their untagged cache keys.
+
+
+def s4_encoder_precision() -> str:
+    val = os.environ.get("LNVOX_S4_ENCODER_PRECISION", "bnb4").strip().lower() or "bnb4"
+    if val not in ("bnb4", "bf16"):
+        raise ValueError(
+            f"LNVOX_S4_ENCODER_PRECISION must be 'bnb4' or 'bf16' (got {val!r})"
+        )
+    return val
+
+
+def s4_chunk_cap() -> float | None:
+    val = os.environ.get("LNVOX_S4_CHUNK_CAP", "").strip()
+    return float(val) if val else None
+
+
+def s4_decode_dtype() -> str | None:
+    val = os.environ.get("LNVOX_S4_DECODE_DTYPE", "").strip().lower()
+    if val and val != "fp32":
+        raise ValueError(f"LNVOX_S4_DECODE_DTYPE only supports 'fp32' (got {val!r})")
+    return val or None
+
+
+def s4_variant_tag() -> str:
+    """Cache-key suffix encoding the active overrides; empty when none are
+    set, so default renders keep their existing keys."""
+    parts = []
+    if s4_encoder_precision() != "bnb4":
+        parts.append(f"enc-{s4_encoder_precision()}")
+    cap = s4_chunk_cap()
+    if cap is not None:
+        parts.append(f"cap{cap:g}")
+    if s4_decode_dtype():
+        parts.append(f"dec-{s4_decode_dtype()}")
+    return ("+" + "+".join(parts)) if parts else ""
+
+
 class DramaboxClient:
     """One Dramabox server instance held in VRAM for the duration of stage 4."""
 
@@ -126,6 +177,8 @@ class DramaboxClient:
             kwargs.setdefault("dtype", "fp16")
             kwargs.setdefault("bnb_4bit", False)
             kwargs.setdefault("compile_model", False)
+        if s4_encoder_precision() == "bf16":
+            kwargs.setdefault("bnb_4bit", False)
 
         paths = get_all_paths()
         self.device = device

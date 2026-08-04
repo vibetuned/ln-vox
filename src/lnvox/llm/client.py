@@ -119,6 +119,12 @@ class LLMClient:
         extra_body: dict = {"guided_json": schema.model_json_schema()}
         if self.settings.llm.repetition_penalty != 1.0:
             extra_body["repetition_penalty"] = self.settings.llm.repetition_penalty
+            # llama-server spells it repeat_penalty; without this the
+            # documented anti-loop lever (config.py) was a silent no-op on
+            # the default backend. Unknown fields are ignored server-side,
+            # so both spellings ride along safely.
+            if os.environ.get("LNVOX_LLM_BACKEND", "llama") == "llama":
+                extra_body["repeat_penalty"] = self.settings.llm.repetition_penalty
         # Llama-server + Gemma 4: the GGUF's chat template enables thinking by
         # default (`thinking = 1` at server init, format `peg-gemma4`). For
         # structured-JSON tasks the model burns the entire token budget in the
@@ -143,17 +149,20 @@ class LLMClient:
         last_raw = ""
         diag = ""
         attempt = 0
+        # Retries escalate temperature ONLY after schema-invalid completions,
+        # never after a length cut. Hot retries exist to break deterministic
+        # re-sampling of degenerate-but-valid-looking output (mlx-lm replays
+        # byte-identical completions; observed: bare `{}` on a characterless
+        # chapter). A length cut is the opposite case — the sampling was fine,
+        # the budget wasn't — and re-running it hot makes the quantized model
+        # LOOP (observed on gemma-4-12B QAT: healthy 3.2 chars/token at temp
+        # 0.2 degraded to 1.24 chars/token of repetition at temp 1.0, so the
+        # grown budget was eaten by garbage and still finished length).
+        hot_retries = 0
+        prev_length_cut = False
         for attempt in range(attempts):
-            # Escalate temperature on retries. Backends without guided_json
-            # (mlx, llama) can sample a *schema-invalid but low-perplexity*
-            # completion — observed on mlx-lm 0.31.3: a characterless front-
-            # matter chapter yields bare `{}`, and at the configured temp the
-            # retry re-samples the identical degenerate output, so all
-            # attempts (and the launcher's whole-stage retries around them)
-            # fail the same way. A hotter retry breaks the loop; attempt 0 is
-            # unchanged on every backend.
             temperature = min(
-                1.0, self.settings.llm.temperature + 0.4 * attempt
+                1.0, self.settings.llm.temperature + 0.4 * hot_retries
             )
             # Retries must not replay a byte-identical prompt: mlx-lm 0.31.3
             # seeds its sampler deterministically per request, so the same
@@ -163,8 +172,11 @@ class LLMClient:
             # determinism and gives the model a corrective signal (helps the
             # unguided llama/mlx backends; vLLM's guided_json rarely gets
             # here at all).
+            # A length retry keeps the prompt untouched too: the completion
+            # was cut, not wrong, so "your previous response failed
+            # validation" feedback is noise that shifts the resample.
             user_msg = user
-            if attempt > 0 and last_error is not None:
+            if attempt > 0 and last_error is not None and not prev_length_cut:
                 err_summary = str(last_error).splitlines()[0][:300]
                 user_msg = (
                     f"{user}\n\n"
@@ -214,8 +226,24 @@ class LLMClient:
                     f"content_chars={len(content)}, reasoning_chars={len(reasoning)}"
                 )
                 if finish == "length":
-                    # Retrying won't help a hard length cut; fail fast.
-                    break
+                    # A hard length cut can't parse no matter how it's
+                    # re-sampled — but it CAN succeed with a bigger budget.
+                    # Grow it 1.5x for the next attempt (clamped to the
+                    # context window); failing fast here made the launcher's
+                    # whole-stage retries replay the same too-small cap.
+                    prev_length_cut = True
+                    headroom = (
+                        self.settings.llm.max_model_len
+                        - int((len(system) + len(user_msg)) / self._CHARS_PER_TOKEN)
+                        - 1024
+                    )
+                    grown = min(int(effective_max * 1.5), headroom)
+                    if grown <= effective_max:
+                        break  # already at the context ceiling
+                    effective_max = grown
+                else:
+                    prev_length_cut = False
+                    hot_retries += 1
 
         if salvage is not None:
             try:

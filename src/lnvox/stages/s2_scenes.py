@@ -142,12 +142,16 @@ def _tag_scene_beats(
         location_hint=boundary.location_hint or "",
         text=scene_text,
     )
-    # source_span roughly duplicates the source, so budget ~1.4x the scene
-    # text; capped well inside the context window. Exceptions propagate (a dead
-    # vLLM here used to be silently swallowed into empty beats, which cached as
-    # a degenerate "1 scene, 0 beats" result and corrupted every subsequent
-    # chapter until the cache was wiped).
-    budget = max(4096, min(32000, int(len(scene_text) * 1.4) + 1024))
+    # The beats JSON carries the source twice (spoken `text` + verbatim
+    # `source_span`) plus keys/escapes — measured ~5.2x the scene chars on
+    # dialogue-dense chapters, i.e. ~1.6 output tokens per source char; 1.4
+    # under-shot those and died on finish_reason=length. 2.0 gives margin,
+    # capped well inside the context window; the client also grows the budget
+    # on a length cut now. Exceptions propagate (a dead vLLM here used to be
+    # silently swallowed into empty beats, which cached as a degenerate
+    # "1 scene, 0 beats" result and corrupted every subsequent chapter until
+    # the cache was wiped).
+    budget = max(4096, min(32000, int(len(scene_text) * 2.0) + 1024))
     return client.structured(
         system=BEATS_SYSTEM, user=user, schema=SceneBeats, max_tokens=budget
     )

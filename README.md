@@ -94,6 +94,69 @@ Notes:
 
 ---
 
+## macOS (Apple Silicon) setup
+
+The full pipeline runs on an M-series Mac — validated end-to-end on an
+M4 Max / 64 GB (`MAC_TEST_REPORT.md` has the whole story; DESIGN.md §11 is
+the contract for what differs). Linux + CUDA remains the primary target.
+
+```bash
+# 1. Tooling
+brew install ffmpeg          # s5 mix
+brew install llama.cpp       # default LLM backend, same as Linux
+
+# 2. Python deps (the mlx extra adds the Apple-native LLM backend)
+uv sync --extra mlx --extra voice --extra tts
+
+# 3. Dramabox — the Darwin branch installs MPS-capable torch and drops
+#    bitsandbytes (CUDA-only)
+./scripts/setup_dramabox.sh
+
+# 4. Voicebank: copy it from your main machine instead of re-seeding
+#    (seeding needs the ~96 GB Common Voice tarball)
+rsync -a <linux-box>:projects/ln-vox/voicebank/ voicebank/
+```
+
+Then run the launcher exactly as on Linux — llama.cpp is the default LLM
+backend on every platform. To serve the LLM stages Apple-natively instead,
+add `--llm-backend mlx`:
+
+```bash
+./scripts/run_pipeline.sh novel-name/volume-01 \
+    --llm-backend mlx \
+    --narrator-clip cv_… --book-title "…"
+```
+
+What the Mac path does automatically:
+
+- **s4 auto-detects MPS** and applies the working per-phase dtype map:
+  Gemma prompt-encoder in bf16 (fp16 overflows to NaN → silent audio),
+  DiT in fp16, vocoder in fp32. The first run downloads the **unquantized**
+  encoder checkpoint (~23 GB) because the bnb-4bit one is CUDA-only.
+- **Render chunks are capped at 22 s** (an MPS boolean-indexing bug breaks
+  the DiT mask on longer beats) — a change that blind-tested *better* than
+  long chunks, see the render-quality flags below.
+- **The launcher re-execs under `caffeinate -dis`** so multi-hour renders
+  survive macOS power management.
+
+mlx backend notes:
+
+- Default model: `mlx-community/gemma-4-12B-it-qat-4bit`, served by a
+  **git-pinned mlx-lm** (in `pyproject.toml`; drop the pin at the first
+  mlx-lm release > 0.31.3 — released versions can't load Gemma 4 12B
+  conversions). `gemma-4-E4B-it-4bit` fits 16 GB Macs but is structurally
+  unreliable on s1/s2; the 31B QAT works but is far too slow for real books.
+- `mlx_lm.server` ignores per-request sampling and replays identical
+  completions — `serve_mlx.sh` serves with `--temp` (`LNVOX_LLM_TEMP`,
+  default 0.2) and the client feeds validation errors back into retries.
+
+Sizing: 36 GB+ unified memory recommended (the bf16 encoder alone is
+~24 GB). Measured on an M4 Max: ~3.6× real-time denoise ≈ **4 h of render
+per hour of audio** — plan accordingly, the s4 cache makes interrupted runs
+resumable.
+
+---
+
 ## Importing books from EPUB
 
 If your source is a publisher-issued EPUB rather
@@ -584,6 +647,36 @@ noise floor and can slur into unintelligible speech. The Director's merge pass
 caps at 375 chars (~30 s; `MAX_MERGED_BEAT_CHARS` in `s3_director.py`); a source
 narration paragraph longer than that is auto-split at sentence boundaries before
 TTS.
+
+### Render-quality flags (blind-test winner on CUDA)
+
+Three opt-in s4 env flags backport the Mac path's render config to CUDA.
+The bundle **won a blind A/B against the CUDA defaults** (baseline had
+audible artifacts; this config had none — `MAC_TEST_REPORT.md`) and
+measured **~20% faster** in denoise (short chunks beat long ones — DiT
+attention is quadratic in chunk length):
+
+```bash
+LNVOX_S4_ENCODER_PRECISION=bf16 \
+LNVOX_S4_CHUNK_CAP=22 \
+LNVOX_S4_DECODE_DTYPE=fp32 \
+./scripts/run_pipeline.sh novel-name/volume-01 --book-title "…" …
+```
+
+- `LNVOX_S4_ENCODER_PRECISION=bf16` — unquantized Gemma prompt-encoder
+  instead of bnb-4bit (one-time ~23 GB download; the staged ctx phase
+  loads it with the GPU to itself, so it fits a 32 GB card).
+- `LNVOX_S4_CHUNK_CAP=22` — caps denoise chunks at 22 s (target 18 s)
+  with a word-boundary fallback split; seams are crossfaded.
+- `LNVOX_S4_DECODE_DTYPE=fp32` — vocoder in fp32.
+
+Active flags append a variant tag to the TTS cache key (e.g.
+`+enc-bf16+cap22+dec-fp32`), so flagged and default renders never collide
+in `cache/tts/` — but that also means flipping flags mid-book re-renders
+everything. Pick a config per book and keep it. The cap and decode flags
+need the staged path (the launcher default); `lnvox s4` without `--staged`
+refuses them. If this config keeps winning on full books it will become
+the CUDA default via a `MODEL_VERSION` bump.
 
 ### Disk
 

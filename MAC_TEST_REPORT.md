@@ -9,9 +9,10 @@ user request; manual verification first).
 playable, chapter-marked, loudness-verified 35-minute `.m4b` of Alice
 ch. I–II came out the far end (LLM stages on mlx_lm.server, DramaBox s4 on
 MPS, ffmpeg mix). It took 11 pipeline attempts and 11 findings to get
-there; every fix is small and Mac-gated, on this branch, unreviewed —
-**the user still needs to LISTEN to the output** (an automated loudness
-check can't judge speech quality; see F10's process note).
+there; every fix is small and Mac-gated, on this branch, unreviewed.
+**Listening verdict (2026-08-03): APPROVED** — the user judges this render
+*better to the ear* than the CUDA renders, at a real-time cost. See
+"Listening verdict & CUDA backport candidates" at the end.
 
 ## Machine
 
@@ -236,10 +237,6 @@ be narrated into the audiobook. Left in place for this run (it became a
 useful robustness probe). A filter tweak is content-heuristic work — flagged
 rather than fixed (design-first convention).
 
-### Timings / retry rates (Phase 2)
-
-*being collected — filled in when the LLM phase completes*
-
 ## Phase 3 — DramaBox s4 on MPS
 
 ### Phase 2 final timings (12B QAT, run 6)
@@ -406,7 +403,7 @@ auto-invalidates every derived intermediate; no more hand-purges. The 45
 affected cache WAVs (>19 s) were evicted and re-rendered clean (run 12,
 83 chunks ≈ 1.4 h), and the m4b re-mixed. Duration is unchanged by design
 (chunk lengths are pinned by their planned frame budgets; only the speech
-content changed). **Needs a fresh listening pass on the long beats.**
+content changed). **Listening pass done — see the Phase 4 verdict.**
 
 Note on the user's alternative (split beats in s2 on Mac instead of s4):
 now that the artifact is explained by cache identity — not by the split
@@ -450,10 +447,10 @@ Final artifact — `artifacts/test/alice/06_final/Alice - MLX smoke test.m4b`:
 | loudness (5 sample points) | mean −19…−22 dB, peaks ≈ −5 dB — consistent with the −18 LUFS mix target |
 | exit code | 0 |
 
-**Human listening check still pending** — especially the word-split seams
-in long beats (F11) and overall MPS-fp16 render quality vs the CUDA path.
-30 seconds from each chapter is enough:
-`afplay "artifacts/test/alice/06_final/Alice - MLX smoke test.m4b"`.
+**Human listening check (2026-08-03): PASSED.** The user listened and
+judges the output **better to the ear than the CUDA/DramaBox renders**
+(informal cross-book comparison — this Alice build has no CUDA twin). No
+long-beat seam artifacts reported after the F12 re-render.
 
 ## Effective throughput (M4 Max, staged s4, final config)
 
@@ -503,9 +500,65 @@ in long beats (F11) and overall MPS-fp16 render quality vs the CUDA path.
   dtype treatment routed via `DramaboxClient` kwargs.
 - §11.3's dtype table needs updating (fp16 blanket rule is wrong — see F10).
 
-## Phase 4 — mix & verify
+## Listening verdict & CUDA backport candidates (2026-08-03)
 
-*pending*
+The user finds the Mac render **better to the ear** than prior CUDA
+renders. The MPS path differs from CUDA in ways that plausibly explain it,
+ranked by suspected audible impact:
+
+1. **Shorter render chunks** (F11: ≤22 s cap / 18 s target vs CUDA's
+   ~30 s beats). README already documents that shorter beats lower
+   DramaBox's noise floor and slurring — likely the dominant factor.
+2. **Unquantized bf16 Gemma prompt-encoder** (F8/F10) vs bnb-4bit on
+   CUDA — full-precision conditioning should improve direction-following
+   and prosody. The staged path makes this portable: the `ctx` phase loads
+   ONLY the encoder, so ~24 GB bf16 fits a 32 GB 5090 where the monolithic
+   path could not.
+3. **fp32 vocoder decode** (F9) vs fp16 — subtle noise-floor gain, and
+   decode is cheap (~3 s/chunk), so near-free on CUDA.
+
+Confounds: informal cross-book comparison, different direction text
+(different LLM run). A blind A/B on one CUDA-rendered chapter — baseline
+vs +chunk-cap vs +bf16-encoder vs both — is the honest test before any
+CUDA default changes.
+
+**Cache warning for the A/B:** the s4 content cache key is
+(prompt, ref clip, model_version) — encoder precision/checkpoint and
+chunk policy are NOT in the key on the monolithic path. Variants must
+bump the key (or force re-render) or the A/B silently mixes old and new
+audio — the F12/F13 trap in a new coat.
+
+**Blind A/B rendered (2026-08-03, RTX 5090):** the overrides are now
+env flags on the staged path — `LNVOX_S4_ENCODER_PRECISION=bf16`
+(honored monolithically too), `LNVOX_S4_CHUNK_CAP=<s>`,
+`LNVOX_S4_DECODE_DTYPE=fp32` — and any active override appends a
+variant tag (e.g. `+enc-bf16+cap22+dec-fp32`) to the cache key, so the
+A/B could not reuse baseline renders (monolithic s4 refuses the
+staged-only flags rather than mis-keying). Test material: Oz ch. I
+(`novels/oz-blind`, 30 beats, one shared LLM pass): baseline = 30
+denoise chunks, 522.8 s; mac-quality = 44 chunks, 0 cache reuse,
+552.3 s, ~8 min render wall incl. the one-time 23 GB encoder fetch.
+Outputs anonymized as `artifacts/oz-blind/06_final/oz-blind-{red,blue}.m4b`
+(same embedded title); the mapping was coin-flipped and sealed unseen in
+`artifacts/oz-blind/blind_key.b64` — decode with `base64 -d` only after
+voting.
+
+**VERDICT (2026-08-03): the mac-quality config WON.** Blind vote: blue
+better, "did not hear any artifact contrary to red" — unsealed, blue =
+mac-quality (enc-bf16 + cap22 + dec-fp32), red = baseline. So the CUDA
+default render has audible artifacts on this material that the backported
+config removes. Caveats: n = 1 chapter / 1 listener, and the three
+changes were bundled — which one(s) kill the artifacts is untested
+(isolating = two more renders: cap-only and enc-only). Cost of the
+config on CUDA, measured: **~20% FASTER denoise** (218 s → 174 s —
+44 short chunks beat 30 long ones because DiT attention is quadratic
+in chunk length), ctx encode comparable (~12 s vs ~10 s), decode/mix
+unchanged; the only real costs are the one-time 23 GB encoder download
+(+~3 min first load) and the ctx phase's ~24 GB VRAM appetite (fine
+staged, risky monolithic). Recommended path: run the next full book
+with the three env flags set, and if it holds up, promote them to CUDA
+defaults via a deliberate MODEL_VERSION bump (not the variant tag) +
+update DESIGN §11.3/§2.6.
 
 ## Stale-doc call-outs
 

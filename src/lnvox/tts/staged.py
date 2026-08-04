@@ -41,6 +41,10 @@ from lnvox.tts.dramabox_client import (
     _DRAMABOX_ROOT,
     DramaboxClient,
     _ensure_path,
+    s4_chunk_cap,
+    s4_decode_dtype,
+    s4_encoder_precision,
+    s4_variant_tag,
 )
 
 PHASES = ("refs", "ctx", "denoise", "decode")
@@ -292,7 +296,15 @@ def build_plan(
     if device.startswith("mps"):
         params.max_chunk_duration = 22.0
         params.target_chunk_duration = 18.0
-    model_version = DramaboxClient.MODEL_VERSION
+    # Opt-in cap override (CUDA backport A/B — see s4_variant_tag). Wins over
+    # the MPS default when both apply.
+    chunk_cap = s4_chunk_cap()
+    if chunk_cap is not None:
+        params.max_chunk_duration = chunk_cap
+        params.target_chunk_duration = max(6.0, chunk_cap - 4.0)
+    # Any active override changes the rendered audio → it must re-key the
+    # content cache, or an A/B against default renders silently reuses them.
+    model_version = DramaboxClient.MODEL_VERSION + s4_variant_tag()
     speaker_to_clip = _build_speaker_to_clip_path(casting, voicebank, voicebank_root)
     if limit is not None:
         chapters = _slice_to_limit(chapters, limit)
@@ -350,17 +362,18 @@ def build_plan(
                         ]
                     else:
                         texts = [beat.prompt]
-                    if device.startswith("mps"):
+                    if device.startswith("mps") or chunk_cap is not None:
                         # text_chunker splits on sentence boundaries INSIDE
                         # the prompt's quoted body, and treats a fully
                         # parenthesized+quoted beat as one unit — so a long
                         # single utterance can come back whole, still over
                         # the cap. Over the cap means the DiT's (T, T) mask
                         # enters MPS's broken boolean-indexing zone (F11), a
-                        # hard failure. Force a word-boundary split as a last
-                        # resort, replicating the "(voice direction)" header
-                        # on every piece; the decode crossfade smooths the
-                        # mid-sentence seam.
+                        # hard failure — and with an explicit cap it means
+                        # the cap wasn't actually enforced. Force a
+                        # word-boundary split as a last resort, replicating
+                        # the "(voice direction)" header on every piece; the
+                        # decode crossfade smooths the mid-sentence seam.
                         texts = [
                             t2
                             for t in texts
@@ -621,6 +634,11 @@ def _phase_ctx(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -> No
     # uses bf16 via _knobs().
     if device.startswith("mps"):
         dtype = torch.bfloat16
+    # Opt-in unquantized encoder on CUDA (A/B backport of the Mac path's
+    # accidental upgrade — see s4_variant_tag). ctx is the only phase that
+    # loads the encoder, so the ~24 GB bf16 checkpoint gets the GPU alone.
+    if s4_encoder_precision() == "bf16":
+        bnb_4bit = False
     from lnvox.tts.dramabox_client import resolve_gemma_root
 
     encoder = PromptEncoder(
@@ -860,6 +878,8 @@ def _phase_decode(plan: StagedPlan, root: Path, cache_dir: Path, device: str) ->
         # phase in fp32 there instead of chasing the individual op. CUDA keeps
         # the _knobs() dtype.
         if device.startswith("mps"):
+            dtype = torch.float32
+        if s4_decode_dtype() == "fp32":
             dtype = torch.float32
         decoder = AudioDecoder(
             checkpoint_path=paths["audio_components"], dtype=dtype, device=dev, warm=True
