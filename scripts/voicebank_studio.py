@@ -85,8 +85,10 @@ except ImportError as e:  # pragma: no cover
         f"(import error: {e})"
     )
 
+from lnvox.llm.schemas import ChapterScenes, CharacterList
+from lnvox.series import find_prior_volumes
 from lnvox.voices import manifest as voice_manifest
-from lnvox.voices.matcher import descriptor_from_clip
+from lnvox.voices.matcher import PriorCastIndex, _norm_name, descriptor_from_clip
 from lnvox.voices.common_voice import (
     _AGE_MAP,
     _GENDER_MAP,
@@ -94,7 +96,7 @@ from lnvox.voices.common_voice import (
     _normalize_accent,
     build_speaker_clip,
 )
-from lnvox.voices.schema import BookCasting, VoiceClip
+from lnvox.voices.schema import BookCasting, CharacterCasting, VoiceClip
 
 OUTPUT_SR = 24000
 AGE_BANDS = ["teen", "young_adult", "adult", "elder"]
@@ -980,16 +982,27 @@ class ImportTab(QWidget):
 #  Casting tab — assign voicebank clips to characters in a 04_voice_assignments
 # --------------------------------------------------------------------------- #
 class CastingTab(QWidget):
-    CHAR_COLS = ["character", "target", "assigned clip", "ok?"]
+    CHAR_COLS = ["character", "#lines", "target", "assigned clip", "ok?", "inherited"]
     VB_COLS = ["id", "gender", "age", "accent"]
 
-    def __init__(self, store: VoicebankStore, player: AudioPlayer, casting_file: Path | None) -> None:
+    def __init__(
+        self,
+        store: VoicebankStore,
+        player: AudioPlayer,
+        casting_file: Path | None,
+        artifacts_dir: Path,
+    ) -> None:
         super().__init__()
         self.store = store
         self.player = player
+        self.artifacts_dir = artifacts_dir
         self.casting: BookCasting | None = None
         self.path: Path | None = None
         self.dirty = False
+        # Per-volume context, rebuilt on _load (see _load_volume_context):
+        self._line_counts: dict[str, int] | None = None  # None → no 02_scenes yet
+        self._chars_by_name: dict = {}  # canonical name → s1 Character
+        self._prior_indices: list[tuple[str, PriorCastIndex]] = []  # oldest → newest
 
         layout = QVBoxLayout(self)
 
@@ -1094,9 +1107,104 @@ class CastingTab(QWidget):
         self.path = path
         self.dirty = False
         self.file_label.setText(f"{path}  ·  {self.casting.book_id}")
+        self._load_volume_context(path.parent)
         self._refresh_chars()
-        self.status.setText(f"Loaded {len(self.casting.castings)} character(s).")
+        n_prior = len(self._prior_indices)
+        prior_note = f" · {n_prior} prior volume(s)" if n_prior else ""
+        self.status.setText(f"Loaded {len(self.casting.castings)} character(s){prior_note}.")
         self._update_buttons()
+
+    # -- per-volume context: line counts + prior-volume castings ------------ #
+    def _load_volume_context(self, vol_dir: Path) -> None:
+        self._line_counts = self._count_repliques(vol_dir)
+
+        # This volume's s1 cast: the only source of aliases + gender for the
+        # PriorCastIndex lookup (mirrors `lnvox voice cast`).
+        self._chars_by_name = {}
+        chars_file = vol_dir / "01_characters.json"
+        if chars_file.exists():
+            try:
+                chars = CharacterList.model_validate_json(
+                    chars_file.read_text(encoding="utf-8")
+                )
+                self._chars_by_name = {c.name: c for c in chars.characters}
+            except Exception:
+                pass
+
+        # One index PER prior volume (not folded) so the UI can say WHICH
+        # volume a voice was inherited from; _inherited_from scans newest
+        # first, matching the fold's newest-wins semantics.
+        self._prior_indices = []
+        try:
+            book_id = (
+                vol_dir.resolve().relative_to(self.artifacts_dir.resolve()).as_posix()
+            )
+        except ValueError:
+            return  # casting file lives outside artifacts/ — no series context
+        for prior_dir in find_prior_volumes(self.artifacts_dir, book_id):
+            assign = prior_dir / "04_voice_assignments.json"
+            if not assign.exists():
+                continue
+            try:
+                prior_casting = BookCasting.model_validate_json(
+                    assign.read_text(encoding="utf-8")
+                )
+            except Exception:
+                continue
+            prior_chars = []
+            prior_chars_file = prior_dir / "01_characters.json"
+            if prior_chars_file.exists():
+                try:
+                    prior_chars = CharacterList.model_validate_json(
+                        prior_chars_file.read_text(encoding="utf-8")
+                    ).characters
+                except Exception:
+                    pass
+            index = PriorCastIndex()
+            index.add_volume(prior_casting, prior_chars)
+            self._prior_indices.append((prior_dir.name, index))
+
+    @staticmethod
+    def _count_repliques(vol_dir: Path) -> dict[str, int] | None:
+        """Beat counts per normalized speaker from 02_scenes/ — dialogue beats
+        by speaker, narration beats to the Narrator. None when s2 hasn't run."""
+        scenes_dir = vol_dir / "02_scenes"
+        if not scenes_dir.is_dir():
+            return None
+        counts: dict[str, int] = defaultdict(int)
+        for chapter_file in sorted(scenes_dir.glob("*.json")):
+            try:
+                chapter = ChapterScenes.model_validate_json(
+                    chapter_file.read_text(encoding="utf-8")
+                )
+            except Exception:
+                continue
+            for scene in chapter.scenes:
+                for beat in scene.beats:
+                    if beat.type == "dialogue" and beat.speaker:
+                        counts[_norm_name(beat.speaker)] += 1
+                    elif beat.type == "narration":
+                        counts[_norm_name("Narrator")] += 1
+        return dict(counts)
+
+    def _lines_for(self, character_name: str) -> str:
+        if self._line_counts is None:
+            return "—"
+        return str(self._line_counts.get(_norm_name(character_name), 0))
+
+    def _inherited_from(self, cast: CharacterCasting) -> str | None:
+        """Leaf name of the newest prior volume whose assignment this entry
+        reuses, or None. Recomputed live so Studio re-casts update it."""
+        if not cast.assigned_clip_id:
+            return None
+        ch = self._chars_by_name.get(cast.character_name)
+        aliases = ch.aliases if ch else []
+        gender = ch.gender if ch else cast.target.gender
+        for vol_name, index in reversed(self._prior_indices):
+            prior = index.lookup(cast.character_name, aliases, gender)
+            if prior and prior.assigned_clip_id == cast.assigned_clip_id:
+                return vol_name
+        return None
 
     def _reload(self) -> None:
         if self.path and self._confirm_discard():
@@ -1163,14 +1271,20 @@ class CastingTab(QWidget):
         for r, cast in enumerate(self.casting.castings):
             clip = self._clip_by_id(cast.assigned_clip_id)
             ok = "✓" if clip else ("—" if not cast.assigned_clip_id else "missing!")
+            inherited = self._inherited_from(cast)
             values = [
                 cast.character_name,
+                self._lines_for(cast.character_name),
                 f"{cast.target.gender}/{cast.target.age_band}",
                 cast.assigned_clip_id or "(none)",
                 ok,
+                f"↩ {inherited}" if inherited else "—",
             ]
             for col, val in enumerate(values):
-                self.char_table.setItem(r, col, QTableWidgetItem(val))
+                item = QTableWidgetItem(val)
+                if col == self.CHAR_COLS.index("#lines"):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.char_table.setItem(r, col, item)
         self.char_table.resizeColumnsToContents()
         if 0 <= row < self.char_table.rowCount():
             self.char_table.selectRow(row)
@@ -1196,8 +1310,16 @@ class CastingTab(QWidget):
         t = cast.target
         kw = ", ".join(t.accent_keywords + t.timbre_keywords + t.manner_keywords) or "—"
         desc = f"\nDescriptor: {cast.voice_descriptor}" if cast.voice_descriptor else ""
+        extra = []
+        if self._line_counts is not None:
+            extra.append(f"{self._lines_for(cast.character_name)} line(s) in this volume")
+        inherited = self._inherited_from(cast)
+        if inherited:
+            extra.append(f"voice inherited from {inherited}")
+        extra_html = f"<br><i>{' · '.join(extra)}</i>" if extra else ""
         self.target_label.setText(
-            f"<b>{cast.character_name}</b> — target {t.gender}/{t.age_band}<br>keywords: {kw}{desc}"
+            f"<b>{cast.character_name}</b> — target {t.gender}/{t.age_band}"
+            f"<br>keywords: {kw}{desc}{extra_html}"
         )
         for rc in cast.ranked:
             mark = "★ " if rc.clip_id == cast.assigned_clip_id else ""
@@ -1655,7 +1777,13 @@ class TtsLabTab(QWidget):
 #  Main window
 # --------------------------------------------------------------------------- #
 class MainWindow(QWidget):
-    def __init__(self, store: VoicebankStore, cv_root: Path | None, casting_file: Path | None) -> None:
+    def __init__(
+        self,
+        store: VoicebankStore,
+        cv_root: Path | None,
+        casting_file: Path | None,
+        artifacts_dir: Path,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("ln-vox · Voicebank Studio")
         self.resize(1180, 700)
@@ -1663,7 +1791,7 @@ class MainWindow(QWidget):
 
         self.tabs = QTabWidget()
         self.vb_tab = VoicebankTab(store, self.player)
-        self.casting_tab = CastingTab(store, self.player, casting_file)
+        self.casting_tab = CastingTab(store, self.player, casting_file, artifacts_dir)
         self.import_tab = ImportTab(store, self.player, cv_root, on_change=self._on_voicebank_changed)
         self.tts_tab = TtsLabTab(store, self.player)
         self.vb_tab.on_change = self._on_voicebank_changed
@@ -1700,7 +1828,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     store = VoicebankStore(Path(args.voicebank).expanduser())
-    win = MainWindow(store, cv_root, casting_file)
+    win = MainWindow(store, cv_root, casting_file, Path(args.artifacts).expanduser())
     win.show()
     sys.exit(app.exec())
 
