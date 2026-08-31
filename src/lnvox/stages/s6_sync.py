@@ -523,17 +523,88 @@ def _parse_opf(
         return opf_dir, stem_to_href, spine_stems
 
 
+# Injected into every XHTML of the synced EPUB. Gutenberg's Ebookmaker output
+# sizes illustrations in absolute pixels (`<img style="width: 600px; …">`) and
+# ships no max-width rule, so on a phone the page scrolls sideways and chapter
+# headings — which in the illustrated editions ARE images — clip at the right
+# edge. Measured on the demo run: Oz had 327 pixel-sized elements, 146 of them
+# ≥300px, and 0 max-width rules; the three EPUBs that carry their own
+# responsive CSS were unaffected.
+#
+# `!important` is required: an inline `style` attribute otherwise wins over a
+# stylesheet rule. `height: auto` must come with it, or capping the width
+# against a fixed pixel height distorts every illustration.
+_RESPONSIVE_CSS = (
+    "img,svg{max-width:100%!important;height:auto!important}"
+    "table,pre{max-width:100%;overflow-x:auto}"
+    "body{overflow-wrap:break-word}"
+)
+_RESPONSIVE_MARKER = "lnvox-responsive"
+
+
+def _inject_responsive_css(xhtml_bytes: bytes) -> bytes | None:
+    """Add the viewport-containment style to one XHTML page.
+
+    Returns the new bytes, or None when the page needs no change (already
+    injected, or not parseable as a document with a head).
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(xhtml_bytes, "html.parser")
+    if soup.find("style", attrs={"data-lnvox": _RESPONSIVE_MARKER}):
+        return None
+    head = soup.find("head")
+    if head is None:
+        return None
+    tag = soup.new_tag("style", type="text/css")
+    tag["data-lnvox"] = _RESPONSIVE_MARKER
+    tag.string = _RESPONSIVE_CSS
+    head.append(tag)
+    return str(soup).encode("utf-8")
+
+
+# Below this share of matched beats actually present as spans, something went
+# wrong while writing rather than while matching (DESIGN.md §21.3). Healthy
+# books sit at 88-97%; the two that shipped broken were at 7% and 3%.
+_SPAN_COVERAGE_FLOOR = 0.75
+
+
+def _count_beat_spans(epub_path: Path) -> int:
+    """Unique `data-beat-id` values actually present in a written EPUB."""
+    found: set[str] = set()
+    with zipfile.ZipFile(epub_path, "r") as z:
+        for name in z.namelist():
+            if name.lower().endswith((".xhtml", ".html", ".htm")):
+                found.update(
+                    re.findall(rb'data-beat-id="([^"]+)"', z.read(name))
+                )
+    return len(found)
+
+
 def _write_modified_epub(
     orig_path: Path,
     modifications: dict[str, bytes],
     output_path: Path,
 ) -> None:
-    """Copy the EPUB, overlaying only the XHTML files we modified."""
+    """Copy the EPUB, overlaying the XHTML we modified.
+
+    Every XHTML page also gets the responsive-containment style, including
+    pages with no beats on them — a reader that scrolls sideways on the
+    illustration pages is just as broken as one that does it mid-chapter.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(orig_path, "r") as src, zipfile.ZipFile(
         output_path, "w"
     ) as dst:
         for item in src.infolist():
+            if item.filename.lower().endswith((".xhtml", ".html", ".htm")):
+                base = modifications.get(item.filename) or src.read(item.filename)
+                injected = _inject_responsive_css(base)
+                new_item = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                new_item.compress_type = item.compress_type
+                new_item.external_attr = item.external_attr
+                dst.writestr(new_item, injected if injected is not None else base)
+                continue
             if item.filename in modifications:
                 # Preserve the original ZipInfo's compression to keep
                 # mimetype STORED (uncompressed) per EPUB spec.
@@ -706,6 +777,16 @@ def run(
         "fuzzy": 0,
     }
 
+    # One soup per XHTML file, SHARED across chapters. A `--split-chapters`
+    # ingest (DESIGN.md §18) puts several chapters in one spine file, and each
+    # chapter used to re-read that file from the zip and overwrite
+    # `modifications[arcname]` — so only the last chapter's beat spans
+    # survived. Measured on the demo run: Oz kept 102 of 1396 spans, Flatland
+    # 23 of 687, while the one-chapter-per-file books were untouched. Chapters
+    # cover disjoint regions of a shared file, so accumulating wraps into one
+    # DOM is safe.
+    soup_cache: dict[str, BeautifulSoup] = {}
+
     with zipfile.ZipFile(epub_path, "r") as zf:
         for chapter_id, beats_in_order in chapter_beats.items():
             stems = chapter_stems.get(chapter_id, [])
@@ -740,8 +821,10 @@ def run(
                     )
                     continue
                 arcname = (opf_dir + "/" if opf_dir else "") + href
-                xhtml_bytes = zf.read(arcname)
-                soup = BeautifulSoup(xhtml_bytes, "html.parser")
+                soup = soup_cache.get(arcname)
+                if soup is None:
+                    soup = BeautifulSoup(zf.read(arcname), "html.parser")
+                    soup_cache[arcname] = soup
                 soup_for_arc[arcname] = soup
                 local_shadow, local_segments, local_images = _build_shadow(soup)
                 for seg in local_segments:
@@ -1062,6 +1145,29 @@ def run(
     safe_book_id = book_id.replace("/", "_")
     output_epub = output_dir / f"{safe_book_id}.epub"
     _write_modified_epub(epub_path, modifications, output_epub)
+
+    # Verify what actually landed in the EPUB, not just what matched. Stage 6's
+    # success metric is "beats matched", computed against the shadow text —
+    # both defects in DESIGN.md §21 happened AFTER matching, so the stage
+    # reported success while the reader had nothing to anchor to. Counting the
+    # written spans closes that gap.
+    written_spans = _count_beat_spans(output_epub)
+    if matched_beats:
+        ratio = written_spans / len(matched_beats)
+        progress(
+            f"Wrote {written_spans} beat span(s) into the EPUB "
+            f"({ratio:.0%} of matched beats)."
+        )
+        # A shortfall is normal: a match that overlaps no segment in a given
+        # page never wraps, and healthy books land at 88-97%. The failure this
+        # guards is STRUCTURAL — §21.1 shipped Oz at 7% and Flatland at 3% —
+        # so the threshold sits well below the normal band.
+        if ratio < _SPAN_COVERAGE_FLOOR:
+            progress(
+                f"  [WARN] only {written_spans} of {len(matched_beats)} matched "
+                f"beat(s) reached the EPUB. Reader auto-follow will not "
+                f"highlight the rest — see DESIGN.md §21.1."
+            )
 
     manifest = {
         "book_id": book_id,

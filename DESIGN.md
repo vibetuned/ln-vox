@@ -2271,3 +2271,65 @@ lowering `--min-semitones` is a judgment call, so it stays manual.
 Runs after Stage V (voice cast) and before Stage 3, where `02_scenes` already
 supplies co-occurrence and a casting change is still free. The launcher runs
 it in report-only mode by default; `--audit-cast fix` opts into repair.
+
+---
+
+## 21. Synced-EPUB output defects (reader-reported, 2026-08-31)
+
+Two bugs the pipeline could not see, because both are only visible in the
+reader. Stage 6 reported success in each case.
+
+### 21.1 Beat spans lost when chapters share a spine file
+
+`--split-chapters` (§18) puts several chapters in one XHTML. Stage 6 built its
+soup by re-reading that file from the zip **per chapter** and assigning
+`modifications[arcname]`, so each chapter overwrote the previous one's wraps
+and only the last survived:
+
+| Book | chapters | unique XHTML | spans kept | matched beats |
+|---|---|---|---|---|
+| Oz | 27 | 4 | 102 | 1396 |
+| Flatland | 28 | 2 | 23 | 687 |
+| Alice | 18 | 18 | 1056 | 1192 |
+| Fairy Dreams | 9 | 9 | 637 | 667 |
+
+The correlation is exact: only books whose chapters share a file were hit,
+which is why the one-chapter-per-file books hid it through the whole demo run.
+The manifest was always complete — the loss was purely in the EPUB — so
+auto-follow had timings for beats whose spans did not exist.
+
+Fix: one soup per XHTML, cached across chapters, so wraps accumulate into a
+single DOM. Chapters cover disjoint regions of a shared file, so accumulation
+is safe. Guarded by `tests/test_s6_split_chapters.py`, which fails on the old
+code.
+
+### 21.2 Horizontal overflow on fixed-pixel illustrations
+
+Gutenberg's Ebookmaker sizes images absolutely (`style="width: 600px"`) and
+ships no `max-width` rule. In the illustrated editions the chapter headings
+*are* images, so they clipped at the right edge and the page scrolled
+sideways. Measured: Oz had 327 pixel-sized elements (146 ≥ 300px) and 0
+max-width rules; Flatland, Fairy Dreams and Alice ship their own responsive
+CSS and were unaffected.
+
+Stage 6 now injects a containment style into **every** XHTML of the synced
+EPUB, including pages carrying no beats — an illustration page that scrolls
+sideways is as broken as a chapter that does:
+
+    img,svg{max-width:100%!important;height:auto!important}
+    table,pre{max-width:100%;overflow-x:auto}
+    body{overflow-wrap:break-word}
+
+`!important` is required because an inline `style` attribute otherwise wins.
+`height:auto` must accompany it, or capping width against a fixed pixel height
+distorts every illustration. Injection is idempotent (marked with
+`data-lnvox`), skips pages with no `<head>`, and leaves non-XHTML entries —
+including the STORED `mimetype` that must stay first — byte-identical.
+
+### 21.3 Why neither was caught
+
+Stage 6's success metric is *beats matched*, computed against the shadow text.
+Both bugs happen after matching: one when writing the DOM back, one in how a
+reader lays the result out. A span count taken from the written EPUB, compared
+against the manifest, would have caught 21.1 immediately — worth adding to the
+stage's own summary output.
