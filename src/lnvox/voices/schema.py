@@ -78,6 +78,15 @@ class CharacterCasting(BaseModel):
     # LLM to compose one — guarantees the descriptor stays consistent with
     # the assigned reference clip.
     voice_descriptor: str = ""
+    # Set by hand when an assignment is deliberate and must survive
+    # `lnvox voice audit --fix` (DESIGN.md §20.4). The audit still REPORTS a
+    # locked casting's collisions; it just won't reassign them. Flatland needs
+    # this: "The Square" is the narrator's own pseudonym, so sharing the
+    # narrator's clip is correct rather than a collision.
+    locked: bool = False
+    # Free-text provenance for a non-obvious assignment (why it was locked,
+    # or what the audit moved it away from).
+    audit_note: str = ""
 
 
 class BookCasting(BaseModel):

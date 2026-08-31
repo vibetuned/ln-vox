@@ -26,6 +26,7 @@ from lnvox.stages import (
     s6_sync,
     scenario_sync,
 )
+from lnvox.voices import audit as audit_mod
 from lnvox.voices import manifest as voice_manifest
 from lnvox.voices import matcher as voice_matcher
 from lnvox.voices.schema import BookCasting
@@ -146,6 +147,15 @@ def ingest_epub(
         "--no-render",
         help="Lecture mode: skip rasterizing code/tables to PNG (record HTML-only).",
     ),
+    split_chapters: bool = typer.Option(
+        False,
+        "--split-chapters",
+        help=(
+            "Cut a spine page into several chapters at its chapter markers "
+            "(headings, or Gutenberg `id=\"Chapter_XI\"` anchors). For EPUBs "
+            "that pack a whole book into a few XHTML files. DESIGN.md §18."
+        ),
+    ),
 ):
     """Stage 0a: Extract an EPUB into the novels/-folder layout.
 
@@ -180,6 +190,7 @@ def ingest_epub(
         mode=mode,
         classifier=classifier,
         render=not no_render,
+        split_chapters=split_chapters,
         llm=llm,
         progress=lambda m: console.print(f"[dim]{m}[/]"),
     )
@@ -1285,6 +1296,28 @@ def voice_seed_cv(
     ),
     target_seconds: float = typer.Option(12.0, help="Target ref clip length"),
     min_seconds: float = typer.Option(8.0, help="Drop speakers below this total duration"),
+    accent: Optional[list[str]] = typer.Option(
+        None,
+        "--accent",
+        help=(
+            "Keep only speakers with this accent code; repeat for several "
+            "(e.g. --accent us --accent england). Default: every accent."
+        ),
+    ),
+    rank_by_quality: bool = typer.Option(
+        False,
+        "--rank-by-quality",
+        help=(
+            "Select speakers by measured recording quality (bandwidth, SNR, "
+            "hum, hiss) instead of client_id order, with per-gender/age quotas. "
+            "Adds a probe pass. DESIGN.md §19."
+        ),
+    ),
+    max_candidates: Optional[int] = typer.Option(
+        None,
+        "--max-candidates",
+        help="--rank-by-quality: speakers to probe (default: max-speakers x 6).",
+    ),
 ):
     """Populate the voicebank from a locally-extracted Common Voice tarball.
 
@@ -1308,9 +1341,12 @@ def voice_seed_cv(
             max_speakers=max_speakers,
             target_seconds=target_seconds,
             min_seconds=min_seconds,
+            accents=accent or None,
+            rank_by_quality=rank_by_quality,
+            max_candidates=max_candidates,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )
-    except (RuntimeError, FileNotFoundError) as e:
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
         console.print(f"[red]{e}[/]")
         raise typer.Exit(1)
 
@@ -1323,6 +1359,106 @@ def voice_seed_cv(
     console.print(
         f"[green]✓[/] Voicebank now has {len(merged.clips)} clip(s) "
         f"({len(new_vb.clips)} from this run)"
+    )
+
+
+@voice_app.command(name="audit")
+def voice_audit(
+    book_id: str,
+    fix: bool = typer.Option(
+        False, "--fix", help="Reassign the lower-speaking side of each collision."
+    ),
+    min_semitones: float = typer.Option(
+        audit_mod.MIN_SEMITONES,
+        help="Flag scene-sharing pairs closer than this in pitch.",
+    ),
+    min_shared: int = typer.Option(
+        audit_mod.MIN_SHARED,
+        help="Ignore pairs with less shared-scene dialogue than this.",
+    ),
+):
+    """Check that characters who share scenes have distinguishable voices.
+
+    The matcher casts each character independently on demographics, so two
+    people who talk to each other can land on near-identical clips. Run this
+    after `voice cast` and before s3 — a casting change is free there, but
+    costs a re-render once s4 has run. See DESIGN.md §20.
+    """
+    from lnvox.voices.acoustics import load_acoustics
+
+    book_dir = _book_dir(book_id)
+    casting_path = book_dir / "04_voice_assignments.json"
+    if not casting_path.exists():
+        console.print(f"[red]No casting at {casting_path} — run `lnvox voice cast` first.[/]")
+        raise typer.Exit(1)
+
+    scene_dir = book_dir / "03_directed"
+    if not scene_dir.exists() or not any(scene_dir.glob("*.json")):
+        scene_dir = book_dir / "02_scenes"
+    if not scene_dir.exists() or not any(scene_dir.glob("*.json")):
+        console.print("[red]No 02_scenes/ or 03_directed/ — run s2 first.[/]")
+        raise typer.Exit(1)
+
+    casting = BookCasting.model_validate_json(
+        casting_path.read_text(encoding="utf-8")
+    )
+    vb_dir = _voicebank_dir()
+    voicebank = voice_manifest.load(vb_dir)
+    acoustics = load_acoustics(
+        vb_dir, voicebank.clips, progress=lambda m: console.print(f"[dim]{m}[/]")
+    )
+
+    beats, pairs = audit_mod.scene_cooccurrence(scene_dir)
+    collisions = audit_mod.find_collisions(
+        casting, acoustics, pairs,
+        min_semitones=min_semitones, min_shared=min_shared,
+    )
+
+    assigned = sum(1 for c in casting.castings if c.assigned_clip_id)
+    console.print(
+        f"[dim]{len(beats)} speaking character(s), {assigned}/{len(casting.castings)} "
+        f"with a reference clip, co-occurrence from {scene_dir.name}/[/]"
+    )
+    if not collisions:
+        console.print("[green]✓[/] No scene-sharing pair shares or nearly shares a voice.")
+        return
+
+    table = Table(title=f"Voice collisions ({len(collisions)})")
+    table.add_column("kind")
+    table.add_column("characters", overflow="fold")
+    table.add_column("shared", justify="right")
+    table.add_column("apart", justify="right")
+    for c in collisions:
+        table.add_row(
+            c.kind,
+            f"{c.a} ({beats.get(c.a, 0)}) + {c.b} ({beats.get(c.b, 0)})",
+            str(c.shared),
+            f"{c.semitones:.1f} st",
+        )
+    console.print(table)
+
+    if not fix:
+        console.print("[dim]Re-run with --fix to reassign the lower-speaking side.[/]")
+        raise typer.Exit(1)
+
+    applied, unfixed = audit_mod.repair_collisions(
+        casting, voicebank, acoustics, beats, pairs, collisions,
+        min_semitones=min_semitones, min_shared=min_shared,
+    )
+    if applied:
+        casting_path.write_text(casting.model_dump_json(indent=2), encoding="utf-8")
+        for r in applied:
+            console.print(
+                f"[green]✓[/] {r.character}: {r.old_clip_id} → {r.new_clip_id} "
+                f"({r.new_pitch:.0f} Hz)"
+            )
+    for c in unfixed:
+        console.print(
+            f"[yellow]![/] {c.a} + {c.b}: no separated clip available "
+            f"(locked, narrator, or bank exhausted) — recast by hand."
+        )
+    console.print(
+        "[dim]Re-run s3 (or the launcher) so voice profiles match the new casting.[/]"
     )
 
 

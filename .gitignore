@@ -33,6 +33,7 @@ cache/
 # Voicebank — large audio files (10s+ of audio per clip)
 voicebank/
 voicebank-fr/
+voicebank-demo/
 
 # Downloaded datasets — multi-GB, never commit
 data/

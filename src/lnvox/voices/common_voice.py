@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 from collections import defaultdict
+from collections.abc import Collection
 from pathlib import Path
 
 from lnvox.voices.schema import VoiceClip, Voicebank
@@ -77,6 +78,14 @@ _CV_ACCENT_NAME_TO_CODE: dict[str, str] = {
     "South Atlantic (Falkland Islands, Saint Helena)": "southatlandtic",
 }
 
+# Every accent code the seeder can emit: the mapped CV accents plus the two
+# synthetic buckets `_normalize_accent` falls back to. Used to reject typos in
+# `--accent` up front — an unknown code would otherwise filter every speaker
+# out and look like an empty corpus.
+KNOWN_ACCENT_CODES: frozenset[str] = frozenset(
+    set(_CV_ACCENT_NAME_TO_CODE.values()) | {"any", "other"}
+)
+
 
 def _normalize_accent(s: str | None) -> str:
     """Convert CV's `accents` column to a canonical accent code.
@@ -122,6 +131,122 @@ def _audio_libs():
             f"(import error: {e})"
         ) from e
     return np, sf, librosa
+
+
+# --- recording-quality probe (DESIGN.md §19) --------------------------------
+
+# Frames this far below peak are the digital silence `build_speaker_clip`
+# inserts between utterances, not room tone. Including them makes every clip
+# score 90+ dB SNR (speech measured against true zeros).
+_SILENCE_FLOOR_DB = -90.0
+
+
+def _db(x, np):
+    return 20 * np.log10(np.maximum(x, 1e-10))
+
+
+def probe_recording_quality(path) -> dict | None:
+    """Measure recording quality of one audio file (DESIGN.md §19.2).
+
+    Returns bandwidth / snr / rumble / hiss / clip, or ``None`` when the file
+    is unreadable or too short to say anything about. Cheap enough to run over
+    thousands of candidate speakers.
+    """
+    np, _sf, librosa = _audio_libs()
+    try:
+        y, sr = librosa.load(str(path), sr=None, mono=True)
+    except Exception:
+        return None
+    if y.size < sr * 1.5:
+        return None
+    y, _ = librosa.effects.trim(y, top_db=30)
+    if y.size < sr:
+        return None
+
+    peak = float(np.max(np.abs(y))) or 1e-9
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    frame_db = _db(
+        librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0][: S.shape[1]],
+        np,
+    ) - _db(peak, np)
+
+    real = frame_db > _SILENCE_FLOOR_DB
+    if real.sum() < 8:
+        return None
+    rr = frame_db[real]
+    floor = float(np.percentile(rr, 5))
+    snr = float(np.percentile(rr, 75)) - floor
+
+    loud = real & (frame_db > np.percentile(rr, 70))
+    spec = S[:, loud].mean(axis=1) if loud.any() else S.mean(axis=1)
+    sdb = _db(spec / (spec.max() or 1e-9), np)
+    above = np.where(sdb > -40)[0]
+    bandwidth = float(freqs[above[-1]]) if above.size else 0.0
+    rumble = float(spec[freqs < 80].sum() / (spec.sum() or 1e-9))
+
+    quiet = real & (frame_db < floor + 6)
+    if quiet.sum() >= 3:
+        qs = S[:, quiet].mean(axis=1)
+        hiss = float(qs[freqs > 4000].sum() / (qs.sum() or 1e-9))
+    else:
+        hiss = 0.0
+
+    return {
+        "bandwidth": bandwidth,
+        "snr": snr,
+        "rumble": rumble,
+        "hiss": hiss,
+        "clip": float(np.mean(np.abs(y) > 0.98 * peak)),
+    }
+
+
+def quality_score(m: dict) -> float:
+    """Composite recording-quality score; higher is better (DESIGN.md §19.2).
+
+    Blunt on purpose: bandwidth and SNR carry the decision, the rest are
+    penalties for defects that survive voice cloning.
+    """
+    score = min(m["bandwidth"], 11000.0) / 1000.0 * 3.0
+    score += min(m["snr"], 50.0) * 0.6
+    score -= min(m["rumble"], 0.3) * 60.0
+    score -= min(m["hiss"], 1.0) * 15.0
+    score -= min(m["clip"], 0.02) * 1500.0
+    return score
+
+
+def _bucket_quotas(
+    scored: list[dict], max_speakers: int
+) -> dict[tuple[str, str], int]:
+    """Per-(gender, age_band) intake, proportional to the pool with a floor.
+
+    Quality alone inherits Common Voice's male/young-adult skew, which starves
+    the rarer casting buckets (DESIGN.md §19.4).
+    """
+    pool: dict[tuple[str, str], int] = defaultdict(int)
+    for c in scored:
+        pool[(c["gender"], c["age_band"])] += 1
+    if not pool:
+        return {}
+
+    floor = max_speakers // 20
+    quotas = {b: min(floor, n) for b, n in pool.items()}
+    remaining = max_speakers - sum(quotas.values())
+    if remaining > 0:
+        headroom = {b: pool[b] - quotas[b] for b in pool}
+        total = sum(headroom.values()) or 1
+        for b in sorted(pool, key=lambda b: -headroom[b]):
+            take = min(headroom[b], round(remaining * headroom[b] / total))
+            quotas[b] += take
+    # Hand any rounding slack to whichever buckets still have candidates.
+    slack = max_speakers - sum(quotas.values())
+    for b in sorted(pool, key=lambda b: -(pool[b] - quotas[b])):
+        if slack <= 0:
+            break
+        take = min(slack, pool[b] - quotas[b])
+        quotas[b] += take
+        slack -= take
+    return quotas
 
 
 def build_speaker_clip(
@@ -251,6 +376,85 @@ def _detect_tsv(cv_root: Path, prefer: str) -> Path:
     )
 
 
+def _net_votes(row: dict) -> int:
+    return int(row.get("up_votes") or 0) - int(row.get("down_votes") or 0)
+
+
+def _rank_speakers_by_quality(
+    by_speaker: dict[str, list[dict]],
+    *,
+    clips_src: Path,
+    max_speakers: int,
+    max_candidates: int,
+    progress,
+) -> list[str]:
+    """Order speakers best-recording-first, subject to bucket quotas (§19.3).
+
+    Probes ONE utterance per candidate — the expensive full-clip build happens
+    afterwards, only for the winners. Speakers beyond the quotas are returned
+    as backfill so a speaker who later fails `min_seconds` doesn't shrink the
+    bank.
+    """
+    candidates = sorted(by_speaker)[:max_candidates]
+    progress(
+        f"Probing recording quality of {len(candidates):,} candidate speaker(s)…"
+    )
+
+    scored: list[dict] = []
+    for i, cid in enumerate(candidates):
+        rows = sorted(by_speaker[cid], key=_net_votes, reverse=True)
+        measured = None
+        for row in rows[:3]:  # first readable of the top-voted three
+            measured = probe_recording_quality(clips_src / row["path"])
+            if measured:
+                break
+        if not measured:
+            continue
+        first = rows[0]
+        scored.append({
+            "client_id": cid,
+            "gender": _GENDER_MAP[(first.get("gender") or "").strip()],
+            "age_band": _AGE_MAP[(first.get("age") or "").strip()],
+            "score": quality_score(measured),
+            **measured,
+        })
+        if (i + 1) % 250 == 0:
+            progress(f"  probed {i + 1:,}/{len(candidates):,} → {len(scored):,} scored")
+
+    if not scored:
+        raise RuntimeError(
+            "Quality ranking probed every candidate and could not read any "
+            "audio. Is the corpus `clips/` directory intact?"
+        )
+
+    quotas = _bucket_quotas(scored, max_speakers)
+    by_bucket: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for c in scored:
+        by_bucket[(c["gender"], c["age_band"])].append(c)
+
+    picked: list[dict] = []
+    for bucket, quota in quotas.items():
+        ranked = sorted(by_bucket[bucket], key=lambda c: -c["score"])
+        picked.extend(ranked[:quota])
+    picked.sort(key=lambda c: -c["score"])
+
+    if picked:
+        bw = sorted(c["bandwidth"] for c in picked)
+        snr = sorted(c["snr"] for c in picked)
+        mid = len(picked) // 2
+        progress(
+            f"Selected {len(picked):,} speaker(s) across {len(quotas)} bucket(s); "
+            f"median bandwidth {bw[mid] / 1000:.1f} kHz, median SNR {snr[mid]:.0f} dB"
+        )
+
+    chosen = {c["client_id"] for c in picked}
+    backfill = sorted(
+        (c for c in scored if c["client_id"] not in chosen),
+        key=lambda c: -c["score"],
+    )
+    return [c["client_id"] for c in picked] + [c["client_id"] for c in backfill]
+
+
 def seed_from_common_voice(
     voicebank_dir: Path,
     *,
@@ -260,6 +464,9 @@ def seed_from_common_voice(
     target_seconds: float = 12.0,
     min_seconds: float = 8.0,
     output_sr: int = 24000,
+    accents: Collection[str] | None = None,
+    rank_by_quality: bool = False,
+    max_candidates: int | None = None,
     progress=print,
 ) -> Voicebank:
     """Build a Voicebank from a locally-extracted Common Voice tarball.
@@ -272,8 +479,27 @@ def seed_from_common_voice(
         target_seconds: Stop concatenating once a speaker's clip hits this length.
         min_seconds: Drop speakers whose total clean speech falls below this.
         output_sr: Sample rate of the written mono WAV files.
+        accents: Restrict the bank to these accent codes (see
+            `KNOWN_ACCENT_CODES`), e.g. `{"us", "england"}` for a bank of
+            American and English speakers only. `None` keeps every accent.
+        rank_by_quality: Pick speakers by measured recording quality instead of
+            `client_id` order (DESIGN.md §19), with per-(gender, age_band)
+            quotas so casting buckets stay covered.
+        max_candidates: How many speakers to probe when ranking. Defaults to
+            `max_speakers * 6`.
         progress: Callable for status messages.
     """
+    wanted_accents: set[str] | None = None
+    if accents is not None:
+        wanted_accents = {a.strip().lower() for a in accents if a.strip()}
+        unknown = sorted(wanted_accents - KNOWN_ACCENT_CODES)
+        if unknown:
+            raise ValueError(
+                f"Unknown accent code(s): {', '.join(unknown)}. "
+                f"Known codes: {', '.join(sorted(KNOWN_ACCENT_CODES))}"
+            )
+        if not wanted_accents:
+            wanted_accents = None
     # Fail fast on missing voice deps before the long TSV scan.
     _audio_libs()
 
@@ -298,12 +524,20 @@ def seed_from_common_voice(
     by_speaker: dict[str, list[dict]] = defaultdict(list)
     total_rows = 0
     eligible_rows = 0
+    wrong_accent_rows = 0
     with tsv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
             total_rows += 1
             if not _eligible(row):
                 continue
+            if wanted_accents is not None:
+                accent = _normalize_accent(
+                    row.get("accents") or row.get("variant")
+                )
+                if accent not in wanted_accents:
+                    wrong_accent_rows += 1
+                    continue
             cid = row.get("client_id")
             if not cid:
                 continue
@@ -312,7 +546,18 @@ def seed_from_common_voice(
     progress(
         f"Scanned {total_rows:,} rows; "
         f"{eligible_rows:,} eligible across {len(by_speaker):,} speakers"
+        + (
+            f" (accent filter {'/'.join(sorted(wanted_accents))} "
+            f"dropped {wrong_accent_rows:,} row(s))"
+            if wanted_accents is not None
+            else ""
+        )
     )
+    if not by_speaker and wanted_accents is not None:
+        raise RuntimeError(
+            f"No eligible speaker matched accent(s) "
+            f"{'/'.join(sorted(wanted_accents))} in {tsv_path.name}."
+        )
 
     # ---------- pass 2: build a ref clip per speaker ----------
 
@@ -325,6 +570,14 @@ def seed_from_common_voice(
 
     # Iterate in a stable order so reruns produce the same selection.
     speaker_ids = sorted(by_speaker.keys())
+    if rank_by_quality:
+        speaker_ids = _rank_speakers_by_quality(
+            by_speaker,
+            clips_src=clips_src,
+            max_speakers=max_speakers,
+            max_candidates=max_candidates or max_speakers * 6,
+            progress=progress,
+        )
 
     def _count_missing() -> None:
         nonlocal skipped_missing

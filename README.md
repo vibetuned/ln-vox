@@ -266,6 +266,44 @@ On a roomy machine you can also bump `--max-model-len` higher:
     --narrator-clip cv_051e865815e5
 ```
 
+### Casting by hand (the `--stop-after-audit` loop)
+
+The matcher casts each character independently on demographics, so it can put
+two people who talk to each other on the same voice — and it declines to cast
+anyone Stage 1 left `gender: unknown` (talking animals, mostly), leaving them
+to render descriptor-only. Both are worth fixing by ear.
+
+Stop the pipeline at the one point where fixing is free:
+
+```bash
+./scripts/run_pipeline.sh novel-name/volume-01 \
+    --narrator-clip cv_… --stop-after-audit
+```
+
+That runs ingest → s1 → s2 → voice cast → **the casting audit (report only)**
+and stops. Nothing has been rendered, and s3 hasn't yet baked a voice
+descriptor per character from the casting — edit after s3 and the descriptor
+describes the old voice; edit after s4 and you pay a re-render.
+
+Fix what it reported, in the Studio's Casting tab:
+
+```bash
+LNVOX_VOICEBANK=voicebank uv run python scripts/voicebank_studio.py \
+    --casting artifacts/novel-name/volume-01/04_voice_assignments.json
+uv run lnvox voice audit novel-name/volume-01        # re-check by the numbers
+```
+
+Then re-run the same command **without** `--stop-after-audit` to continue.
+s1/s2 and the voice cast are all cached, so it resumes rather than repeats.
+
+Two things to know while casting:
+
+- Set `"locked": true` on an assignment you want `--audit-cast fix` to leave
+  alone — deliberate sharing (a narrator who is also a character) is otherwise
+  indistinguishable from a mistake.
+- The audit only flags pairs that **share scenes**. Two characters who never
+  speak together can sound identical without anyone noticing.
+
 ### Picking the narrator
 
 Run `lnvox voice list` after seeding to see the per-bucket distribution,
@@ -288,6 +326,7 @@ outputs.
 | 1 | `lnvox s1 novel-name/volume-01` | `00_text.jsonl` (+ prior `01_characters.json`) | `01_characters.json` |
 | 2 | `lnvox s2 novel-name/volume-01` | `00_text.jsonl` + `01_characters.json` | `02_scenes/*.json` |
 | V | `lnvox voice cast novel-name/volume-01 --narrator-clip cv_…` | `01_characters.json` + voicebank | `04_voice_assignments.json` |
+| A | `lnvox voice audit novel-name/volume-01 [--fix]` | `02_scenes/*.json` + `04_voice_assignments.json` | flags characters who share scenes but not distinguishable voices |
 | 3 | `lnvox s3 novel-name/volume-01 --regen-profiles` | `02_scenes/*.json` + `04_voice_assignments.json` | `03_directed/*.json` + `03_voice_profiles.json` |
 | 4 | `./scripts/s4_retry.sh novel-name/volume-01` | `03_directed/*.json` + `04_voice_assignments.json` | `05_audio/<ch>/*.wav` |
 | 5 | `lnvox s5 novel-name/volume-01 --title "…"` | `05_audio/<ch>/*.wav` | `06_final/<title>.m4b` |

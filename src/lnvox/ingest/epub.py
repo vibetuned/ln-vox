@@ -118,6 +118,88 @@ def _xhtml_to_text(xhtml_bytes: bytes) -> tuple[str, str]:
     return title, "\n\n".join(paragraphs)
 
 
+# Gutenberg's Ebookmaker marks a chapter start with a bare anchor
+# (`<a id="Chapter_XI"/>`) in illustrated editions whose chapter titles are
+# images and so carry no heading text at all. DESIGN.md §18.3.
+_CHAPTER_ANCHOR_RE = re.compile(r"^(?:chap|chapter)[_\-]?[0-9ivxlcdm]+$", re.I)
+_HEADING_TAGS = ("h1", "h2", "h3")
+
+
+def _is_chapter_marker(el) -> bool:
+    """True if `el` starts a chapter: a heading, or a Gutenberg chapter anchor."""
+    if el.name in _HEADING_TAGS:
+        return True
+    eid = el.get("id")
+    return bool(eid and _CHAPTER_ANCHOR_RE.match(eid.strip()))
+
+
+def _marker_title(el) -> str:
+    """Chapter title for a marker element.
+
+    Headings carry their own text. A bare anchor does not — fall back to the
+    alt/title of the image that renders the chapter head (the illustrated
+    case), then to a humanised form of the anchor id.
+    """
+    if el.name in _HEADING_TAGS:
+        text = el.get_text(" ", strip=True)
+        if text:
+            return text
+    img = el.find_next("img")
+    if img is not None:
+        alt = (img.get("alt") or img.get("title") or "").strip()
+        if alt:
+            return alt
+    return (el.get("id") or "").strip().replace("_", " ").strip()
+
+
+def _split_page_sections(
+    xhtml_bytes: bytes, stem: str
+) -> list[tuple[str, str, str]]:
+    """Cut one spine page into `(section_key, title, text)` chapters (§18.3).
+
+    A page holding fewer than two chapter markers is returned as a single
+    section, so the one-page-one-chapter default is reproduced exactly. Text
+    preceding the first marker opens the page's first chapter rather than
+    being dropped.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(xhtml_bytes, "html.parser")
+    markers = [el for el in soup.find_all(True) if _is_chapter_marker(el)]
+    if len(markers) < 2:
+        title, text = _xhtml_to_text(xhtml_bytes)
+        return [(stem, title, text)]
+
+    # Titles must be read before <img> elements are stripped — the anchor
+    # case resolves its title *through* the chapter-head image.
+    titles = [_marker_title(m) for m in markers]
+    for img in soup.find_all("img"):
+        img.decompose()
+
+    marker_index = {id(m): i for i, m in enumerate(markers)}
+    buckets: list[list[str]] = [[] for _ in markers]
+    preamble: list[str] = []
+    current = -1
+    for el in soup.find_all(True):
+        idx = marker_index.get(id(el))
+        if idx is not None:
+            current = idx
+            continue
+        if el.name != "p":
+            continue
+        text = el.get_text(" ", strip=True)
+        if text:
+            (preamble if current < 0 else buckets[current]).append(text)
+    if preamble:
+        buckets[0] = preamble + buckets[0]
+
+    sections: list[tuple[str, str, str]] = []
+    for i, (marker, title) in enumerate(zip(markers, titles)):
+        key = f"{stem}#{marker.get('id') or f'sec{i:03d}'}"
+        sections.append((key, title, "\n\n".join(buckets[i])))
+    return sections
+
+
 def _xhtml_to_blocks(
     xhtml_bytes: bytes,
     *,
@@ -223,6 +305,7 @@ def extract_epub(
     mode: str = "narration",
     classifier: str = "fallback",
     render: bool = True,
+    split_chapters: bool = False,
     llm=None,
     progress=print,
 ) -> EpubMeta:
@@ -233,6 +316,12 @@ def extract_epub(
     code/tables to PNG when the ``render`` extra is installed). ``llm`` is an
     optional ``LLMClient`` for the §13.2a fallback classifier; ``classifier``
     is ``"fallback"`` or ``"none"``.
+
+    ``split_chapters`` (DESIGN.md §18) cuts a spine page into several chapters
+    at its chapter markers — needed for Gutenberg Ebookmaker EPUBs that pack a
+    whole book into a handful of XHTML files. Off by default: it is a
+    heuristic, and re-chaptering an already-correct book would invalidate
+    every downstream artifact.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir = output_dir / "images"
@@ -436,17 +525,33 @@ def extract_epub(
                 text = "\n\n".join(paragraphs)
                 if not text.strip() and not blocks:
                     continue
-            else:
-                title, text = _xhtml_to_text(xhtml)
-                paragraphs, blocks = None, None
-                if not text.strip():
-                    continue
+                base = _chapter_base(stem)
+                if base not in chapter_groups:
+                    chapter_groups[base] = []
+                    chapter_order.append(base)
+                chapter_groups[base].append(
+                    (spine_idx, title, text, stem, paragraphs, blocks)
+                )
+                continue
 
-            base = _chapter_base(stem)
-            if base not in chapter_groups:
-                chapter_groups[base] = []
-                chapter_order.append(base)
-            chapter_groups[base].append((spine_idx, title, text, stem, paragraphs, blocks))
+            if split_chapters:
+                sections = _split_page_sections(xhtml, stem)
+            else:
+                page_title, page_text = _xhtml_to_text(xhtml)
+                sections = [(stem, page_title, page_text)]
+            # One section means the page was not split; keep the historical
+            # `_chapter_base` grouping so multi-part chapters still merge.
+            single = len(sections) == 1
+            for sec_key, sec_title, sec_text in sections:
+                if not sec_text.strip():
+                    continue
+                base = _chapter_base(stem) if single else sec_key
+                if base not in chapter_groups:
+                    chapter_groups[base] = []
+                    chapter_order.append(base)
+                chapter_groups[base].append(
+                    (spine_idx, sec_title, sec_text, sec_key, None, None)
+                )
 
     # 5. Write chapter .txt files in spine order.
     image_basename_to_rel = {Path(rel).name: rel for rel in meta.images}

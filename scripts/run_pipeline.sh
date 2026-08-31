@@ -15,6 +15,18 @@
 #     --narrator-clip <id>     Voicebank clip id for the Narrator. Optional when
 #                              a previous volume of the same series already has
 #                              one assigned — it'll be inherited automatically.
+#     --audit-cast <mode>      Check that characters sharing scenes got
+#                              distinguishable voices (DESIGN.md §20), after
+#                              voice cast and before s3: report (default),
+#                              fix (auto-reassign), or off. Honors
+#                              $LNVOX_AUDIT_CAST.
+#     --stop-after-audit       Stop right after the casting audit, before s3.
+#                              The point at which to fix a casting BY HAND:
+#                              collisions are known, s3 hasn't baked voice
+#                              descriptors from the casting yet, and nothing
+#                              has been rendered. Re-run without the flag to
+#                              continue. Implies report-only unless you also
+#                              pass --audit-cast fix.
 #     --book-title <title>     Final m4b title (default: book_id).
 #     --novels-root <path>     Where the chapter .txt files live (default: novels).
 #     --vllm-url <url>         Use an already-running LLM server at this URL
@@ -78,6 +90,8 @@ MODE="narration"
 SCENARIO_FILE=""
 NO_NORMALIZE=0
 NARRATOR_CLIP=""
+AUDIT_CAST="${LNVOX_AUDIT_CAST:-report}"
+STOP_AFTER_AUDIT=0
 BOOK_TITLE=""
 NOVELS_ROOT="novels"
 VLLM_URL=""
@@ -120,6 +134,8 @@ while [ $# -gt 0 ]; do
         --llm-backend)   LLM_BACKEND="$2";  shift 2 ;;
         --llm-model)     LLM_MODEL="$2";    shift 2 ;;
         --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
+        --audit-cast)    AUDIT_CAST="$2";   shift 2 ;;
+        --stop-after-audit) STOP_AFTER_AUDIT=1; shift ;;
         --skip-llm)      SKIP_LLM=1;        shift   ;;
         --skip-tts)      SKIP_TTS=1;        shift   ;;
         --staged-tts)    STAGED_TTS=1; STAGED_TTS_EXPLICIT=1; shift ;;
@@ -335,9 +351,23 @@ CAUSAL_CONV1D_VERSION="1.6.2.post1"
 install_mamba_kernel_wheels() {
     local abi="$1" arch="$2" pytag
     pytag="$(.venv/bin/python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
-    uv pip install --no-deps \
-        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${abi}cxx11abiTRUE-${pytag}-${pytag}-linux_${arch}.whl" \
-        "https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${abi}cxx11abiTRUE-${pytag}-${pytag}-linux_${arch}.whl"
+    local cc="https://github.com/Dao-AILab/causal-conv1d/releases/download/v${CAUSAL_CONV1D_VERSION}/causal_conv1d-${CAUSAL_CONV1D_VERSION}+${abi}cxx11abiTRUE-${pytag}-${pytag}-linux_${arch}.whl"
+    local ms="https://github.com/state-spaces/mamba/releases/download/v${MAMBA_SSM_VERSION}/mamba_ssm-${MAMBA_SSM_VERSION}+${abi}cxx11abiTRUE-${pytag}-${pytag}-linux_${arch}.whl"
+
+    # Serve from the uv cache FIRST. The LLM phase's `uv sync` prunes these
+    # wheels before every TTS phase, so this runs once per book — and uv
+    # revalidates a direct URL over the network even on a cache hit, so a
+    # GitHub hiccup fails an install it could have served from disk in
+    # milliseconds. Observed 2026-08-31: `error sending request for url
+    # (…causal-conv1d…)` left the venv without the kernels, and s4 then
+    # crashlooped through its entire retry budget on `No module named
+    # 'mamba_ssm'` with the GPU sitting idle.
+    if uv pip install --offline --no-deps "$cc" "$ms" 2>/dev/null; then
+        echo "    mamba kernel wheels installed from the uv cache (offline)"
+        return 0
+    fi
+    echo "    mamba kernel wheels not in cache — downloading…"
+    uv pip install --no-deps "$cc" "$ms"
 }
 
 # Install Dramabox's requirements.txt with platform-aware torch handling.
@@ -438,7 +468,12 @@ import sys, torch
 backend = sys.argv[1]
 if backend == "mps":
     sys.exit(0 if torch.backends.mps.is_available() else 1)
-sys.exit(0 if torch.cuda.is_available() else 1)
+if not torch.cuda.is_available():
+    sys.exit(1)
+# A failed kernel-wheel fetch is invisible to a torch.cuda probe: the venv
+# looks healthy, s4 starts, and every attempt dies on a missing module.
+import causal_conv1d_cuda, selective_scan_cuda  # noqa: F401
+sys.exit(0)
 PY
     then
         echo "" >&2
@@ -638,6 +673,37 @@ else
         run_step "$VC_HOOK" "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID" --narrator-clip "$NARRATOR_CLIP"
     else
         run_step "$VC_HOOK" "Stage V (voice cast)" uv run lnvox voice cast "$BOOK_ID"
+    fi
+
+    # Casting audit (DESIGN.md §20). Here, not later: 02_scenes already gives
+    # co-occurrence, and a casting change is free before s3 — after s4 it costs
+    # a re-render. Never fatal; a collision is a quality warning, not a broken
+    # pipeline, and `voice audit` exits non-zero purely to report findings.
+    if [ "$MODE" != "scenario" ] && [ "$AUDIT_CAST" != "off" ]; then
+        banner "Stage A: casting audit ($AUDIT_CAST)"
+        if [ "$AUDIT_CAST" = "fix" ]; then
+            uv run lnvox voice audit "$BOOK_ID" --fix || true
+        else
+            uv run lnvox voice audit "$BOOK_ID" || true
+        fi
+    fi
+
+    # Hand-casting checkpoint. Stopping HERE and not later is the whole point:
+    # s3 bakes a voice descriptor per character from the casting, so a casting
+    # edited after s3 leaves the descriptor describing the old voice, and one
+    # edited after s4 costs a re-render.
+    if [ "$STOP_AFTER_AUDIT" -eq 1 ]; then
+        stop_vllm
+        banner "Stopped after the casting audit (--stop-after-audit)"
+        echo "Casting:  $BOOK_ART/04_voice_assignments.json"
+        echo ""
+        echo "Fix it by hand, then re-run WITHOUT --stop-after-audit to continue:"
+        echo "  LNVOX_VOICEBANK=${LNVOX_VOICEBANK:-voicebank} uv run python scripts/voicebank_studio.py \\"
+        echo "      --casting $BOOK_ART/04_voice_assignments.json"
+        echo "  LNVOX_VOICEBANK=${LNVOX_VOICEBANK:-voicebank} uv run lnvox voice audit $BOOK_ID   # re-check"
+        echo ""
+        echo "Set \"locked\": true on an assignment you want --audit-cast fix to leave alone."
+        exit 0
     fi
 
     if [ "$MODE" = "narration" ]; then

@@ -145,6 +145,85 @@ def _is_generic_alias(name: str) -> bool:
     return not any(ch.isupper() for ch in name)
 
 
+# The narrator is a structural role, not a name in the prose — a first-person
+# novel never says "the narrator". Canonicalised to the exact spelling the
+# voice matcher special-cases (`character.name == "Narrator"`), so that
+# `--narrator-clip` actually reaches it instead of the narrator being cast as
+# an unrelated extra character. Exempt from the attestation check below for
+# the same reason: it is never literally in the text.
+NARRATOR_NAME = "Narrator"
+_NARRATOR_NAME_RE = re.compile(r"(?:the\s+)?narrator", re.I)
+
+_ATTEST_STOPWORDS = {
+    "the", "a", "an", "of", "and", "or", "to", "in", "my", "his", "her",
+    "their", "our",
+}
+_ATTEST_MIN_TOKEN = 4
+
+
+def _attested_in(text_lower: str, name: str, aliases) -> bool:
+    """Whether this character is actually named somewhere in the chapter.
+
+    Guards against the extractor copying a name out of its own few-shot
+    example — `characters_per_chapter.jinja` illustrates the alias field with
+    "Sir Patrick"/"Pat", and a chapter with no dialogue reliably produced a
+    "Sir Patrick" whose own description read "appears in the prompt's example
+    but not the provided text".
+
+    Matching is word-bounded: a bare substring test lets the short alias "Pat"
+    match inside "pattern" and the hallucination survives. A multi-word name
+    also passes if all of its content tokens appear ("The Four Sons" → "Four",
+    "Sons"), since the extractor legitimately composes descriptive names.
+    """
+    for cand in (name, *(aliases or [])):
+        c = _norm(cand)
+        if not c:
+            continue
+        if re.search(rf"\b{re.escape(c)}\b", text_lower):
+            return True
+        tokens = [
+            t for t in re.findall(r"[a-z']+", c)
+            if t not in _ATTEST_STOPWORDS and len(t) >= _ATTEST_MIN_TOKEN
+        ]
+        if tokens and all(
+            re.search(rf"\b{re.escape(t)}\b", text_lower) for t in tokens
+        ):
+            return True
+    return False
+
+
+def sanitize_character_list(cl: CharacterList, chapter_text: str) -> CharacterList:
+    """Drop extraction artifacts from one chapter's character list.
+
+    Three failure modes, all seen on real books:
+      - the model copies a character straight out of the prompt's example;
+      - a first-person POV is emitted as a character literally named "I"
+        (twice, with contradictory genders, on Flatland);
+      - the narrator arrives as "The Narrator" and misses the voice matcher's
+        exact-match narrator case.
+
+    Applied to freshly extracted AND cached per-chapter results, so a bank of
+    already-cached extractions is cleaned without re-calling the LLM. The
+    cache keeps the raw model output; sanitation happens on use.
+    """
+    text_lower = chapter_text.lower()
+    kept: list[Character] = []
+    seen: set[str] = set()
+    for c in cl.characters:
+        if _NARRATOR_NAME_RE.fullmatch(_norm(c.name)):
+            c = c.model_copy(update={"name": NARRATOR_NAME})
+        elif _norm(c.name) in _PRONOUNS:
+            continue
+        elif not _attested_in(text_lower, c.name, c.aliases):
+            continue
+        key = _norm(c.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(c)
+    return cl.model_copy(update={"characters": kept})
+
+
 def _digits(s: str) -> list[str]:
     """Runs of digits in a string, e.g. 'Knight 12' → ['12']."""
     return re.findall(r"\d+", s)
@@ -612,6 +691,7 @@ def run(
             cached_path.write_text(
                 result.model_dump_json(indent=2), encoding="utf-8"
             )
+        result = sanitize_character_list(result, ch.text)
         per_chapter.append(result)
         if on_chapter_done:
             on_chapter_done(ch, result)

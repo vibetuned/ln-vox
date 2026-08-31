@@ -645,6 +645,15 @@ def run(
         if chapter_id:
             chapter_stems[chapter_id] = ch.get("source_parts") or []
 
+    # A `--split-chapters` ingest (DESIGN.md §18) records source parts as
+    # `<stem>#<anchor>` because several chapters share one XHTML page. The OPF
+    # manifest is keyed on the stem alone, so drop the anchor here; the shadow
+    # is built from the whole page and the beat matcher narrows within it.
+    chapter_stems = {
+        cid: list(dict.fromkeys(st.split("#", 1)[0] for st in parts))
+        for cid, parts in chapter_stems.items()
+    }
+
     # Reverse map: XHTML stem → chapter_id (for spine-order image placement).
     stem_to_chapter: dict[str, str] = {}
     for cid, parts in chapter_stems.items():

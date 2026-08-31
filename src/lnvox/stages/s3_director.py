@@ -479,6 +479,69 @@ def direct_chapter(
     return ChapterDirected(chapter_id=chapter_scenes.chapter_id, scenes=directed)
 
 
+# Articles carried by a speaker tag but not by the cast entry (or the reverse):
+# s2 writes "The Square" for a character s1 canonicalised as "A SQUARE".
+_LEADING_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+", re.I)
+_SPEAKER_NARRATOR_RE = re.compile(r"(?:the\s+)?narrator", re.I)
+
+
+def _speaker_key(name: str) -> str:
+    return _LEADING_ARTICLE_RE.sub("", " ".join(name.lower().split())).strip()
+
+
+def build_speaker_index(cast: CharacterList) -> dict[str, str]:
+    """Lookup from any spelling of a speaker to its canonical cast name.
+
+    s2 tags dialogue with whatever the prose calls someone, which routinely
+    differs from the cast's canonical name by an article or by using an alias.
+    Those tags reach s4 as-is, and `_build_speaker_to_clip_path` has no entry
+    for them — so the beat renders with NO reference clip and the character
+    silently loses their cast voice mid-scene.
+    """
+    index: dict[str, str] = {}
+    for c in cast.characters:
+        for spelling in (c.name, *(c.aliases or [])):
+            key = _speaker_key(spelling)
+            # A canonical name always wins over an alias claiming the same key.
+            if key and (key not in index or spelling == c.name):
+                index[key] = c.name
+    return index
+
+
+def canonical_speaker(name: str | None, index: dict[str, str]) -> str | None:
+    """Resolve one s2 speaker tag onto a cast name, or `None` if unresolvable.
+
+    `None` (narration) passes through untouched — s3 assigns those the
+    Narrator downstream.
+    """
+    if not name:
+        return name
+    if _SPEAKER_NARRATOR_RE.fullmatch(" ".join(name.lower().split())):
+        return NARRATOR_NAME
+    return index.get(_speaker_key(name), name)
+
+
+def canonicalize_scene_speakers(
+    chapters_scenes: list[ChapterScenes], cast: CharacterList
+) -> tuple[int, dict[str, str]]:
+    """Rewrite every beat speaker in place onto its cast name. Returns
+    ``(changed_beat_count, {original: canonical})`` for logging."""
+    index = build_speaker_index(cast)
+    changed = 0
+    remapped: dict[str, str] = {}
+    for cs in chapters_scenes:
+        for scene in cs.scenes:
+            for beat in scene.beats:
+                original = beat.speaker
+                resolved = canonical_speaker(original, index)
+                if resolved != original:
+                    beat.speaker = resolved
+                    changed += 1
+                    if original:
+                        remapped[original] = resolved or ""
+    return changed, remapped
+
+
 def run(
     chapters_scenes: list[ChapterScenes],
     cast: CharacterList,
@@ -490,6 +553,15 @@ def run(
     on_chapter_done=None,
 ) -> list[ChapterDirected]:
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fold s2's free-text speaker tags onto cast names BEFORE profiles or
+    # directed beats are built, so a tag that differs only by an article or
+    # alias keeps its cast voice instead of rendering reference-free.
+    changed, remapped = canonicalize_scene_speakers(chapters_scenes, cast)
+    if changed:
+        sample = ", ".join(f"{k} → {v}" for k, v in list(remapped.items())[:5])
+        print(f"  [s3] canonicalised {changed} beat speaker(s): {sample}")
+
     profiles_path = output_dir / "03_voice_profiles.json"
     if profiles_path.exists():
         profiles = VoiceProfileList.model_validate_json(

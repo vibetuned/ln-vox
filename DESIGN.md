@@ -2034,3 +2034,240 @@ once; no per-command flags.
   is the tool for that (decision 2026-07-24).
 - **A rehearsal app/UI** — the sync file is the contract; consumers are
   out of scope (same stance as the ln-reader split).
+
+---
+
+## 18. Chapter splitting inside a spine page (`--split-chapters`)
+
+### 18.1 The problem
+
+Stage 0a assumes **one spine item ≈ one chapter** (§2, `_chapter_base`
+merges `chapter1_1` into `chapter1`). That holds for publisher EPUBs and for
+the Standard-Ebooks-style Gutenberg conversions, but not for Gutenberg's
+`Ebookmaker` output, which packs an entire book into a handful of XHTML
+files. Measured on the illustrated editions:
+
+| EPUB | spine XHTML | chapters ingested | largest chapter |
+|---|---|---|---|
+| Gutenberg #45506 (Flatland, illustrated) | 5 | 2 | 24,498 words |
+| Gutenberg #43936 (Oz, illustrated) | 7 | 4 | 17,811 words |
+| Gutenberg #52521 (Grimm) | 57 | 55 | fine as-is |
+| Gutenberg #76391 (Fairy Dreams) | 11 | 9 | fine as-is |
+
+A 24k-word "chapter" is not a correctness failure — s1/s2 chunk internally —
+but it destroys the two things the m4b and ln-reader are *for*: chapter
+markers and chapter-relative scrubbing. A 4.7 h audiobook with two markers is
+not navigable.
+
+### 18.2 Why not the TOC
+
+The obvious source of boundaries — `toc.ncx` / `nav.xhtml` fragment links
+into the spine page — is unreliable on exactly these files:
+
+- #43936 declares **4** TOC entries for a 24-chapter book.
+- #52521 and #76391 declare 40+ anchors on a single page, nearly all of them
+  *illustration* and *page-number* anchors, not chapters.
+
+Splitting on TOC anchors would under-split one book and shatter another. The
+TOC is descriptive of the reading order, not of chapter structure.
+
+### 18.3 The rule
+
+Split a spine page at **chapter-start markers**, defined as either:
+
+1. a heading element (`<h1>`–`<h3>`), or
+2. any element whose `id` matches `^(?:chap|chapter)[_\-]?[0-9ivxlcdm]+$`
+   (case-insensitive) — Gutenberg's `id="Chapter_XI"` convention, used by
+   illustrated editions whose chapter titles are *images* and therefore carry
+   no heading text at all.
+
+A page splits only when it holds **≥ 2** such markers; text before the first
+marker stays with the preceding section (or opens the page's first chapter).
+Each resulting section becomes its own chapter part, titled from the marker's
+text, falling back to the nearest preceding `<img alt=…>` (the illustrated
+case) and then to the anchor id.
+
+### 18.4 Opt-in, not automatic
+
+The flag is **off by default**. Auto-detection was rejected: the rule is a
+heuristic, and eight series already in `novels/` were ingested under the
+one-page-one-chapter assumption. A Standard Ebooks page with three `<h3>`
+subheadings would silently re-chapter a book that is already correct, and
+re-chaptering changes `00_text.jsonl` chapter ids — which invalidates every
+downstream artifact, including prior-volume voice continuity (§6). Opt-in
+keeps every existing book byte-identical.
+
+    lnvox ingest-epub <epub> <out> --split-chapters
+
+### 18.5 What it must not break
+
+- `.epub_meta.json` keeps a `source_parts` entry per chapter, now carrying
+  the anchor id alongside the XHTML stem (`43936-h-2#Chapter_XI`), so Stage 6
+  can still re-align a beat to the original markup.
+- Image extraction and `meta.images` ordering are untouched — they walk the
+  spine independently of chapter grouping.
+- Lecture mode is unaffected in this revision (its block classifier already
+  drops and restructures pages; splitting interacts with `visual_elements`
+  placement and is deferred until a non-fiction book actually needs it).
+
+---
+
+## 19. Quality-ranked voicebank seeding (`--rank-by-quality`)
+
+### 19.1 The problem
+
+`seed_from_common_voice` iterates `sorted(by_speaker)` and stops at
+`max_speakers`. The sort is over Common Voice `client_id` hashes, so the bank
+is an arbitrary — effectively random — slice of the eligible pool, and
+nothing in the selection looks at how the recording *sounds*. Measured on the
+400-speaker US+England bank seeded 2026-08-30, against 9,782 eligible
+speakers:
+
+| | count |
+|---|---|
+| effective bandwidth < 8 kHz (phone / heavily compressed capture) | 274 / 400 |
+| SNR < 30 dB against real room tone | 123 / 400 |
+| both wide-band (≥ 9 kHz) and clean (≥ 35 dB) | **52 / 400** |
+
+87% of the bank is material that clones muffled or noisy. This is not only a
+narrator problem: a 55-tale Grimm and a 24-chapter Oz cast dozens of
+supporting characters out of the same bank.
+
+Manifest metadata (`accent`, `gender`, `age_band`) says nothing about any of
+this, and neither does `duration_seconds` — ranking the bank by clip length
+produced a candidate set whose median quality rank was 182/400, where random
+is 200.
+
+### 19.2 What is measured
+
+Per candidate, on one representative utterance (highest net votes):
+
+- **Effective bandwidth** — highest FFT bin still within 40 dB of the
+  spectral peak, measured over *loud* frames only. Separates full-band
+  capture from 8 kHz phone/codec capture. The dominant term.
+- **SNR** — 75th-percentile frame level minus 5th-percentile, both in dB
+  relative to peak.
+- **Rumble** — energy below 80 Hz as a share of total (hum, handling noise).
+- **Hiss** — high-band share of the energy in *room-tone* frames.
+- **Clipping** — fraction of samples at ≥ 98% of peak.
+
+**Floor estimates must exclude digital silence.** `build_speaker_clip`
+joins utterances with 0.25 s of true zeros; measured naively, those frames
+become the "noise floor" and every clip scores 90+ dB SNR. Every percentile
+here is taken over frames more than 90 dB below peak only. This bit the
+first implementation and is the single easiest thing to get wrong.
+
+### 19.3 Two passes
+
+Building a reference clip is expensive (decode + trim + concatenate ~12 s of
+audio per speaker); probing one utterance is not. So:
+
+1. **Probe** up to `max_candidates` speakers (default `max_speakers × 6`),
+   decoding a single utterance each, and score it.
+2. **Build** full reference clips only for the winners.
+
+Cost scales with the probe, not the pool: ~2,500 probes ≈ 10 min, against
+~25 min to build 400 clips.
+
+### 19.4 Bucket quotas
+
+Ranking on quality alone would inherit — and sharpen — Common Voice's
+male/young-adult skew, because that majority also supplies most of the good
+recordings. The casting matcher selects on `(gender, age_band)`, so a bank
+with four clean female elders casts every witch, godmother and queen in
+Grimm to the same voice.
+
+Quota per bucket is therefore **proportional to the candidate pool, with a
+floor of `max_speakers // 20`** (5%, so 20 of 400) wherever the pool can fill
+it. Within each bucket, highest score wins. Buckets whose pool is smaller
+than the floor contribute everything they have.
+
+### 19.5 Opt-in
+
+Off by default: it changes which speakers a given `--max-speakers` selects,
+so an existing bank would silently re-populate and every casting made
+against it would drift. Existing banks are unaffected until re-seeded.
+
+    lnvox voice seed-cv <cv-root> --max-speakers 400 \
+        --accent us --accent england --rank-by-quality
+
+Scoring weights live in `quality_score()` and are deliberately blunt —
+bandwidth and SNR carry the decision. The score predicts *recording*
+quality, not whether someone reads like a narrator; picking among the clean
+survivors is still done by ear.
+
+---
+
+## 20. Casting audit (`lnvox voice audit`)
+
+### 20.1 The problem
+
+The voice matcher (§6) selects per character, on demographics: gender, age
+band, accent, timbre keywords. It never asks whether two characters who
+**talk to each other** ended up sounding the same. Nothing downstream asks
+either, so the first time anyone finds out is by listening to the finished
+m4b.
+
+Observed on the first demo run, all three found only by hand:
+
+| Book | Pair | Separation | Consequence |
+|---|---|---|---|
+| Flatland | Narrator / The Sphere | **0.6 semitones** | the book's central 88-beat dialogue in two indistinguishable voices |
+| Flatland | The Square / The Monarch | same clip | the Lineland two-hander in one voice |
+| Fairy Dreams | Brigitta / Fritzchen | 0.4 semitones | — |
+| Fairy Dreams | Father Franz / Fredrich von Rosenberg | 0.8 semitones | — |
+
+Flatland's two cost a re-render because they were caught after s4. Fairy
+Dreams' three were caught before s4 and cost nothing — which is the whole
+argument for making this a stage rather than a habit.
+
+### 20.2 What it measures
+
+Two characters are a problem when they **share scenes** and their voices are
+**not separable**:
+
+- **Co-occurrence weight** — for each scene, `min(beats_a, beats_b)` summed
+  over the book. This is deliberately not "appears in the same book": a pair
+  that never exchanges lines can share a voice harmlessly, and a book with 46
+  characters has far too many incidental pairs to look at.
+- **Separation** — absolute distance in semitones between the two assigned
+  clips' median f0. Identical clips are separation zero and always flagged.
+
+Pitch is a crude proxy for "sounds different" — it says nothing about timbre
+or delivery — but it is cheap, and it reliably catches the failure that
+actually matters: two same-gender, same-age-band clips landing within a
+semitone of each other.
+
+### 20.3 Acoustic index
+
+Clip metrics live in `<voicebank>/acoustics.json`, keyed by clip id, built
+lazily and incrementally: a bank seeded before this existed gets indexed on
+first audit, and re-seeding only pays for new clips. It is a cache, not a
+source of truth — deleting it costs one rebuild.
+
+### 20.4 Repair
+
+`--fix` reassigns the **lower-speaking** character of a flagged pair: the
+re-render is cheaper, and the dominant voice is the one the listener has
+already learned. A replacement must be unused in this book, match the
+original's gender and age band, clear `--min-semitones` against *every*
+scene partner of the character being moved (not just the one flagged), and
+meet a quality floor.
+
+Two things are never auto-recast:
+
+- **The Narrator**, whose clip is a deliberate `--narrator-clip` choice.
+- Any casting with **`locked: true`** — set by hand when an assignment is
+  intentional. Flatland needs this: "The Square" is the narrator's own
+  pseudonym, so sharing the narrator's clip is correct, and an unguarded
+  auto-fix would helpfully break it.
+
+When no candidate satisfies every constraint the pair is reported unfixed
+rather than being moved to something marginal. Widening the age band or
+lowering `--min-semitones` is a judgment call, so it stays manual.
+
+### 20.5 Placement
+
+Runs after Stage V (voice cast) and before Stage 3, where `02_scenes` already
+supplies co-occurrence and a casting change is still free. The launcher runs
+it in report-only mode by default; `--audit-cast fix` opts into repair.

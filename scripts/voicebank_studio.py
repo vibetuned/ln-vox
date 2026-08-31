@@ -16,15 +16,21 @@ Run it:
     uv pip install PySide6           # one-time; PySide6 is dev-only, not a project dep
     uv run python scripts/voicebank_studio.py
 
-Optional: point it at a different voicebank / corpus:
+The bank is selected exactly like the rest of the toolchain (DESIGN.md §17.5) —
+`$LNVOX_VOICEBANK`, defaulting to ./voicebank:
 
-    uv run python scripts/voicebank_studio.py --voicebank voicebank --cv-root <path-to>/en
+    LNVOX_VOICEBANK=voicebank-demo uv run python scripts/voicebank_studio.py
+
+An explicit flag still wins, for a one-off look at another bank / corpus:
+
+    uv run python scripts/voicebank_studio.py --voicebank voicebank-fr --cv-root <path-to>/fr
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import sys
 import tempfile
@@ -1812,7 +1818,11 @@ class MainWindow(QWidget):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ln-vox Voicebank Studio")
-    parser.add_argument("--voicebank", default=str(REPO_ROOT / "voicebank"), help="Voicebank directory")
+    parser.add_argument(
+        "--voicebank",
+        default=None,
+        help="Voicebank directory (default: $LNVOX_VOICEBANK, else ./voicebank)",
+    )
     parser.add_argument("--cv-root", default=None, help="Common Voice locale dir (has clips/ + *.tsv)")
     parser.add_argument("--data", default=str(REPO_ROOT / "data"), help="Where to auto-detect the CV corpus")
     parser.add_argument("--casting", default=None, help="A 04_voice_assignments.json to open in the Casting tab")
@@ -1821,13 +1831,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Same bank selection as the rest of the toolchain (DESIGN.md §17.5): the
+    # per-language / per-project bank is chosen once via env, not re-typed per
+    # command. An explicit --voicebank still wins, so a one-off inspection of
+    # another bank doesn't need the env var unset.
+    voicebank_dir = Path(
+        args.voicebank or os.environ.get("LNVOX_VOICEBANK") or (REPO_ROOT / "voicebank")
+    ).expanduser()
+    if not (voicebank_dir / "manifest.json").exists():
+        print(
+            f"WARNING: no manifest.json in {voicebank_dir} — "
+            f"the Studio will open on an empty bank.",
+            file=sys.stderr,
+        )
+
     cv_root = Path(args.cv_root).expanduser() if args.cv_root else autodetect_cv_root(Path(args.data))
     casting_file = (
         Path(args.casting).expanduser() if args.casting else autodetect_casting_file(Path(args.artifacts))
     )
 
     app = QApplication(sys.argv)
-    store = VoicebankStore(Path(args.voicebank).expanduser())
+    store = VoicebankStore(voicebank_dir)
     win = MainWindow(store, cv_root, casting_file, Path(args.artifacts).expanduser())
     win.show()
     sys.exit(app.exec())
