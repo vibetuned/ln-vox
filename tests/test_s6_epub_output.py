@@ -111,3 +111,22 @@ def test_modified_page_keeps_its_beat_spans_and_gains_the_style(tmp_path):
         got = z.read("a.xhtml")
     assert b'data-beat-id="s1_b0000"' in got     # the wrap survived
     assert _RESPONSIVE_MARKER.encode() in got    # and the style was added
+
+
+def test_mimetype_is_moved_first_when_the_source_has_it_later(tmp_path):
+    """Publisher EPUBs sometimes put `mimetype` mid-archive (Index v07-v09:
+    entry 21-26). The synced copy must not inherit that."""
+    src = tmp_path / "bad.epub"
+    with zipfile.ZipFile(src, "w") as z:
+        z.writestr("content.opf", "<package/>", compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("a.xhtml", PAGE)
+        z.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip",
+                   compress_type=zipfile.ZIP_DEFLATED)       # wrong place AND compressed
+    out = tmp_path / "out.epub"
+    _write_modified_epub(src, {}, out)
+    with zipfile.ZipFile(out) as z:
+        infos = z.infolist()
+        assert infos[0].filename == "mimetype"
+        assert infos[0].compress_type == zipfile.ZIP_STORED
+        assert [i.filename for i in infos].count("mimetype") == 1   # not duplicated
+        assert z.read("content.opf") == b"<package/>"

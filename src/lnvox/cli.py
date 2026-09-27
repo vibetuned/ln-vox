@@ -1032,65 +1032,17 @@ def stage5(
         f"Output: {final_dir}/{book_title}.m4b"
     )
 
-    # Auto-detect cover image from 00_book_meta.json if not passed.
-    cover_image: Optional[Path] = cover
-    if cover_image is None:
-        book_meta_path = out_dir / "00_book_meta.json"
-        if book_meta_path.exists():
-            import json as _json
-
-            book_meta = _json.loads(book_meta_path.read_text(encoding="utf-8"))
-            if book_meta.get("cover_image"):
-                cover_image = Path(book_meta["cover_image"])
-                if not cover_image.exists():
-                    console.print(
-                        f"[yellow]Cover image referenced by 00_book_meta.json "
-                        f"is missing: {cover_image} — skipping[/]"
-                    )
-                    cover_image = None
+    # Same resolution Stage 6 and `lnvox sample` use to align manifest images
+    # with embedded pictures — see s5_mix.resolve_book_images.
+    novel_dir = novels_root / book_id
+    cover_image, extra_images = s5_mix.resolve_book_images(
+        out_dir, novel_dir, cover=cover, images_dir=images_dir,
+        log=console.print,
+    )
     if cover_image is not None:
         console.print(f"[dim]Embedding cover: {cover_image}[/]")
-
-    # Resolve images directory: explicit flag wins, otherwise check
-    # <novels_root>/<book_id>/images/.
-    novel_dir = novels_root / book_id
-    resolved_images_dir = images_dir if images_dir else (novel_dir / "images")
-    extra_images: list[Path] = []
-    if resolved_images_dir.exists():
-        # Prefer the spine-ordered image list from `.epub_meta.json` when
-        # available — that's how a reader encounters the illustrations
-        # (`Insert1, Insert2, …, Insert10`) rather than alphabetical
-        # (`Insert1, Insert10, Insert2, …`) which is what a raw directory
-        # listing produces.
-        meta_path = novel_dir / ".epub_meta.json"
-        ordered_paths: list[Path] = []
-        if images_dir is None and meta_path.exists():
-            import json as _json
-
-            meta = _json.loads(meta_path.read_text(encoding="utf-8"))
-            for rel in meta.get("images", []) or []:
-                p = novel_dir / rel
-                if p.exists():
-                    ordered_paths.append(p)
-            if ordered_paths:
-                console.print(
-                    f"[dim]Using spine-ordered image list from {meta_path.name} "
-                    f"({len(ordered_paths)} image(s))[/]"
-                )
-        extra_images = ordered_paths or s5_mix.collect_images(resolved_images_dir)
-        if extra_images:
-            # If we have a `cover.*` in the images dir AND no --cover override,
-            # promote it to the cover slot so it's the primary attached_pic.
-            if cover_image is None:
-                covers = [p for p in extra_images if p.stem.lower() in ("cover", "front")]
-                if covers:
-                    cover_image = covers[0]
-                    extra_images = [p for p in extra_images if p != cover_image]
-                    console.print(f"[dim]Auto-promoted cover: {cover_image}[/]")
-            console.print(
-                f"[dim]Found {len(extra_images)} additional image(s) in {resolved_images_dir}[/]"
-            )
-
+    if extra_images:
+        console.print(f"[dim]Found {len(extra_images)} additional image(s)[/]")
     output_m4b = s5_mix.mix(
         chapters_audio=chapters_audio,
         chapter_titles=titles,
@@ -1167,6 +1119,7 @@ def sample_cmd(
     table.add_row("duration", f"{summary['seconds'] / 60:.1f} min")
     table.add_row("audio size", f"{size_mb:.1f} MB")
     table.add_row("beats", str(summary["beats"]))
+    table.add_row("embedded pictures", f"{summary['pictures']} (cover + {max(0, summary['pictures'] - 1)})")
     table.add_row("visual elements", str(summary["visual_elements"]))
     console.print(table)
 

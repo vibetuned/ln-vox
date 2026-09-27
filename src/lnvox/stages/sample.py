@@ -55,10 +55,11 @@ def score_pairs(
     images can still yield a window with one. Every candidate is therefore
     evaluated on its realised window.
 
-    Returns `(images, speakers, first, second)`, best first — eligible pairs
-    (>= _MIN_IMAGES) ranked by speaker count, then everything else by images.
-    Multi-voice dialogue is the headline feature, so it decides among pairs
-    that already clear the image bar rather than competing with it.
+    Returns `(images, speakers, first, second)`, best first: the pairs in the
+    highest image tier that anyone reaches (>= _MIN_IMAGES, else >= 1, else
+    all), ranked by speaker count. Multi-voice dialogue is the headline
+    feature, so it decides among pairs that already show the image viewer
+    rather than competing with it.
     """
     image_times = [
         float(v["trigger_seconds"])
@@ -78,11 +79,15 @@ def score_pairs(
         n_spk = len(speakers[a] | speakers[b])
         rated.append((n_img, n_spk, a, b))
 
-    eligible = [r for r in rated if r[0] >= _MIN_IMAGES]
-    if eligible:
-        eligible.sort(key=lambda r: (r[1], r[0]), reverse=True)
-        return eligible
-    rated.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    # Tiers, not a single sort: once a window shows the image viewer at all,
+    # more voices beat more pictures. Maximising images outright when nothing
+    # reached _MIN_IMAGES picked a Flatland window with 2 speakers over one
+    # with 6, for the sake of a second diagram.
+    for floor in (_MIN_IMAGES, 1, 0):
+        tier = [r for r in rated if r[0] >= floor]
+        if tier:
+            tier.sort(key=lambda r: (r[1], r[0]), reverse=True)
+            return tier
     return rated
 
 
@@ -155,22 +160,63 @@ def _ffmetadata(spans: list[ChapterSpan], window: tuple[float, float], title: st
     return "\n".join(lines) + "\n"
 
 
-def _slice_audio(src: Path, dst: Path, window: tuple[float, float], meta: Path) -> None:
-    """Cut the window out of the m4b without re-encoding.
+def select_pictures(
+    images: list[dict], window: tuple[float, float]
+) -> list[int]:
+    """Embedded-picture indices a sample carries: the cover, then every
+    picture whose playback time falls in the window, in embed order.
 
-    `-c copy` keeps the sample bit-identical to the shipped render — the point
-    is to show the real thing — and turns an hour of encoding into a second.
+    Index 0 is always kept because ln-reader treats the first embedded picture
+    as the cover, and `images` must stay aligned to what gets embedded.
     """
     start, end = window
+    keep = [0] if images else []
+    for k, im in enumerate(images[1:], start=1):
+        t = im.get("trigger_seconds")
+        if t is not None and start <= float(t) <= end:
+            keep.append(k)
+    return keep
+
+
+def _slice_audio(
+    src: Path,
+    dst: Path,
+    window: tuple[float, float],
+    meta: Path,
+    pictures: list[int],
+) -> None:
+    """Cut the window, then re-attach the cover and in-window pictures.
+
+    Two passes, both `-c copy` — no re-encode, so the sample is bit-identical
+    to the shipped render. It has to be two: an attached picture is a single
+    packet at pts 0, so ANY seek past 0 drops it. That is exactly how the first
+    samples shipped with no cover and no images. Pass 1 cuts the audio with an
+    exact output seek; pass 2 muxes it with pictures read from an unseeked copy
+    of the source.
+    """
+    start, end = window
+    audio_only = dst.with_suffix(".audio.m4a")
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(src), "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+        "-map", "0:a", "-c", "copy", str(audio_only),
+    ], check=True)
+
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(src), "-i", str(meta),
-        "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
-        "-map", "0:a", "-map", "0:v?", "-map_metadata", "1",
-        "-c", "copy", "-disposition:v:0", "attached_pic",
-        str(dst),
+        "-i", str(audio_only), "-i", str(src), "-i", str(meta),
+        "-map", "0:a",
     ]
-    subprocess.run(cmd, check=True)
+    for k in pictures:
+        cmd += ["-map", f"1:v:{k}"]
+    cmd += ["-map_metadata", "2", "-map_chapters", "2", "-c", "copy"]
+    for out_idx in range(len(pictures)):
+        cmd += [f"-disposition:v:{out_idx}", "attached_pic"]
+    cmd.append(str(dst))
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        audio_only.unlink(missing_ok=True)
 
 
 def _spans_in_epub(epub_path: Path) -> set[str]:
@@ -192,6 +238,7 @@ def _rebase(
     manifest: dict,
     window: tuple[float, float],
     present_spans: set[str] | None = None,
+    pictures: list[int] | None = None,
 ) -> dict:
     """Keep only what falls inside the window, with timings rebased to zero.
 
@@ -222,9 +269,25 @@ def _rebase(
             if v.get(k) and v[k] not in kept_ids:
                 v[k] = None
         visuals.append(v)
+    images = []
+    for k in pictures or []:
+        im = dict(manifest["images"][k])
+        t = im.get("trigger_seconds")
+        # The cover (index 0) usually has no time; one outside the window is
+        # meaningless here. Either way None, which the reader places at 0.
+        im["trigger_seconds"] = (
+            round(float(t) - start, 3)
+            if t is not None and start <= float(t) <= end else None
+        )
+        for key in ("after_beat_id", "before_beat_id"):
+            if im.get(key) and im[key] not in kept_ids:
+                im[key] = None
+        images.append(im)
+
     return {
         **{k: v for k, v in manifest.items()
            if k not in ("beats", "visual_elements", "images")},
+        "images": images,
         "sample": {
             "window_start_seconds": round(start, 3),
             "window_end_seconds": round(end, 3),
@@ -247,15 +310,15 @@ It straddles a chapter boundary so every reader feature is exercisable:
 | Text-highlight auto-follow | Open the EPUB alongside the audio; the current beat highlights as it plays. |
 | Chapter-relative scrubbing | Two chapters are present — scrub within one, then across the boundary. |
 | Chapter transition | The boundary sits near the middle of the sample, at ~{boundary:.1f} min. |
-| Inline images | {n_images} illustration(s) trigger during playback. |
+| Image viewer | The cover plus {n_images} illustration(s) are embedded; each shows as a scrubber marker at its playback time. |
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `{audio_name}` | The audio slice — `-c copy` from the real render, no re-encode. |
+| `{audio_name}` | The audio slice plus the cover and in-window pictures — `-c copy` from the real render, no re-encode. |
 | `{epub_name}` | The **complete** synced EPUB (it is the small half). |
-| `sync_manifest.json` | {n_beats} beats + {n_images} visual elements, timings rebased so the sample starts at 0. |
+| `sync_manifest.json` | {n_beats} beats and one `images` entry per embedded picture (cover first), timings rebased so the sample starts at 0. |
 
 ## Chapters in this sample
 
@@ -327,11 +390,14 @@ def build(
 
     ffmeta = out_dir / "ffmetadata.txt"
     ffmeta.write_text(_ffmetadata(spans, window, book_title), encoding="utf-8")
-    _slice_audio(src_audio, out_dir / audio_name, window, ffmeta)
+    pictures = select_pictures(manifest.get("images") or [], window)
+    _slice_audio(src_audio, out_dir / audio_name, window, ffmeta, pictures)
     ffmeta.unlink()
     shutil.copy2(src_epub, out_dir / epub_name)
 
-    sample_manifest = _rebase(manifest, window, _spans_in_epub(src_epub))
+    sample_manifest = _rebase(
+        manifest, window, _spans_in_epub(src_epub), pictures
+    )
     sample_manifest["epub"] = epub_name
     (out_dir / "sync_manifest.json").write_text(
         json.dumps(sample_manifest, indent=1, ensure_ascii=False), encoding="utf-8"
@@ -345,7 +411,7 @@ def build(
     boundary = (spans[[s.chapter_id for s in spans].index(second)].start - start) / 60
     (out_dir / "README.md").write_text(_README.format(
         title=book_title, minutes=(end - start) / 60, boundary=boundary,
-        n_images=len(sample_manifest["visual_elements"]),
+        n_images=max(0, len(sample_manifest["images"]) - 1),
         n_beats=len(sample_manifest["beats"]),
         audio_name=audio_name, epub_name=epub_name,
         book_id=manifest.get("book_id", slug),
@@ -356,6 +422,7 @@ def build(
         "chapters": [s.chapter_id for s in in_window],
         "beats": len(sample_manifest["beats"]),
         "visual_elements": len(sample_manifest["visual_elements"]),
+        "pictures": len(sample_manifest["images"]),
         "seconds": round(end - start, 1),
         "audio": str(out_dir / audio_name),
     }

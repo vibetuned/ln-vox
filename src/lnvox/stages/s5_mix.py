@@ -183,6 +183,88 @@ def _build_ffmetadata(
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
+def resolve_book_images(
+    book_dir: Path,
+    novel_dir: Path,
+    *,
+    cover: Path | None = None,
+    images_dir: Path | None = None,
+    log=None,
+) -> tuple[Path | None, list[Path]]:
+    """`(cover_image, extra_images)` exactly as Stage 5 will embed them.
+
+    The single source of truth for which pictures an m4b carries and in what
+    order. ln-reader matches a sync-manifest image to an embedded picture by
+    POSITION (MP4's `covr` atom keeps no per-picture name), so Stage 6 and the
+    sample builder must reproduce this order exactly — they call this rather
+    than re-deriving it.
+    """
+    say = log or (lambda _m: None)
+
+    cover_image = cover
+    if cover_image is None:
+        book_meta_path = book_dir / "00_book_meta.json"
+        if book_meta_path.exists():
+            book_meta = json.loads(book_meta_path.read_text(encoding="utf-8"))
+            if book_meta.get("cover_image"):
+                cover_image = Path(book_meta["cover_image"])
+                if not cover_image.exists():
+                    say(
+                        f"[yellow]Cover image referenced by 00_book_meta.json "
+                        f"is missing: {cover_image} — skipping[/]"
+                    )
+                    cover_image = None
+
+    resolved_images_dir = images_dir if images_dir else (novel_dir / "images")
+    extra_images: list[Path] = []
+    if resolved_images_dir.exists():
+        # Prefer the spine-ordered list from `.epub_meta.json` — the order a
+        # reader meets the illustrations — over a directory listing, which
+        # sorts `Insert10` before `Insert2`.
+        meta_path = novel_dir / ".epub_meta.json"
+        ordered_paths: list[Path] = []
+        if images_dir is None and meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            for rel in meta.get("images", []) or []:
+                candidate = novel_dir / rel
+                if candidate.exists():
+                    ordered_paths.append(candidate)
+            if ordered_paths:
+                say(
+                    f"[dim]Using spine-ordered image list from {meta_path.name} "
+                    f"({len(ordered_paths)} image(s))[/]"
+                )
+        extra_images = ordered_paths or collect_images(resolved_images_dir)
+        if extra_images and cover_image is None:
+            covers = [q for q in extra_images if q.stem.lower() in ("cover", "front")]
+            if covers:
+                cover_image = covers[0]
+                extra_images = [q for q in extra_images if q != cover_image]
+                say(f"[dim]Auto-promoted cover: {cover_image}[/]")
+    return cover_image, extra_images
+
+
+def embedded_image_order(
+    cover_image: Path | None, images: list[Path] | None
+) -> list[Path]:
+    """The pictures `_encode_m4b` embeds, in stream order: cover first, then
+    the rest, deduplicated, missing files skipped. Mirrors its loop exactly."""
+    ordered: list[Path] = []
+    seen: set[Path] = set()
+    if cover_image and cover_image.exists():
+        ordered.append(cover_image)
+        seen.add(cover_image.resolve())
+    for img in images or []:
+        if not img.exists():
+            continue
+        rp = img.resolve()
+        if rp in seen:
+            continue
+        ordered.append(img)
+        seen.add(rp)
+    return ordered
+
+
 def collect_images(images_dir: Path) -> list[Path]:
     """Discover image files in `images_dir`, ordered with `cover.*` first.
 
@@ -218,21 +300,9 @@ def _encode_m4b(
     `cover_image` is a backward-compat alias for `images=[cover_image]`. If
     both are passed, `cover_image` is prepended to `images` (deduplicated).
     """
-    # Build the ordered image list. Cover first, then rest.
-    ordered: list[Path] = []
-    seen: set[Path] = set()
-    if cover_image and cover_image.exists():
-        rp = cover_image.resolve()
-        ordered.append(cover_image)
-        seen.add(rp)
-    for img in images or []:
-        if not img.exists():
-            continue
-        rp = img.resolve()
-        if rp in seen:
-            continue
-        ordered.append(img)
-        seen.add(rp)
+    # Cover first, then the rest — the order ln-reader indexes by (see
+    # embedded_image_order / resolve_book_images).
+    ordered = embedded_image_order(cover_image, images)
 
     cmd: list[str] = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",

@@ -221,6 +221,21 @@ def _nav_titles(zf, opf_dir: str, manifest: dict) -> dict[str, str]:
     return out
 
 
+def chapter_markers(soup) -> list:
+    """Chapter-start markers on a page, in document order (DESIGN.md §18.3)."""
+    return [el for el in soup.find_all(True) if _is_chapter_marker(el)]
+
+
+def section_key(stem: str, marker, index: int) -> str:
+    """The `source_parts` key for the section a marker opens.
+
+    Shared with Stage 6, which must map a picture on a page split into several
+    chapters back to the ONE chapter whose section holds it — so the key format
+    lives here, once, rather than being re-derived there.
+    """
+    return f"{stem}#{marker.get('id') or f'sec{index:03d}'}"
+
+
 def _split_page_sections(
     xhtml_bytes: bytes, stem: str
 ) -> list[tuple[str, str, str]]:
@@ -234,7 +249,7 @@ def _split_page_sections(
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(xhtml_bytes, "html.parser")
-    markers = [el for el in soup.find_all(True) if _is_chapter_marker(el)]
+    markers = chapter_markers(soup)
     if len(markers) < 2:
         title, text = _xhtml_to_text(xhtml_bytes)
         return [(stem, title, text)]
@@ -264,7 +279,7 @@ def _split_page_sections(
 
     sections: list[tuple[str, str, str]] = []
     for i, (marker, title) in enumerate(zip(markers, titles)):
-        key = f"{stem}#{marker.get('id') or f'sec{i:03d}'}"
+        key = section_key(stem, marker, i)
         sections.append((key, title, "\n\n".join(buckets[i])))
     return sections
 

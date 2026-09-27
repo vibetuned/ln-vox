@@ -125,6 +125,9 @@ class _ImageMark:
 
     shadow_pos: int
     src: str
+    # The <img> itself, so a picture on a page shared by several chapters can
+    # be attributed to the section that actually holds it (§23.2).
+    node: object = None
 
 
 def _build_shadow(
@@ -191,7 +194,7 @@ def _build_shadow(
                 or node.get("href")
                 or ""
             )
-            images.append(_ImageMark(shadow_pos=cursor, src=src))
+            images.append(_ImageMark(shadow_pos=cursor, src=src, node=node))
     return "".join(parts), segments, images
 
 
@@ -569,6 +572,100 @@ def _inject_responsive_css(xhtml_bytes: bytes) -> bytes | None:
 _SPAN_COVERAGE_FLOOR = 0.75
 
 
+def _image_owners(soup: BeautifulSoup, stem: str, key_to_chapter: dict[str, str]) -> dict[int, str]:
+    """`id(<img>) -> chapter_id` for a page that `--split-chapters` cut into
+    several chapters; empty for a page holding a single chapter (§23.2).
+
+    Each chapter used to claim every picture on its shared page, so Oz's 148
+    pictures surfaced as 1,453 "occurrences" — each copy snapped to the start
+    of whichever chapter happened to share the page. Ownership follows the
+    ingest split exactly (same markers, same keys): text before the first
+    marker opens the first section, and a section that produced no chapter
+    (a heading with no prose) hands its pictures to the chapter after it,
+    which is the one that heading introduces.
+    """
+    from lnvox.ingest.epub import chapter_markers, section_key
+
+    markers = chapter_markers(soup)
+    if len(markers) < 2:
+        return {}
+    owners_by_section = [
+        key_to_chapter.get(section_key(stem, m, i)) for i, m in enumerate(markers)
+    ]
+    if not any(owners_by_section):
+        return {}
+    following = None
+    for i in range(len(owners_by_section) - 1, -1, -1):
+        if owners_by_section[i] is None:
+            owners_by_section[i] = following
+        else:
+            following = owners_by_section[i]
+    preceding = None
+    for i, owner in enumerate(owners_by_section):
+        if owner is None:
+            owners_by_section[i] = preceding
+        else:
+            preceding = owner
+
+    index_of = {id(m): i for i, m in enumerate(markers)}
+    owners: dict[int, str] = {}
+    section = 0
+    for el in soup.find_all(True):
+        i = index_of.get(id(el))
+        if i is not None:
+            section = i
+            continue
+        if el.name in ("img", "image") and owners_by_section[section]:
+            owners[id(el)] = owners_by_section[section]
+    return owners
+
+
+def align_images_to_embeds(image_marks: list[dict], embedded: list[Path]) -> list[dict]:
+    """One manifest image per EMBEDDED m4b picture, in embed order (§23).
+
+    ln-reader pairs `images[i]` with the i-th embedded picture by position —
+    MP4's `covr` atom carries no per-picture name, so position is all there is.
+    Stage 6 used to write one entry per `<img>` occurrence in the EPUB while
+    Stage 5 embeds one picture per unique file, cover first, so the two never
+    lined up: 0 of 148 Oz markers showed the right picture, 0 of 45 in Alice.
+
+    Each picture takes its first occurrence that has a playback time. A picture
+    no beat ever reaches (typically the cover and front matter) still gets an
+    entry, with `trigger_seconds` None — dropping it would shift every later
+    picture by one, which is the bug this fixes. The per-occurrence list lives
+    on in `visual_elements`.
+    """
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    for mark in image_marks:
+        name = Path(str(mark.get("src") or "")).name
+        if name:
+            by_name[name].append(mark)
+
+    aligned: list[dict] = []
+    for pic in embedded:
+        marks = by_name.get(pic.name, [])
+        chosen = next(
+            (m for m in marks if m.get("trigger_seconds") is not None),
+            marks[0] if marks else None,
+        )
+        if chosen is None:
+            aligned.append({
+                "src": pic.name, "xhtml": None, "chapter_id": None,
+                "trigger_seconds": None,
+                "after_beat_id": None, "before_beat_id": None,
+            })
+        else:
+            aligned.append({
+                "src": chosen.get("src"),
+                "xhtml": chosen.get("xhtml"),
+                "chapter_id": chosen.get("chapter_id"),
+                "trigger_seconds": chosen.get("trigger_seconds"),
+                "after_beat_id": chosen.get("after_beat_id"),
+                "before_beat_id": chosen.get("before_beat_id"),
+            })
+    return aligned
+
+
 def _count_beat_spans(epub_path: Path) -> int:
     """Unique `data-beat-id` values actually present in a written EPUB."""
     found: set[str] = set()
@@ -596,7 +693,19 @@ def _write_modified_epub(
     with zipfile.ZipFile(orig_path, "r") as src, zipfile.ZipFile(
         output_path, "w"
     ) as dst:
+        # EPUB OCF: `mimetype` must be the FIRST entry and stored uncompressed.
+        # Some publisher EPUBs get this wrong (Index v07-v09 carry it at entry
+        # 21-26) and copying entries in source order passed the defect on.
+        # ln-reader unzips everything and doesn't care, but stricter readers
+        # and epubcheck reject the file, so write it first regardless.
+        names = src.namelist()
+        if "mimetype" in names:
+            mt = zipfile.ZipInfo("mimetype", date_time=src.getinfo("mimetype").date_time)
+            mt.compress_type = zipfile.ZIP_STORED
+            dst.writestr(mt, src.read("mimetype"))
         for item in src.infolist():
+            if item.filename == "mimetype":
+                continue
             if item.filename.lower().endswith((".xhtml", ".html", ".htm")):
                 base = modifications.get(item.filename) or src.read(item.filename)
                 injected = _inject_responsive_css(base)
@@ -720,6 +829,12 @@ def run(
     # `<stem>#<anchor>` because several chapters share one XHTML page. The OPF
     # manifest is keyed on the stem alone, so drop the anchor here; the shadow
     # is built from the whole page and the beat matcher narrows within it.
+    key_to_chapter = {
+        part: cid
+        for cid, parts in chapter_stems.items()
+        for part in parts
+        if "#" in part
+    }
     chapter_stems = {
         cid: list(dict.fromkeys(st.split("#", 1)[0] for st in parts))
         for cid, parts in chapter_stems.items()
@@ -786,6 +901,7 @@ def run(
     # cover disjoint regions of a shared file, so accumulating wraps into one
     # DOM is safe.
     soup_cache: dict[str, BeautifulSoup] = {}
+    owners_cache: dict[str, dict[int, str]] = {}
 
     with zipfile.ZipFile(epub_path, "r") as zf:
         for chapter_id, beats_in_order in chapter_beats.items():
@@ -832,7 +948,13 @@ def run(
                     seg.shadow_end += master_cursor
                     chapter_segments.append(seg)
                     arc_for_segments[id(seg.node)] = arcname
+                owners = owners_cache.get(arcname)
+                if owners is None:
+                    owners = _image_owners(soup, stem, key_to_chapter)
+                    owners_cache[arcname] = owners
                 for im in local_images:
+                    if owners and owners.get(id(im.node), chapter_id) != chapter_id:
+                        continue  # another chapter's section of this page
                     chapter_images.append(
                         (im.shadow_pos + master_cursor, im.src, arcname)
                     )
@@ -996,6 +1118,13 @@ def run(
                         if before_beat
                         else None
                     )
+                    # A tailpiece — after the chapter's last matched beat — has
+                    # no beat to precede, so show it as that beat ends. Left at
+                    # None, ln-reader places it at 0:00, i.e. the start of the
+                    # BOOK: 8 of Oz's chapter-end illustrations did exactly that
+                    # once §23.2 stopped them borrowing other chapters' times.
+                    if before_timing is None and after_beat:
+                        before_timing = timings.get(after_beat, (None, None))[1]
                     image_marks.append({
                         "src": src,
                         "xhtml": arcname,
@@ -1141,6 +1270,19 @@ def run(
     visual_elements = [{**im, "kind": im.get("kind", "image")} for im in image_marks]
     visual_elements += ingest_visual_elements
 
+    # Manifest images must mirror the m4b's embedded pictures one-for-one, in
+    # the order Stage 5 embeds them (see align_images_to_embeds).
+    from lnvox.stages.s5_mix import embedded_image_order, resolve_book_images
+
+    _cover, _extra = resolve_book_images(book_dir, novel_dir)
+    embedded = embedded_image_order(_cover, _extra)
+    aligned_images = align_images_to_embeds(image_marks, embedded)
+    timed = sum(1 for im in aligned_images if im["trigger_seconds"] is not None)
+    progress(
+        f"Aligned {len(aligned_images)} manifest image(s) to the m4b's embedded "
+        f"pictures ({timed} with a playback time)."
+    )
+
     # Write the modified EPUB.
     safe_book_id = book_id.replace("/", "_")
     output_epub = output_dir / f"{safe_book_id}.epub"
@@ -1183,7 +1325,7 @@ def run(
             "inter_scene_seconds": inter_scene_silence,
             "inter_chapter_seconds": inter_chapter_silence,
         },
-        "images": image_marks,
+        "images": aligned_images,
         "visual_elements": visual_elements,
         "beats": matched_beats,
     }

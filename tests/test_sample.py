@@ -77,7 +77,7 @@ def test_pairs_meeting_the_image_bar_are_ranked_by_speakers():
     assert (ranked[0][2], ranked[0][3]) == ("01", "02")
 
 
-def test_falls_back_to_most_images_when_none_clear_the_bar():
+def test_falls_back_to_pairs_with_any_image_when_none_clear_the_bar():
     beats = [_beat("b1", "01", 0, 10, "A"), _beat("b2", "02", 1800, 1810, "B"),
              _beat("b3", "03", 3600, 3610, "C")]
     ranked = score_pairs(_manifest(beats, [3550.0]), SPANS, 12.0)
@@ -145,3 +145,22 @@ def test_chapter_spans_derive_bounds_from_beats():
     spans = chapter_spans(man, {"01": "One", "02": "Two"})
     assert [(s.chapter_id, s.start, s.end) for s in spans] == [
         ("01", 5.0, 30.0), ("02", 40.0, 50.0)]
+
+
+def test_below_the_bar_voices_beat_a_second_picture():
+    """Flatland: no window reaches 3 images. One image with many voices is a
+    better demo than two images and a near-monologue."""
+    beats = [_beat("a1", "01", 0, 10, "A"),
+             _beat("b1", "02", 1800, 1810, "B"), _beat("b2", "02", 1820, 1830, "C"),
+             _beat("b3", "02", 1840, 1850, "D"), _beat("b4", "02", 1860, 1870, "E"),
+             _beat("c1", "03", 3600, 3610, "B")]
+    images = [1700.0, 1750.0,          # two pictures at 01|02 (voices A,B,C,D,E → 5)
+              3500.0]                  # one picture at 02|03 (voices B,C,D,E → 4)
+    ranked = score_pairs(_manifest(beats, images), SPANS, 12.0)
+    assert (ranked[0][2], ranked[0][3]) == ("01", "02")   # 5 voices, 2 images
+
+    images_one_each = [1700.0, 3500.0]
+    beats_many_at_23 = beats + [_beat(f"x{i}", "03", 3620 + i, 3621 + i, f"V{i}") for i in range(4)]
+    ranked = score_pairs(_manifest(beats_many_at_23, images_one_each), SPANS, 12.0)
+    assert ranked[0][0] >= 1                               # the viewer is shown
+    assert (ranked[0][2], ranked[0][3]) == ("02", "03")   # and voices decide

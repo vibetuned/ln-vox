@@ -2384,3 +2384,81 @@ demo books this picks, without any hand-tuning:
   of audio), and trimming it would mean rewriting the OPF spine and nav for no
   real saving. The reader shows the complete book; only the audio is a sample.
   Beats outside the window simply have no timing, which is what a sample is.
+
+---
+
+## 23. Embedded pictures and the manifest `images` contract
+
+### 23.1 The contract
+
+ln-reader (`ln-reader/DESIGN.md`, "images[]") pairs `sync_manifest.images[i]`
+with the **i-th picture in the m4b's `covr` atom** — by array position,
+because MP4 stores attached pictures without per-picture names. The first
+picture is the cover. Every scrubber marker in the image viewer is
+`images[i].trigger_seconds` pointing at embedded picture `i`.
+
+ln-vox never honoured it. Stage 5 embeds one picture per unique image file,
+cover first; Stage 6 wrote one entry per `<img>` **occurrence** in the EPUB,
+in walk order. Measured on the four demo books, before this change:
+
+| Book | embedded | manifest `images` | at the right position |
+|---|---|---|---|
+| Oz | 148 | 1,453 | 0 |
+| Alice | 45 | 45 | 0 |
+| Fairy Dreams | 19 | 19 | 0 |
+| Flatland | 12 | 200 | 0 |
+
+Even where the counts matched, the manifest did not start with the cover, so
+every marker showed the neighbouring picture. The demo samples then lost the
+pictures entirely (23.4), which is how it surfaced.
+
+### 23.2 Pictures on a shared page belong to one chapter
+
+`--split-chapters` (§18) puts many chapters in one XHTML, and each chapter
+claimed every picture on it — the same "chapter owns the whole file" mistake
+as §21.1. Each copy snapped to that chapter's first beat, which is why Oz's
+148 pictures appeared 1,453 times, most of them at the wrong chapter start.
+
+Each `<img>` is now attributed to the section that holds it, using the ingest
+split's own marker rule and key format (`chapter_markers` / `section_key` in
+`ingest/epub.py`, shared rather than re-derived): preamble joins the first
+section, and a heading-only section — no prose, so no chapter — hands its
+pictures to the chapter that heading introduces. Result: Oz 148 occurrences
+for 148 pictures, Flatland 12 for 12.
+
+### 23.3 Alignment
+
+- `s5_mix.resolve_book_images` + `embedded_image_order` are the single
+  definition of what an m4b embeds and in what order. Stage 5, Stage 6 and
+  `lnvox sample` all call them; verified against the existing renders stream
+  by stream (picture dimensions, then byte hashes of the `covr` payloads).
+- Stage 6 writes `images` as **exactly one entry per embedded picture**, in
+  that order, taking each picture's first timed occurrence. A picture no beat
+  reaches keeps its slot with `trigger_seconds: null` — dropping it would
+  shift every later picture by one. The per-occurrence list is unchanged in
+  `visual_elements`.
+- A **tailpiece** — after its chapter's last matched beat — used to get no
+  time, which the reader places at 0:00: the start of the *book*. It now
+  triggers as that last beat ends. Eight of Oz's chapter-end illustrations
+  and five of Fairy Dreams' were affected.
+
+After: every picture byte-identical at its position in all four books, and
+every picture timed except Alice's cover.
+
+### 23.4 Samples dropped every picture
+
+An attached picture is a single packet at pts 0. The sample cut used an
+output seek (`-ss` after `-i`), which discards everything before the cut —
+including all pictures, cover included. The cut is now two `-c copy` passes:
+an exact audio-only slice, then a mux of that audio with the chosen pictures
+read from an **unseeked** copy of the source. A sample embeds the cover plus
+the pictures whose playback time falls in its window, and its `images` array
+mirrors exactly those, in the same order.
+
+### 23.5 Choosing sample chapters once the data was right
+
+With the phantom duplicates gone, Flatland — 12 pictures in the whole book —
+has no 12-minute window holding three. The old fallback then maximised
+pictures outright and chose a two-voice window over the six-voice arrival of
+the Sphere. Selection is now tiered: pairs whose window has ≥ 3 pictures,
+else ≥ 1, else any — ranked by distinct voices within the tier.
