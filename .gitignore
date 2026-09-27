@@ -47,4 +47,6 @@ data/
 
 models/
 scenarios/
+# Source PDFs of scripts — same protected IP as scenarios/, never committed.
+pdf/
 logs/
