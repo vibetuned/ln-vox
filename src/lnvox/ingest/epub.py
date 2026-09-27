@@ -152,6 +152,75 @@ def _marker_title(el) -> str:
     return (el.get("id") or "").strip().replace("_", " ").strip()
 
 
+# A heading that is only a numeral is not a title. Standard Ebooks marks its
+# chapters `<h2>III</h2>` and puts the real name ("III: A Caucus-Race and a
+# Long Tale") in the nav only, so the m4b chapter markers and the reader's
+# chapter list both end up reading "III", "IV", "V".
+_BARE_NUMERAL_RE = re.compile(
+    r"^(?:chapter\s+)?(?:[0-9]+|[ivxlcdm]+)[.:)]?$", re.I
+)
+
+
+def _is_bare_numeral_title(title: str) -> bool:
+    return bool(_BARE_NUMERAL_RE.match(" ".join(title.split())))
+
+
+def _nav_titles(zf, opf_dir: str, manifest: dict) -> dict[str, str]:
+    """`xhtml stem -> title` from the EPUB's nav document or NCX.
+
+    Only used to rescue a chapter whose own heading is a bare numeral; a real
+    heading always wins, because the nav is often abbreviated.
+    """
+    from bs4 import BeautifulSoup
+
+    candidates = [
+        href for _iid, (href, mt, props) in manifest.items()
+        if "nav" in (props or "") or Path(href).name.lower() in ("toc.xhtml", "nav.xhtml")
+    ]
+    ncx = [
+        href for _iid, (href, mt, _p) in manifest.items()
+        if mt == "application/x-dtbncx+xml" or href.lower().endswith(".ncx")
+    ]
+    out: dict[str, str] = {}
+
+    for href in candidates:
+        try:
+            soup = BeautifulSoup(zf.read((opf_dir + "/" if opf_dir else "") + href), "html.parser")
+        except (KeyError, OSError):
+            continue
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(" ", strip=True)
+            raw = unquote(a["href"])
+            stem = Path(raw.split("#")[0]).stem
+            frag = raw.split("#", 1)[1] if "#" in raw else ""
+            if not text or not stem:
+                continue
+            if frag:
+                out.setdefault(f"{stem}#{frag}", text)
+            out.setdefault(stem, text)
+
+    if not out:
+        for href in ncx:
+            try:
+                root = ET.fromstring(zf.read((opf_dir + "/" if opf_dir else "") + href))
+            except (KeyError, OSError, ET.ParseError):
+                continue
+            for nav_point in root.iter():
+                if not nav_point.tag.endswith("navPoint"):
+                    continue
+                label = next(
+                    (e.text for e in nav_point.iter() if e.tag.endswith("text") and e.text),
+                    None,
+                )
+                content = next(
+                    (e for e in nav_point.iter() if e.tag.endswith("content")), None
+                )
+                if label and content is not None and content.get("src"):
+                    stem = Path(unquote(content.get("src")).split("#")[0]).stem
+                    out.setdefault(stem, label.strip())
+    return out
+
+
 def _split_page_sections(
     xhtml_bytes: bytes, stem: str
 ) -> list[tuple[str, str, str]]:
@@ -492,6 +561,8 @@ def extract_epub(
 
         meta.images = ordered_image_rels
 
+        nav_titles = _nav_titles(zf, opf_dir, manifest)
+
         # 4. Walk the spine, collecting chapter parts grouped by base name.
         # Each part tuple: (spine_idx, title, text, stem, paragraphs, blocks).
         # paragraphs/blocks are None in narration mode; populated in lecture.
@@ -567,12 +638,31 @@ def extract_epub(
                 "rasterize them)."
             )
 
+    stems_per_chapter: dict[str, int] = {}
+    for _base in chapter_order:
+        for _p in chapter_groups[_base]:
+            bare = str(_p[3]).split("#")[0]
+            stems_per_chapter[bare] = stems_per_chapter.get(bare, 0) + 1
+
     for i, base in enumerate(chapter_order, start=1):
         parts = chapter_groups[base]
         # Sort parts by spine index — handles weird manifest ordering.
         parts.sort(key=lambda p: p[0])
         # First non-empty title wins; fallback to humanised base.
         title = next((t for _, t, *_ in parts if t), base.replace("_", " ").title())
+        # Rescue a numeral-only heading from the nav (see _nav_titles). Only
+        # when the nav can name THIS chapter specifically: with
+        # --split-chapters many chapters share one XHTML, and a lookup by stem
+        # alone would hand all 23 of Oz's chapters the same nav entry.
+        if _is_bare_numeral_title(title):
+            for _sidx, _t, _txt, stem_key, *_rest in parts:
+                key = str(stem_key)
+                nav = nav_titles.get(key)                     # stem#anchor
+                if nav is None and stems_per_chapter[key.split("#")[0]] == 1:
+                    nav = nav_titles.get(key.split("#")[0])   # unshared stem
+                if nav and not _is_bare_numeral_title(nav):
+                    title = nav
+                    break
         chapter_id = f"{i:02d}"
 
         slug = _slugify(title)

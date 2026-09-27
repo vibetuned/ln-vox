@@ -1110,6 +1110,67 @@ def stage5(
     console.print(f"[green]✓[/] {output_m4b}")
 
 
+@app.command(name="sample")
+def sample_cmd(
+    book_id: str,
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Output dir (default: samples/<book>)."
+    ),
+    chapters: Optional[str] = typer.Option(
+        None, "--chapters",
+        help="Two consecutive chapter ids, e.g. '14,15'. Default: best-scoring pair.",
+    ),
+    minutes: float = typer.Option(12.0, help="Sample length, centred on the boundary."),
+    title: Optional[str] = typer.Option(None, "--title", help="Title for the sample."),
+    novels_root: Path = typer.Option(Path("novels"), "--novels-root"),
+):
+    """Cut a small, committable demo sample from a finished book.
+
+    Straddles a chapter boundary so auto-follow, chapter-relative scrubbing,
+    the chapter transition and inline images are all exercisable from a file
+    small enough to put in a public repo. See DESIGN.md §22.
+    """
+    from lnvox.stages import sample as sample_mod
+
+    book_dir = _book_dir(book_id)
+    novel_dir = novels_root / book_id
+    if not (novel_dir / ".epub_meta.json").exists():
+        console.print(f"[red]No .epub_meta.json under {novel_dir}.[/]")
+        raise typer.Exit(1)
+
+    pair: Optional[tuple[str, str]] = None
+    if chapters:
+        parts = [c.strip() for c in chapters.split(",") if c.strip()]
+        if len(parts) != 2:
+            console.print("[red]--chapters needs exactly two ids, e.g. '14,15'.[/]")
+            raise typer.Exit(2)
+        pair = (parts[0], parts[1])
+
+    out_dir = out or Path("samples") / book_id.replace("/", "_")
+    book_title = title or book_id
+
+    try:
+        summary = sample_mod.build(
+            book_dir, novel_dir, out_dir,
+            book_title=book_title, chapters=pair, minutes=minutes,
+            progress=lambda m: console.print(f"[dim]{m}[/]"),
+        )
+    except (FileNotFoundError, ValueError, KeyError) as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1)
+
+    size_mb = Path(summary["audio"]).stat().st_size / 1e6
+    table = Table(title=f"Sample → {out_dir}/")
+    table.add_column("field")
+    table.add_column("value")
+    table.add_row("chapters", ", ".join(summary["chapters"]))
+    table.add_row("duration", f"{summary['seconds'] / 60:.1f} min")
+    table.add_row("audio size", f"{size_mb:.1f} MB")
+    table.add_row("beats", str(summary["beats"]))
+    table.add_row("visual elements", str(summary["visual_elements"]))
+    console.print(table)
+
+
 @app.command(name="s6")
 def stage6(
     book_id: str,

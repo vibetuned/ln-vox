@@ -2333,3 +2333,54 @@ Both bugs happen after matching: one when writing the DOM back, one in how a
 reader lays the result out. A span count taken from the written EPUB, compared
 against the manifest, would have caught 21.1 immediately — worth adding to the
 stage's own summary output.
+
+---
+
+## 22. Demo samples (`lnvox sample`)
+
+### 22.1 Purpose
+
+A finished book is 150–220 MB of audio. To let someone try ln-reader from a
+public repo we need a slice small enough to commit that still exercises every
+reader feature: **text-highlight auto-follow**, **chapter-relative scrubbing**,
+**the chapter transition**, and **inline images**.
+
+### 22.2 What a sample must contain
+
+Those four features constrain the slice more than duration does:
+
+- Auto-follow needs beats whose `data-beat-id` spans exist in the EPUB, with
+  timings rebased so the sample's audio starts at 0.
+- Scrubbing *relative to a chapter* needs **two** chapters, not one.
+- The chapter-end transition needs the **boundary between them** inside the
+  window — not merely two chapters listed in the metadata.
+- Images need visual elements whose `trigger_seconds` fall in the window.
+
+So the window straddles a chapter boundary: the tail of one chapter and the
+head of the next. Taking two whole chapters would be correct but far too big —
+the best-scoring pairs run 22–63 minutes, and Oz's would be ~45 MB on its own.
+
+### 22.3 Choosing the chapters
+
+Scored per consecutive pair as `3 × distinct speakers + min(images, 40)`,
+which favours multi-voice dialogue while still rewarding illustration. On the
+demo books this picks, without any hand-tuning:
+
+| Book | Pair | Speakers | Images |
+|---|---|---|---|
+| Oz | XI + XII — Emerald City / Search for the Wicked Witch | 14 | 124 |
+| Alice | VI + VII — Pig and Pepper / **A Mad Tea-Party** | 15 | 6 |
+| Flatland | §14 + §15 — the Sphere's arrival | 6 | 16 |
+| Fairy Dreams | Under the Sea / The Castle on the Cliff | 14 | 6 |
+
+### 22.4 What ships, and what does not
+
+- **Audio** is `-c copy` sliced — no re-encode, so the sample is the real
+  render at full quality, and cutting costs a second rather than an hour.
+- **Chapter markers** are rewritten via ffmetadata, rebased to the slice.
+- **The manifest** keeps only beats and visual elements inside the window,
+  with every timestamp rebased.
+- **The EPUB ships whole.** It is the small half (0.4–11 MB against 150–220 MB
+  of audio), and trimming it would mean rewriting the OPF spine and nav for no
+  real saving. The reader shows the complete book; only the audio is a sample.
+  Beats outside the window simply have no timing, which is what a sample is.
