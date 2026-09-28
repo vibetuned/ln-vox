@@ -1,0 +1,19 @@
+/* ln-vox docs: a warm "stage-lighting" accent over Starlight's defaults. */
+:root {
+	--sl-color-accent-low: #3b1f0e;
+	--sl-color-accent: #d9771f;
+	--sl-color-accent-high: #fbd9b6;
+}
+:root[data-theme='light'] {
+	--sl-color-accent-low: #fde6cf;
+	--sl-color-accent: #b35c0f;
+	--sl-color-accent-high: #4a2508;
+}
+/* API headings name one symbol each: show it as code, without the inline-code box. */
+.sl-markdown-content :is(h2, h3, h4) code {
+	background: none;
+	border: none;
+	padding: 0;
+	font-size: 0.92em;
+	color: var(--sl-color-accent-high);
+}

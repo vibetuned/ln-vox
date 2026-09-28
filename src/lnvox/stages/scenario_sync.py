@@ -6,8 +6,9 @@ and emits per-scene sync files plus a whole-play one: for every script item a
 timed entry `{start, end, type, speaker, text, direction, emotion}`.
 
 Timing is DETERMINISTIC — the same cursor math s5 uses (beat durations from
-the manifests + the same pad values), never audio probing, so the sync file
-and the m4b agree by construction:
+the manifests + the same pad values, by default read back from s5's
+`06_final/<title>.timings.json`), never audio probing, so the sync file and
+the m4b agree by construction:
 - consecutive beats inside a staging-delimited run → intra pad;
 - a staging run between two dialogue runs → one inter-scene pad (the
   "staging pause"), shared by every staging item of the run;
@@ -273,15 +274,54 @@ def to_srt(play: PlaySync, *, min_display: float = 1.5) -> str:
 def run(
     book_dir: Path,
     *,
-    intra: float = 0.25,
-    staging_pause: float = 1.0,
-    inter_scene: float = SCENARIO_INTER_SCENE,
-    lead_in: float = SCENARIO_LEAD_IN,
+    intra: float | None = None,
+    staging_pause: float | None = None,
+    inter_scene: float | None = None,
+    lead_in: float | None = None,
+    mix_title: str | None = None,
     progress: Callable[[str], None] = print,
 ) -> PlaySync:
-    """Read artifacts, emit 07_sync/<scene>.json + play.json + play.srt."""
+    """Read artifacts, emit 07_sync/<scene>.json + play.json + play.srt.
+
+    Pads left None come from the Stage-5 mix recorded in
+    `06_final/<mix_title>.timings.json` (default: the newest), mapped
+    s5 intra → `intra`, s5 inter-scene → `staging_pause`, s5 inter-chapter →
+    `inter_scene`, s5 lead-in → `lead_in`; the play covers the scenes that
+    mix contains, in its order. With no sidecar the scenario pacing constants
+    apply (0.25 / 1.0 / SCENARIO_INTER_SCENE / SCENARIO_LEAD_IN — what the
+    launcher gives s5) and every script scene is emitted.
+    """
+    from lnvox.stages.s5_mix import load_mix_layout
+
     script = ScenarioScript.model_validate_json(
         (book_dir / "00_script.json").read_text(encoding="utf-8")
+    )
+    layout = load_mix_layout(book_dir / "06_final", mix_title)
+    if layout is None:
+        recorded = (0.25, 1.0, SCENARIO_INTER_SCENE, SCENARIO_LEAD_IN)
+    else:
+        if layout.audio_dir not in (None, "05_audio"):
+            raise ValueError(
+                f"{layout.m4b.name} was mixed from {layout.audio_dir}/ (VibeVoice "
+                "sessions), which has no per-line timing (DESIGN.md §17.4)."
+            )
+        recorded = (
+            layout.intra_silence,
+            layout.inter_scene_silence,
+            layout.inter_chapter_silence,
+            layout.lead_in_silence,
+        )
+        if layout.chapter_ids:
+            # Only the scenes that are in the m4b, in its order — an
+            # `lnvox s5 --chapters` mix starts its first scene at 0:00.
+            by_id = {s.scene_id: s for s in script.scenes}
+            script = script.model_copy(update={"scenes": [
+                by_id[cid] for cid in layout.chapter_ids if cid in by_id
+            ]})
+        progress(f"  following the mix in {layout.sidecar.name}")
+    intra, staging_pause, inter_scene, lead_in = (
+        r if v is None else v
+        for v, r in zip((intra, staging_pause, inter_scene, lead_in), recorded)
     )
     chapters: dict[str, ChapterDirected] = {}
     manifests: dict[str, ChapterAudio] = {}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Launch mlx_lm.server on Apple Silicon (M-series Mac) with an OpenAI-compatible
-# API on localhost:8000 — the same contract serve_vllm.sh provides on Linux,
-# so LLMClient runs unchanged. See DESIGN.md §11.2.
+# Launch mlx-lm's server (`mlx_lm server`) on Apple Silicon (M-series Mac)
+# with an OpenAI-compatible API on localhost:8000 — the same contract
+# serve_vllm.sh provides on Linux, so LLMClient runs unchanged. See
+# DESIGN.md §11.2.
 #
 # Default: mlx-community/gemma-4-12B-it-qat-4bit (~7 GB) — the MLX analog
 # of the pipeline-wide llama default (google/gemma-4-12B-it-qat-q4_0-gguf,
@@ -35,15 +36,13 @@ HOST="${LNVOX_LLM_HOST:-127.0.0.1}"
 # 0.2 default) so retries at least draw fresh samples.
 TEMP="${LNVOX_LLM_TEMP:-0.2}"
 
-# mlx_lm.server has no `--max-model-len` knob — the context window comes
-# from the model's own config. We still respect LNVOX_LLM_MAX_LEN by
-# exporting it for the lnvox client (which uses it to clamp output budgets
-# in LLMClient.budget_for).
-if [ -n "${LNVOX_LLM_MAX_LEN:-}" ]; then
-    export LNVOX_LLM_MAX_MODEL_LEN="$LNVOX_LLM_MAX_LEN"
-fi
+# mlx-lm's server has no `--max-model-len` knob — the context window comes
+# from the model's own config, so LNVOX_LLM_MAX_LEN is ignored here. The
+# lnvox client's budget clamp (LLMClient.budget_for) is set by the launcher,
+# which exports LNVOX_LLM_MAX_MODEL_LEN for --max-model-len: an export from
+# THIS script would only reach the server process, never the stages.
 
-echo "Starting mlx_lm.server: model=$MODEL  host=$HOST  port=$PORT  temp=$TEMP"
+echo "Starting mlx_lm server: model=$MODEL  host=$HOST  port=$PORT  temp=$TEMP"
 # `python -m mlx_lm.server` is deprecated since mlx-lm's CLI consolidation
 # (warns on ≥0.31); the supported form is the `mlx_lm server` subcommand.
 exec uv run --extra mlx python -m mlx_lm server \

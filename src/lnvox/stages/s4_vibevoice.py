@@ -262,7 +262,19 @@ def run(
     def _get_client():
         if not _holder:
             progress("Loading VibeVoice-Large (first load downloads ~18GB of weights)…")
-            _holder.append(client_factory())
+            client = client_factory()
+            # The keys were computed from `model_version` before any load; a
+            # client that renders a different recipe (e.g. a ddpm_steps
+            # override) would file its audio under — and reuse — the wrong
+            # keys. Clients without the attribute (test fakes) are trusted.
+            actual = getattr(client, "model_version", model_version)
+            if actual != model_version:
+                raise RuntimeError(
+                    f"VibeVoice client renders {actual!r} but the cache is keyed "
+                    f"for {model_version!r} — pass "
+                    "VibeVoiceClient.model_version_for(<ddpm_steps>) as model_version."
+                )
+            _holder.append(client)
         return _holder[0]
 
     results: list[ChapterAudio] = []

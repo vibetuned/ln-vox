@@ -115,12 +115,24 @@ def resolve_gemma_root(default_root: str, use_bnb_4bit: bool) -> str:
 #   LNVOX_S4_DECODE_DTYPE       fp32 (default) | auto = per-device knobs,
 #                               the old behavior (staged only)
 #
+# On MPS none of the three reverts can take effect (bnb4 → still bf16, F8/
+# F10; cap none → still 22 s, F11; decode auto → still fp32, F9); the
+# s4_effective_* helpers below are the single source of truth for what the
+# phases actually load, and the cache tag is built from them.
+#
 # Cache keys: s4_variant_tag() encodes deviations from the ORIGINAL v1
 # recipe, NOT from the current defaults — so the tag is stable across
 # default flips. Default staged runs are tagged +enc-bf16+cap22+dec-fp32
 # (byte-identical keys to renders made when these were opt-in flags),
 # old-recipe renders stay untagged, and MODEL_VERSION never needs a
 # compatibility bump.
+#
+# The tag describes the EFFECTIVE recipe on the render device, not the raw
+# env values, so every staged MPS run is tagged +enc-bf16+cap22+dec-fp32
+# (or +capN for an explicit cap). Keying the raw env would re-render
+# byte-identical audio under a new key — and file a Mac's 22 s-chunk render
+# under the key CUDA uses for real 45 s chunks. An empty value counts as
+# unset everywhere (a blank `export VAR=`).
 
 
 def s4_encoder_precision(staged: bool = True) -> str:
@@ -140,7 +152,16 @@ def s4_chunk_cap() -> float | None:
         return None
     if not val:
         return 22.0
-    return float(val)
+    try:
+        cap = float(val)
+    except ValueError:
+        cap = -1.0
+    if not cap > 0:
+        raise ValueError(
+            "LNVOX_S4_CHUNK_CAP must be a positive number of seconds or "
+            f"0/none/off (got {val!r})"
+        )
+    return cap
 
 
 def s4_decode_dtype() -> str | None:
@@ -156,18 +177,67 @@ def s4_decode_dtype() -> str | None:
     return val
 
 
-def s4_variant_tag(staged: bool = True) -> str:
-    """Cache-key suffix for the effective render recipe, relative to the
-    original v1 recipe (empty = v1). Stable across default changes."""
+# MPS chunk cap (MAC_TEST_REPORT.md F11): torch's boolean-index assignment
+# misbehaves on the DiT's (T, T) self-attention mask once T×T reaches ~2.6M
+# elements (beats ≳25 s): `bias[positive] = ...` inside DramaBox's
+# transformer_args raises "shape mismatch: value tensor of shape [N] cannot
+# be broadcast to indexing result of shape [M]" with N and M from the SAME
+# mask. We can't patch DramaBox (DESIGN.md §11.3), but chunking is planner
+# policy: 22 s ≈ 1.3M mask elements — 2× safety margin. A kernel bug is a
+# hard failure, not a preference, so LNVOX_S4_CHUNK_CAP=none can't lift it
+# on MPS; an explicit number still wins (the caller's risk).
+_MPS_CHUNK_CAP = 22.0
+
+
+def _is_mps(device: str) -> bool:
+    return device.startswith("mps")
+
+
+def s4_effective_encoder_precision(device: str, staged: bool = True) -> str:
+    """Encoder the render on `device` actually uses. Staged on MPS it is
+    always the unquantized bf16 encoder: bitsandbytes is CUDA-only (F8) and
+    fp16 Gemma is all-NaN there (F10), so a bnb4 request can't be honored.
+    (The monolithic path refuses MPS outright — see DramaboxClient.)"""
+    val = s4_encoder_precision(staged)  # validate the env even when overridden
+    if staged and _is_mps(device):
+        return "bf16"
+    return val
+
+
+def s4_effective_chunk_cap(device: str) -> float | None:
+    """Chunk cap the staged planner enforces on `device` (None = the
+    chunker's own 45 s, no word-split fallback)."""
+    cap = s4_chunk_cap()
+    if cap is None and _is_mps(device):
+        return _MPS_CHUNK_CAP
+    return cap
+
+
+def s4_effective_decode_dtype(device: str) -> str | None:
+    """Vocoder dtype override for `device` (None = per-device knobs). MPS
+    always decodes fp32: fp16 hits the float-vs-half conv clash (F9)."""
+    val = s4_decode_dtype()
+    if _is_mps(device):
+        return "fp32"
+    return val
+
+
+def s4_variant_tag(device: str, staged: bool = True) -> str:
+    """Cache-key suffix for the EFFECTIVE render recipe on `device`,
+    relative to the original v1 recipe (empty = v1). Stable across default
+    changes; `staged=False` covers only the encoder (the monolithic path has
+    no chunk-cap / decode-dtype knobs)."""
     parts = []
-    if s4_encoder_precision(staged) != "bnb4":
-        parts.append(f"enc-{s4_encoder_precision(staged)}")
+    enc = s4_effective_encoder_precision(device, staged)
+    if enc != "bnb4":
+        parts.append(f"enc-{enc}")
     if staged:
-        cap = s4_chunk_cap()
+        cap = s4_effective_chunk_cap(device)
         if cap is not None:
             parts.append(f"cap{cap:g}")
-        if s4_decode_dtype():
-            parts.append(f"dec-{s4_decode_dtype()}")
+        dec = s4_effective_decode_dtype(device)
+        if dec:
+            parts.append(f"dec-{dec}")
     return ("+" + "+".join(parts)) if parts else ""
 
 
@@ -186,20 +256,25 @@ class DramaboxClient:
     MODEL_VERSION = "dramabox-dit-v1-cfg2.5-stg1.5-dm1.1"
 
     def __init__(self, device: str = "cuda", **kwargs: Any) -> None:
+        # TTSServer builds every component with ONE dtype, and no single
+        # dtype works on MPS: the fp16 Gemma encoder returns all-NaN
+        # encodings — silent audio with exit code 0 (MAC_TEST_REPORT.md
+        # F10) — while bf16/fp16 vocoders hit a float-vs-half conv clash
+        # (F9). The fixes need a per-component dtype map, which only the
+        # staged path (and the Studio's StagedLabEngine) can apply. Refuse
+        # before any import/download rather than render silence.
+        if device.startswith("mps"):
+            raise RuntimeError(
+                "DramaboxClient (monolithic TTSServer) cannot render correctly on "
+                "MPS — no single dtype works there (MAC_TEST_REPORT.md F9/F10). "
+                "Use `lnvox s4 --staged` (the launcher default) for books, or "
+                "lnvox.tts.lab_engine.StagedLabEngine for single prompts."
+            )
         _ensure_path()
         _patch_torchaudio_save()
         from model_downloader import get_all_paths  # type: ignore[import-not-found]
         from inference_server import TTSServer  # type: ignore[import-not-found]
 
-        # MPS-specific defaults (DESIGN.md §11.3). bitsandbytes is CUDA-only,
-        # torch.compile is flaky on MPS for diffusion models, and bfloat16
-        # has materially worse MPS coverage than fp16. Use `setdefault` so a
-        # caller who explicitly passes one of these keeps that choice — only
-        # the unset knobs get the per-device default.
-        if device.startswith("mps"):
-            kwargs.setdefault("dtype", "fp16")
-            kwargs.setdefault("bnb_4bit", False)
-            kwargs.setdefault("compile_model", False)
         # staged=False: the monolithic path defaults to the quantized encoder
         # (bf16 + DiT + vocoder don't fit one process on a 32 GB card); an
         # explicit LNVOX_S4_ENCODER_PRECISION=bf16 is still honored.

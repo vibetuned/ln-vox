@@ -299,6 +299,57 @@ def test_render_chapter_manifest_and_cache():
         assert len(client3.calls) == 1
 
 
+# ---- model version (cache key) follows the DDPM step count ---------------------
+
+
+def test_model_version_includes_ddpm_steps():
+    from lnvox.tts.vibevoice_client import VibeVoiceClient
+
+    # Default key unchanged — existing default renders stay cached.
+    assert VibeVoiceClient.MODEL_VERSION == "vibevoice-large-cfg1.3-ddpm10-48k"
+    assert VibeVoiceClient.model_version_for() == VibeVoiceClient.MODEL_VERSION
+    assert VibeVoiceClient.model_version_for(10) == VibeVoiceClient.MODEL_VERSION
+    assert VibeVoiceClient.model_version_for(20) == "vibevoice-large-cfg1.3-ddpm20-48k"
+
+
+def test_run_refuses_client_rendering_another_recipe():
+    from lnvox.stages.s4_vibevoice import run
+    from lnvox.tts.vibevoice_client import VibeVoiceClient
+    from lnvox.voices.schema import BookCasting, CharacterCasting, VoiceClip, Voicebank, VoiceTarget
+
+    chapter = ChapterDirected(
+        chapter_id="01",
+        scenes=[_scene("01_s1", [_beat("Narrator", "It was morning.", "narration")])],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        _write_wav(tmp / "vb" / "clips" / "n.wav")
+        bank = Voicebank(clips=[VoiceClip(id="n", source="manual", clip_path="clips/n.wav",
+                                          duration_seconds=12.0, gender="female",
+                                          age_band="adult")])
+        casting = BookCasting(book_id="t", castings=[CharacterCasting(
+            character_name="Narrator", target=VoiceTarget(gender="female", age_band="adult"),
+            assigned_clip_id="n")])
+
+        def _run(client_version):
+            client = FakeClient()
+            client.model_version = client_version
+            run([chapter], casting, bank, tmp / "vb", tmp / "book" / "05_audio_v2",
+                tmp / "cache", client_factory=lambda: client,
+                model_version=VibeVoiceClient.MODEL_VERSION, progress=lambda _: None)
+            return client
+
+        # A 20-step client keyed with the default version would file its audio
+        # under (and later reuse) the 10-step keys.
+        try:
+            _run(VibeVoiceClient.model_version_for(20))
+            raise AssertionError("expected RuntimeError for a mismatched model version")
+        except RuntimeError as exc:
+            assert "ddpm20" in str(exc)
+        assert not (tmp / "cache").exists() or not any((tmp / "cache").iterdir())
+        assert len(_run(VibeVoiceClient.MODEL_VERSION).calls) == 1
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

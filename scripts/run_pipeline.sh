@@ -32,20 +32,29 @@
 #     --vllm-url <url>         Use an already-running LLM server at this URL
 #                              (skip auto start/stop). Flag name is historical;
 #                              applies to whichever backend you've selected.
+#                              Without it the server URL is $LNVOX_LLM__ENDPOINT,
+#                              else $LNVOX_LLM_ENDPOINT, else
+#                              http://localhost:${LNVOX_LLM_PORT:-8000}/v1.
 #     --llm-backend <name>     Which LLM server to launch: llama | vllm | mlx.
 #                              Default: llama (llama.cpp, every platform).
 #                              See DESIGN.md §14. Honors $LNVOX_LLM_BACKEND.
 #     --llm-model <id>         Model id for the selected backend (HF repo,
 #                              GGUF repo, or local path depending on backend).
+#                              Honors $LNVOX_LLM__MODEL / $LNVOX_LLM_MODEL.
 #                              Defaults: google/gemma-4-12B-it-qat-q4_0-gguf
 #                              (llama), google/gemma-4-E4B-it (vllm),
-#                              mlx-community/gemma-4-31B-it-qat-4bit (mlx).
-#     --max-model-len <N>      Override vLLM context window (default: model-dependent).
-#     --skip-llm               Skip s1..s3 + voice cast (assume already done).
+#                              mlx-community/gemma-4-12B-it-qat-4bit (mlx).
+#     --max-model-len <N>      LLM context window, for the serve script AND
+#                              the client's output budgets (default: the
+#                              serve script's; mlx-lm has no such knob).
+#     --skip-llm               Skip the LLM phase: ingest, s1..s3 + voice cast
+#                              (assume already done).
 #     --skip-tts               Skip s4 (assume already rendered).
 #     --staged-tts             Run s4 via the staged pipeline (DESIGN.md §15):
 #                              checkpointed single-model phases with built-in
-#                              crash resume. Honors $LNVOX_S4_STAGED=1.
+#                              crash resume. The DEFAULT ($LNVOX_S4_STAGED,
+#                              default 1); LNVOX_S4_STAGED=0 selects the
+#                              monolithic path under s4_retry.sh.
 #                              Dramabox-only.
 #     --tts-backend <name>     TTS engine for s4: dramabox (default, per-beat)
 #                              or vibevoice (multi-speaker sessions →
@@ -54,8 +63,20 @@
 #     --skip-mix               Skip s5 (skip the m4b assembly).
 #     --skip-sync              Skip s6 (skip the synced-EPUB / sync_manifest).
 #     --epub <path>            Source EPUB for s6 (default: epubs/<book_id>.epub).
-#     --max-retries N          Auto-retry budget for s4 (default 30).
+#     --max-retries N          Auto-retry budget for s4 under s4_retry.sh —
+#                              monolithic Dramabox / VibeVoice (default 30).
 #     --step-retries N         Auto-retry budget per non-TTS step (default 3).
+#     --prepare-env <phase>    Only prepare the venv for one phase — llm (per
+#                              --llm-backend), tts (Dramabox) or vibevoice —
+#                              then exit without running any stage. For
+#                              orchestrators that drive the stages one at a
+#                              time (comfyui/). The book id may be omitted.
+#
+# Artifacts live under $LNVOX_ARTIFACTS_DIR/<book_id>/ (default artifacts/),
+# the same root the lnvox CLI uses. The launcher reads the process
+# environment only, never .env: export settings rather than keeping them in
+# .env. (The LLM endpoint and model it resolves are exported to every stage,
+# so they override any .env value.)
 #
 # LLM lifecycle: by default the launcher picks an LLM backend, starts the
 # matching serve script in the background, waits for it to be ready, runs
@@ -96,7 +117,9 @@ BOOK_TITLE=""
 NOVELS_ROOT="novels"
 VLLM_URL=""
 LLM_BACKEND="${LNVOX_LLM_BACKEND:-}"
-LLM_MODEL=""
+# Same precedence as config.py (the nested form wins over the shorthand), so
+# the served model is the one the python client will name in its requests.
+LLM_MODEL="${LNVOX_LLM__MODEL:-${LNVOX_LLM_MODEL:-}}"
 MAX_MODEL_LEN=""
 SKIP_LLM=0
 SKIP_TTS=0
@@ -112,12 +135,15 @@ EPUB_PATH=""
 MAX_RETRIES="${MAX_RETRIES:-30}"
 STEP_RETRIES="${STEP_RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-5}"
+PREPARE_ENV=""
 
 VLLM_PID=""
 VLLM_LOG=""
 
 usage() {
-    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the header comment up to the "LLM lifecycle" notes — the whole
+    # option list, however long it grows.
+    awk 'NR > 1 && /^# LLM lifecycle/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -145,12 +171,13 @@ while [ $# -gt 0 ]; do
         --epub)          EPUB_PATH="$2";    shift 2 ;;
         --max-retries)   MAX_RETRIES="$2";  shift 2 ;;
         --step-retries)  STEP_RETRIES="$2"; shift 2 ;;
+        --prepare-env)   PREPARE_ENV="$2";  shift 2 ;;
         -*)              echo "Unknown option: $1" >&2; usage 2 ;;
         *)               if [ -z "$BOOK_ID" ]; then BOOK_ID="$1"; shift; else echo "Extra positional: $1" >&2; usage 2; fi ;;
     esac
 done
 
-if [ -z "$BOOK_ID" ]; then
+if [ -z "$BOOK_ID" ] && [ -z "$PREPARE_ENV" ]; then
     echo "ERROR: book id (e.g. 'toaru/volume-01') is required" >&2
     usage 2
 fi
@@ -191,8 +218,38 @@ if [ "$MODE" != "narration" ] && [ "$MODE" != "lecture" ] && [ "$MODE" != "scena
     echo "ERROR: --mode must be 'narration', 'lecture' or 'scenario' (got '$MODE')" >&2
     usage 2
 fi
-if [ "$MODE" = "scenario" ] && [ -z "$SCENARIO_FILE" ] && [ ! -f "artifacts/$BOOK_ID/00_script.json" ]; then
-    echo "ERROR: scenario mode needs --scenario-file <script.md> (or a prior ingest at artifacts/$BOOK_ID/00_script.json)" >&2
+# Checked here, not by the stages: the value is exported as the client's
+# nested LNVOX_LLM__MAX_MODEL_LEN (below), and a non-integer there fails
+# Settings validation inside every stage instead of once, up front.
+if [ -n "$MAX_MODEL_LEN" ]; then
+    case "$MAX_MODEL_LEN" in
+        0*|*[!0-9]*)
+            echo "ERROR: --max-model-len must be a positive integer (got '$MAX_MODEL_LEN')" >&2
+            usage 2
+            ;;
+    esac
+fi
+
+# The same root the lnvox CLI writes to (Settings.artifacts_dir, i.e.
+# $LNVOX_ARTIFACTS_DIR) — every existence check and printed path below goes
+# through BOOK_ART, so a relocated artifacts tree is checked where it is.
+ARTIFACTS_DIR="${LNVOX_ARTIFACTS_DIR:-artifacts}"
+BOOK_ART="$ARTIFACTS_DIR/$BOOK_ID"
+
+# Without --scenario-file, scenario mode reuses a prior ingest-scenario — but
+# only a COMPLETE one. ingest-scenario now runs every LLM pass before writing
+# and writes 00_script.json last, so a crash leaves no partial ingest behind —
+# but an ingest from an older lnvox (00_script.json written before the
+# characters pass) can still hold a script without a cast, and skipping
+# Stage 0 on it would hand voice cast nothing to cast.
+if [ "$MODE" = "scenario" ] && [ -z "$SCENARIO_FILE" ] \
+    && { [ ! -f "$BOOK_ART/00_script.json" ] || [ ! -f "$BOOK_ART/01_characters.json" ]; }; then
+    if [ -f "$BOOK_ART/00_script.json" ]; then
+        echo "ERROR: the prior ingest at $BOOK_ART is incomplete (00_script.json but no 01_characters.json — an interrupted ingest from an older lnvox)." >&2
+        echo "  Re-run with --scenario-file <script.md>; the structuring calls already made are served from cache/scenario/." >&2
+    else
+        echo "ERROR: scenario mode needs --scenario-file <script.md> (or a prior ingest at $BOOK_ART/: 00_script.json + 01_characters.json)" >&2
+    fi
     usage 2
 fi
 
@@ -207,24 +264,33 @@ fi
 
 BOOK_TITLE="${BOOK_TITLE:-$BOOK_ID}"
 NOVEL_DIR="$NOVELS_ROOT/$BOOK_ID"
-BOOK_ART="artifacts/$BOOK_ID"
 
-if [ "$MODE" != "scenario" ] && [ ! -d "$NOVEL_DIR" ] && [ "$SKIP_LLM" -eq 0 ]; then
+if [ -z "$PREPARE_ENV" ] && [ "$MODE" != "scenario" ] && [ ! -d "$NOVEL_DIR" ] && [ "$SKIP_LLM" -eq 0 ]; then
     echo "ERROR: novel dir not found: $NOVEL_DIR" >&2
     exit 1
 fi
 
-# Pin the lnvox CLI client to the right vLLM URL.
+# The LLM server URL: the readiness probe polls it AND the lnvox stages talk
+# to it, so both must resolve it identically. --vllm-url wins; otherwise the
+# same precedence as config.py (nested LNVOX_LLM__ENDPOINT, then the
+# LNVOX_LLM_ENDPOINT shorthand), falling back to where the serve scripts
+# bind — LNVOX_LLM_PORT, default 8000. Exported in the nested form, which
+# config.py ranks first: before, a custom LNVOX_LLM_PORT moved only the
+# server, and the probe waited 600 s on :8000 for it.
 if [ -n "$VLLM_URL" ]; then
-    export LNVOX_LLM__ENDPOINT="$VLLM_URL"
+    LNVOX_VLLM_BASE="$VLLM_URL"
+else
+    LNVOX_VLLM_BASE="${LNVOX_LLM__ENDPOINT:-${LNVOX_LLM_ENDPOINT:-http://localhost:${LNVOX_LLM_PORT:-8000}/v1}}"
 fi
-LNVOX_VLLM_BASE="${LNVOX_LLM__ENDPOINT:-http://localhost:8000/v1}"
+export LNVOX_LLM__ENDPOINT="$LNVOX_VLLM_BASE"
 
 # Propagate model + max-model-len to whichever serve script we picked.
-# Per-backend model default when --llm-model is omitted. Always exported:
-# the serve script loads it AND the python client sends it as the request's
-# model name (vLLM validates that name strictly; llama/mlx serve whatever
-# is loaded).
+# Per-backend model default when neither --llm-model nor the env names one.
+# Always exported: the serve script loads it AND the python client sends it
+# as the request's model name (vLLM validates that name strictly; llama/mlx
+# serve whatever is loaded). Both spellings, so a nested LNVOX_LLM__MODEL
+# left in the environment can't make the client name a different model
+# than the one --llm-model just loaded.
 if [ -z "$LLM_MODEL" ]; then
     case "$LLM_BACKEND" in
         llama) LLM_MODEL="google/gemma-4-12B-it-qat-q4_0-gguf" ;;
@@ -233,11 +299,34 @@ if [ -z "$LLM_MODEL" ]; then
     esac
 fi
 if [ -n "$LLM_MODEL" ]; then
-    export LNVOX_LLM_MODEL="$LLM_MODEL"
+    export LNVOX_LLM_MODEL="$LLM_MODEL" LNVOX_LLM__MODEL="$LLM_MODEL"
     echo "Using LLM model: $LLM_MODEL"
 fi
+# serve_vllm.sh gives a 31B/27B model a 20480-token window by default (VRAM),
+# not the client's 65536 — so when the launcher is the one starting that
+# server with that default, the client must hear it too, or its large calls
+# overflow the window (HTTP 400). Mirrors serve_vllm.sh's DEFAULT_MAX_LEN
+# rule (keep the two in step). Skipped whenever a context length is already
+# set anywhere, and for an external --vllm-url server whose window we can't
+# know.
+if [ -z "$MAX_MODEL_LEN" ] && [ "$LLM_BACKEND" = "vllm" ] && [ -z "$VLLM_URL" ] \
+    && [ -z "${LNVOX_LLM_MAX_LEN:-}${LNVOX_LLM_MAX_MODEL_LEN:-}${LNVOX_LLM__MAX_MODEL_LEN:-}" ]; then
+    case "$LLM_MODEL" in
+        *31B*|*27B*)
+            MAX_MODEL_LEN=20480
+            echo "Using LLM context: $MAX_MODEL_LEN tokens (serve_vllm.sh's default for 31B/27B models)"
+            ;;
+    esac
+fi
+# Two consumers, two names: the serve scripts size the server's context from
+# LNVOX_LLM_MAX_LEN, while LLMClient clamps its per-call output budgets with
+# llm.max_model_len (LNVOX_LLM_MAX_MODEL_LEN / nested). Exporting only the
+# first left the client assuming its 65536 default — calls that overflow a
+# smaller served window then fail with HTTP 400.
 if [ -n "$MAX_MODEL_LEN" ]; then
-    export LNVOX_LLM_MAX_LEN="$MAX_MODEL_LEN"
+    export LNVOX_LLM_MAX_LEN="$MAX_MODEL_LEN" \
+        LNVOX_LLM_MAX_MODEL_LEN="$MAX_MODEL_LEN" \
+        LNVOX_LLM__MAX_MODEL_LEN="$MAX_MODEL_LEN"
 fi
 echo "Using LLM backend: $LLM_BACKEND"
 
@@ -251,8 +340,9 @@ banner() {
 # Run a command, retrying up to STEP_RETRIES times on failure. The pipeline
 # stages are idempotent (completed chapters/beats are cached), so a retry
 # resumes from the failure instead of redoing finished work. Aborts the whole
-# pipeline if the step still fails after the budget, or immediately on a
-# signal (Ctrl-C / kill) so retries can't swallow an intentional stop.
+# pipeline if the step still fails after the budget, immediately on a signal
+# (Ctrl-C / kill) so retries can't swallow an intentional stop, and
+# immediately on exit 2 (lnvox's deterministic-refusal status).
 #
 #   run_step <hook|-> "<description>" <command> [args...]
 #
@@ -269,6 +359,13 @@ run_step() {
         if [ "$rc" -ge 128 ]; then
             echo "ERROR: '$desc' terminated by signal (exit $rc); aborting." >&2
             exit "$rc"
+        fi
+        # lnvox exits 2 for deterministic refusals — a usage error, a
+        # mistyped --narrator-clip, a bad knob — which a retry would only
+        # replay (s4_retry.sh applies the same rule).
+        if [ "$rc" -eq 2 ]; then
+            echo "ERROR: '$desc' refused its input (exit 2) — not retrying; fix the arguments / configuration above and re-run." >&2
+            exit 2
         fi
         if [ "$attempt" -ge "$STEP_RETRIES" ]; then
             echo "ERROR: '$desc' failed after $STEP_RETRIES attempt(s) (exit $rc); aborting." >&2
@@ -543,7 +640,7 @@ start_vllm() {
     local serve_script backend_name
     case "$LLM_BACKEND" in
         vllm)  serve_script="./scripts/serve_vllm.sh";  backend_name="vLLM" ;;
-        mlx)   serve_script="./scripts/serve_mlx.sh";   backend_name="mlx_lm.server" ;;
+        mlx)   serve_script="./scripts/serve_mlx.sh";   backend_name="mlx_lm server" ;;
         llama) serve_script="./scripts/serve_llama.sh"; backend_name="llama-server" ;;
     esac
     VLLM_LOG="$(mktemp -t lnvox_llm.XXXXXX.log)"
@@ -621,6 +718,24 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ----- Env-only mode (--prepare-env) -----------------------------------------
+#
+# Lets an external orchestrator (comfyui/) reuse exactly this venv-swap logic
+# while it runs the stages itself, one node at a time.
+if [ -n "$PREPARE_ENV" ]; then
+    case "$PREPARE_ENV" in
+        llm)       prepare_llm_env ;;
+        tts)       prepare_tts_env ;;
+        vibevoice) prepare_vibevoice_env ;;
+        *)
+            echo "ERROR: --prepare-env must be one of llm|tts|vibevoice (got '$PREPARE_ENV')" >&2
+            usage 2
+            ;;
+    esac
+    banner "Environment ready for phase: $PREPARE_ENV"
+    exit 0
+fi
+
 # ----- LLM phase -------------------------------------------------------------
 
 if [ "$SKIP_LLM" -eq 1 ]; then
@@ -642,12 +757,13 @@ else
 
     if [ "$MODE" = "scenario" ]; then
         # ingest-scenario is itself an LLM pass (structure + characters);
-        # skipped when the artifacts already exist and no file was passed.
+        # skipped when no file was passed — argument validation above only
+        # lets that through when a complete prior ingest exists.
         if [ -n "$SCENARIO_FILE" ]; then
             banner "Stage 0: ingest-scenario (structure + characters)"
             run_step ensure_vllm "Stage 0 (ingest-scenario)" uv run lnvox ingest-scenario "$SCENARIO_FILE" --id "$BOOK_ID"
         else
-            banner "Stage 0: ingest-scenario skipped (artifacts/$BOOK_ID/00_script.json exists)"
+            banner "Stage 0: ingest-scenario skipped ($BOOK_ART/00_script.json + 01_characters.json exist)"
         fi
     else
         banner "Stage 0: ingest (mode=$MODE)"
@@ -655,7 +771,10 @@ else
     fi
 
     if [ "$MODE" = "narration" ]; then
-        banner "Stage 1: cast extraction (with cross-volume merge if applicable)"
+        # This volume's cast only: s1 deliberately doesn't merge prior
+        # volumes' casts (s1_characters.merge_clusters) — series continuity
+        # is voice cast's job (PriorCastIndex matches recurring characters).
+        banner "Stage 1: cast extraction (this volume; series voices carry over at voice cast)"
         run_step ensure_vllm "Stage 1 (cast extraction)" uv run lnvox s1 "$BOOK_ID"
 
         banner "Stage 2: scene segmentation"
@@ -689,26 +808,36 @@ else
     fi
 
     # Hand-casting checkpoint. Stopping HERE and not later is the whole point:
-    # s3 bakes a voice descriptor per character from the casting, so a casting
-    # edited after s3 leaves the descriptor describing the old voice, and one
-    # edited after s4 costs a re-render.
+    # s3 re-voices the chapters of a character whose casting changed after it,
+    # and s4 then re-renders those beats, so a hand edit is cheapest here —
+    # before anything has been directed or rendered for it.
     if [ "$STOP_AFTER_AUDIT" -eq 1 ]; then
         stop_vllm
         banner "Stopped after the casting audit (--stop-after-audit)"
         echo "Casting:  $BOOK_ART/04_voice_assignments.json"
         echo ""
         echo "Fix it by hand, then re-run WITHOUT --stop-after-audit to continue:"
-        echo "  LNVOX_VOICEBANK=${LNVOX_VOICEBANK:-voicebank} uv run python scripts/voicebank_studio.py \\"
+        # Repeat only what THIS run had in its environment: spelling out the
+        # defaults (the old `LNVOX_VOICEBANK=voicebank`) would override a
+        # bank or artifacts root the user keeps in .env.
+        env_hint="${LNVOX_VOICEBANK:+LNVOX_VOICEBANK=$LNVOX_VOICEBANK }${LNVOX_ARTIFACTS_DIR:+LNVOX_ARTIFACTS_DIR=$LNVOX_ARTIFACTS_DIR }"
+        echo "  ${env_hint}uv run python scripts/voicebank_studio.py \\"
         echo "      --casting $BOOK_ART/04_voice_assignments.json"
-        echo "  LNVOX_VOICEBANK=${LNVOX_VOICEBANK:-voicebank} uv run lnvox voice audit $BOOK_ID   # re-check"
+        echo "  ${env_hint}uv run lnvox voice audit $BOOK_ID   # re-check"
         echo ""
-        echo "Set \"locked\": true on an assignment you want --audit-cast fix to leave alone."
+        echo "The Studio saves a re-cast as \"locked\": true, which voice cast and --audit-cast fix"
+        echo "keep; for an edit made in the JSON itself, set \"locked\": true yourself."
         exit 0
     fi
 
     if [ "$MODE" = "narration" ]; then
         banner "Stage 3: director (uses voice cast metadata)"
-        run_step ensure_vllm "Stage 3 (director)" uv run lnvox s3 "$BOOK_ID" --regen-profiles
+        # No --regen-profiles: s3's caches are casting-aware (profiles are
+        # regenerated only for recast characters, cached chapters re-voiced
+        # without LLM calls). The flag now forces EVERY descriptor, which
+        # would re-voice every chapter and re-render the whole book in s4 on
+        # every launcher run.
+        run_step ensure_vllm "Stage 3 (director)" uv run lnvox s3 "$BOOK_ID"
     elif [ "$MODE" = "scenario" ]; then
         banner "Stage S: scenario direction (emotion + cues → directed beats)"
         run_step ensure_vllm "Stage S (scenario)" uv run lnvox scenario "$BOOK_ID"
@@ -729,6 +858,18 @@ fi
 
 # ----- TTS phase -------------------------------------------------------------
 
+# Abort unless an s4_retry.sh run succeeded. Past its retry budget (exit 1),
+# on a deterministic refusal it won't retry (exit 2) or on a signal, the
+# render is partial — and s5 would happily mix whatever chapters did finish
+# into a short m4b that looks like success.
+check_s4_retry() {
+    local rc="$1"
+    if [ "$rc" -ne 0 ]; then
+        echo "ERROR: s4 failed (s4_retry.sh exit $rc) — not mixing a partial render. See $BOOK_ART/_s4_full.log." >&2
+        exit "$rc"
+    fi
+}
+
 if [ "$SKIP_TTS" -eq 1 ]; then
     banner "Skipping TTS phase (--skip-tts)"
 else
@@ -745,13 +886,19 @@ else
         # `lnvox s4` inside s4_retry.sh to the vibevoice backend.
         banner "Stage 4: TTS (VibeVoice sessions → 05_audio_v2, with auto-retry)"
         MAX_ATTEMPTS="$MAX_RETRIES" LNVOX_TTS_BACKEND=vibevoice ./scripts/s4_retry.sh "$BOOK_ID"
+        check_s4_retry $?
     elif [ "$STAGED_TTS" -eq 1 ]; then
         prepare_tts_env
         # The staged driver owns crash retries internally (per-phase
         # subprocesses with file-level resume, DESIGN.md §15.4) — no outer
         # retry loop, so a driver abort (stall limit) surfaces immediately.
         banner "Stage 4: TTS (Dramabox, staged phases)"
-        if ! uv run lnvox s4 "$BOOK_ID" --staged; then
+        uv run lnvox s4 "$BOOK_ID" --staged
+        s4_rc=$?
+        if [ "$s4_rc" -eq 2 ]; then
+            echo "ERROR: staged s4 refused its input (exit 2) — fix the arguments / configuration above and re-run." >&2
+            exit 2
+        elif [ "$s4_rc" -ne 0 ]; then
             echo "ERROR: staged s4 failed — see the stall diagnostics above." >&2
             exit 1
         fi
@@ -759,6 +906,7 @@ else
         prepare_tts_env
         banner "Stage 4: TTS (Dramabox, with auto-retry)"
         MAX_ATTEMPTS="$MAX_RETRIES" ./scripts/s4_retry.sh "$BOOK_ID"
+        check_s4_retry $?
     fi
 fi
 
@@ -768,7 +916,11 @@ if [ "$SKIP_MIX" -eq 1 ]; then
     banner "Skipping mix phase (--skip-mix)"
 else
     banner "Stage 5: mix → m4b"
-    MIX_ARGS=(--title "$BOOK_TITLE")
+    # --novels-root: s5 embeds the pictures under <novels-root>/<book>/, and
+    # s6 (given the same flag below) records which embedded picture each
+    # manifest image is — by POSITION (s5_mix.resolve_book_images). Mixing
+    # from a different root than s6 aligns against shifts every picture.
+    MIX_ARGS=(--title "$BOOK_TITLE" --novels-root "$NOVELS_ROOT")
     if [ "$TTS_BACKEND" = "vibevoice" ]; then
         MIX_ARGS+=(--v2)
     fi
@@ -819,7 +971,12 @@ else
 fi
 
 banner "Pipeline complete."
-echo "Final output should be at: $BOOK_ART/06_final/$BOOK_TITLE.m4b"
+# The name s5 really writes: s5_mix.safe_filename replaces '/' and '\' in
+# the title with '_' (the default title is the book id, usually
+# '<series>/<volume>').
+M4B_NAME="${BOOK_TITLE//\//_}"
+M4B_NAME="${M4B_NAME//\\/_}"
+echo "Final output should be at: $BOOK_ART/06_final/$M4B_NAME.m4b"
 ls -la "$BOOK_ART/06_final/" 2>/dev/null || true
 if [ -f "$BOOK_ART/07_sync/sync_manifest.json" ]; then
     echo "Sync layer:               $BOOK_ART/07_sync/ (synced EPUB + sync_manifest.json)"

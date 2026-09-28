@@ -300,6 +300,52 @@ def _rebase(
     }
 
 
+def pick_source_audio(
+    final_dir: Path, manifest: dict, mix_title: str | None = None, progress=print
+) -> Path | None:
+    """The m4b to slice, so the sample's audio matches its manifest timings.
+
+    `06_final/` can hold several m4b files (a re-mix under a new `--title`
+    leaves the old one behind), and the first glob hit used to be sliced —
+    often the stale one. In order: the m4b named by `mix_title`; the one
+    Stage 6 timed the manifest against (its `m4b` key); the newest mix's (by
+    its timings sidecar, written only once the m4b is complete); the newest
+    m4b. A pick that isn't the manifest's own m4b is reported, since its
+    timings may not line up.
+    """
+    from lnvox.stages.s5_mix import find_mix_sidecar, read_mix_layout, safe_filename
+
+    timed_against = manifest.get("m4b")
+    candidates: list[Path] = []
+    if mix_title:
+        candidates.append(final_dir / f"{safe_filename(mix_title)}.m4b")
+    if timed_against:
+        candidates.append(final_dir / timed_against)
+    sidecar = find_mix_sidecar(final_dir)
+    if sidecar is not None:
+        candidates.append(read_mix_layout(sidecar).m4b)
+    candidates += sorted(
+        final_dir.glob("*.m4b"), key=lambda p: p.stat().st_mtime, reverse=True
+    ) if final_dir.is_dir() else []
+    chosen = next((p for p in candidates if p.exists()), None)
+    if chosen is not None and timed_against and chosen.name != timed_against:
+        progress(
+            f"[WARN] slicing {chosen.name}, but sync_manifest.json was timed "
+            f"against {timed_against} — the sample may be out of sync."
+        )
+    return chosen
+
+
+def _pick_synced_epub(sync_dir: Path, manifest: dict) -> Path | None:
+    """The EPUB Stage 6 wrote for this manifest (its `epub` key), else any."""
+    recorded = manifest.get("epub")
+    if recorded:
+        for p in (Path(recorded), sync_dir / Path(recorded).name):
+            if p.exists():
+                return p
+    return next(iter(sorted(sync_dir.glob("*.epub"))), None)
+
+
 _README = """# {title} — ln-reader demo sample
 
 A {minutes:.0f}-minute slice of a full ln-vox render, small enough to commit.
@@ -337,9 +383,14 @@ def build(
     book_title: str,
     chapters: tuple[str, str] | None = None,
     minutes: float = 12.0,
+    mix_title: str | None = None,
     progress=print,
 ) -> dict:
-    """Cut a demo sample. Returns a summary dict."""
+    """Cut a demo sample. Returns a summary dict.
+
+    `mix_title` selects `06_final/<mix_title>.m4b` when it exists; otherwise
+    the m4b is chosen by `pick_source_audio`.
+    """
     sync_dir = book_dir / "07_sync"
     manifest_path = sync_dir / "sync_manifest.json"
     if not manifest_path.exists():
@@ -348,12 +399,15 @@ def build(
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    src_epub = next(iter(sync_dir.glob("*.epub")), None)
-    src_audio = next(iter((book_dir / "06_final").glob("*.m4b")), None)
+    src_epub = _pick_synced_epub(sync_dir, manifest)
+    src_audio = pick_source_audio(
+        book_dir / "06_final", manifest, mix_title, progress=progress
+    )
     if src_epub is None or src_audio is None:
         raise FileNotFoundError(
             f"Need both {book_dir}/06_final/*.m4b and {sync_dir}/*.epub."
         )
+    progress(f"Slicing {src_audio.name}")
 
     meta = json.loads((novel_dir / ".epub_meta.json").read_text(encoding="utf-8"))
     titles = {c["file"].split("-", 1)[0]: c["title"] for c in meta.get("chapters", [])}
@@ -399,6 +453,7 @@ def build(
         manifest, window, _spans_in_epub(src_epub), pictures
     )
     sample_manifest["epub"] = epub_name
+    sample_manifest["m4b"] = audio_name
     (out_dir / "sync_manifest.json").write_text(
         json.dumps(sample_manifest, indent=1, ensure_ascii=False), encoding="utf-8"
     )

@@ -17,9 +17,12 @@ Run it:
     uv run python scripts/voicebank_studio.py
 
 The bank is selected exactly like the rest of the toolchain (DESIGN.md §17.5) —
-`$LNVOX_VOICEBANK`, defaulting to ./voicebank:
+`$LNVOX_VOICEBANK` (or its `.env` entry), defaulting to ./voicebank:
 
     LNVOX_VOICEBANK=voicebank-demo uv run python scripts/voicebank_studio.py
+
+Books (for the Casting tab) are found under `$LNVOX_ARTIFACTS_DIR` (or `.env`),
+defaulting to ./artifacts — the same root the lnvox CLI writes to.
 
 An explicit flag still wins, for a one-off look at another bank / corpus:
 
@@ -124,6 +127,39 @@ def autodetect_cv_root(data_dir: Path) -> Path | None:
         if clips.is_dir() and list(clips.parent.glob("*.tsv")):
             return clips.parent
     return None
+
+
+def _configured_path(field: str, env_var: str, repo_default: str) -> Path:
+    """A path the lnvox CLI takes from `Settings` (env var, else `.env`).
+
+    Resolved through `lnvox.config.Settings` itself so the Studio opens the
+    same bank / artifacts tree as every `lnvox` command, `.env` included.
+    Unset → <repo>/<repo_default> (not the CLI's CWD-relative default: the
+    Studio is often started from elsewhere). A relative value resolves
+    against the current directory, as it does for the CLI. If Settings can't
+    be built (a malformed LNVOX_* value), the raw env var still applies.
+    """
+    try:
+        from lnvox.config import Settings
+
+        settings = Settings()
+    except Exception:
+        value = os.environ.get(env_var)
+        return Path(value).expanduser() if value else REPO_ROOT / repo_default
+    if field in settings.model_fields_set:
+        return Path(getattr(settings, field)).expanduser()
+    return REPO_ROOT / repo_default
+
+
+def default_voicebank_dir() -> Path:
+    """`$LNVOX_VOICEBANK` / `.env` (DESIGN.md §17.5), else <repo>/voicebank."""
+    return _configured_path("voicebank", "LNVOX_VOICEBANK", "voicebank")
+
+
+def default_artifacts_dir() -> Path:
+    """`$LNVOX_ARTIFACTS_DIR` / `.env` — the root the lnvox CLI writes books
+    to — else <repo>/artifacts."""
+    return _configured_path("artifacts_dir", "LNVOX_ARTIFACTS_DIR", "artifacts")
 
 
 def autodetect_casting_file(artifacts_dir: Path) -> Path | None:
@@ -349,6 +385,16 @@ class TtsLoadWorker(QThread):
                 from lnvox.tts.vibevoice_client import VibeVoiceClient
 
                 client = VibeVoiceClient(device=resolved)
+            elif resolved.startswith("mps"):
+                # DramaboxClient's monolithic TTSServer is single-dtype and no
+                # single dtype works on MPS (Gemma encoder NaNs in fp16, the
+                # vocoder needs fp32 — MAC_TEST_REPORT.md F9/F10), so it now
+                # refuses any MPS device ("mps:0" included). The lab engine
+                # assembles the staged-s4 components warm with the proven
+                # per-component dtype map; same generate() contract.
+                from lnvox.tts.lab_engine import StagedLabEngine
+
+                client = StagedLabEngine(device=resolved)
             else:
                 from lnvox.tts.dramabox_client import DramaboxClient
 
@@ -987,6 +1033,39 @@ class ImportTab(QWidget):
 # --------------------------------------------------------------------------- #
 #  Casting tab — assign voicebank clips to characters in a 04_voice_assignments
 # --------------------------------------------------------------------------- #
+def recast(cast: CharacterCasting, clip_id: str, clip: VoiceClip | None) -> str:
+    """Point `cast` at `clip_id` as a deliberate hand edit; returns a status
+    note ("" when the clip didn't change and nothing was touched).
+
+    The edit is marked `locked`: `voice cast` (which the launcher re-runs on
+    continue) keeps a locked entry over prior-volume continuity,
+    --narrator-clip and --fresh, and `voice audit --fix` never moves it — an
+    unlocked hand edit to a recurring character, or to the Narrator of a
+    run given --narrator-clip, would silently be undone.
+
+    A non-empty `voice_descriptor` is used VERBATIM downstream — s3 and the
+    scenario pass skip composing one, lecture mode reads the Narrator's — so
+    left alone it would keep describing the OLD clip. The Narrator gets a
+    fresh clip-derived descriptor (what `voice cast --narrator-clip` writes):
+    lecture mode never composes one and would fall back to a fixed default
+    voice. Anyone else is cleared, so s3 composes a descriptor for the new
+    clip with the character's personality, as it does for a fresh cast.
+    """
+    if cast.assigned_clip_id == clip_id:
+        return ""
+    cast.assigned_clip_id = clip_id
+    cast.locked = True
+    notes = ["locked, so voice cast and audit --fix keep it"]
+    if cast.voice_descriptor:
+        if cast.character_name == "Narrator" and clip is not None:
+            cast.voice_descriptor = descriptor_from_clip(clip)
+            notes.append("voice descriptor re-derived from the new clip")
+        else:
+            cast.voice_descriptor = ""
+            notes.append("old voice descriptor cleared — s3 composes one for the new clip")
+    return "; ".join(notes)
+
+
 class CastingTab(QWidget):
     CHAR_COLS = ["character", "#lines", "target", "assigned clip", "ok?", "inherited"]
     VB_COLS = ["id", "gender", "age", "accent"]
@@ -1095,7 +1174,7 @@ class CastingTab(QWidget):
 
     # -- file I/O ---------------------------------------------------------- #
     def _open(self) -> None:
-        start = str(self.path.parent if self.path else (REPO_ROOT / "artifacts"))
+        start = str(self.path.parent if self.path else self.artifacts_dir)
         path, _ = QFileDialog.getOpenFileName(
             self, "Open voice assignments", start, "Voice assignments (*.json)"
         )
@@ -1322,6 +1401,8 @@ class CastingTab(QWidget):
         inherited = self._inherited_from(cast)
         if inherited:
             extra.append(f"voice inherited from {inherited}")
+        if cast.locked:
+            extra.append("locked (voice cast and audit --fix keep this clip)")
         extra_html = f"<br><i>{' · '.join(extra)}</i>" if extra else ""
         self.target_label.setText(
             f"<b>{cast.character_name}</b> — target {t.gender}/{t.age_band}"
@@ -1368,11 +1449,15 @@ class CastingTab(QWidget):
                 != QMessageBox.Yes
             ):
                 return
-        cast.assigned_clip_id = clip_id
+        note = recast(cast, clip_id, clip)
         self.dirty = True
         self._refresh_chars()
         self._on_char_selected()
-        self.status.setText(f"Cast {cast.character_name} → {clip_id} (unsaved).")
+        self.status.setText(
+            f"Cast {cast.character_name} → {clip_id} (unsaved"
+            + (f"; {note}" if note else "")
+            + ")."
+        )
         self._update_buttons()
 
     def _assign_candidate(self) -> None:
@@ -1821,23 +1906,28 @@ def main() -> None:
     parser.add_argument(
         "--voicebank",
         default=None,
-        help="Voicebank directory (default: $LNVOX_VOICEBANK, else ./voicebank)",
+        help="Voicebank directory (default: $LNVOX_VOICEBANK or .env, else ./voicebank in the repo)",
     )
     parser.add_argument("--cv-root", default=None, help="Common Voice locale dir (has clips/ + *.tsv)")
     parser.add_argument("--data", default=str(REPO_ROOT / "data"), help="Where to auto-detect the CV corpus")
     parser.add_argument("--casting", default=None, help="A 04_voice_assignments.json to open in the Casting tab")
     parser.add_argument(
-        "--artifacts", default=str(REPO_ROOT / "artifacts"), help="Where to auto-detect a casting file"
+        "--artifacts",
+        default=None,
+        help=(
+            "Where to auto-detect a casting file and find prior volumes "
+            "(default: $LNVOX_ARTIFACTS_DIR or .env, else ./artifacts in the repo)"
+        ),
     )
     args = parser.parse_args()
 
     # Same bank selection as the rest of the toolchain (DESIGN.md §17.5): the
-    # per-language / per-project bank is chosen once via env, not re-typed per
-    # command. An explicit --voicebank still wins, so a one-off inspection of
-    # another bank doesn't need the env var unset.
-    voicebank_dir = Path(
-        args.voicebank or os.environ.get("LNVOX_VOICEBANK") or (REPO_ROOT / "voicebank")
-    ).expanduser()
+    # per-language / per-project bank is chosen once via env (or .env), not
+    # re-typed per command. An explicit --voicebank still wins, so a one-off
+    # inspection of another bank doesn't need the env var unset.
+    voicebank_dir = (
+        Path(args.voicebank).expanduser() if args.voicebank else default_voicebank_dir()
+    )
     if not (voicebank_dir / "manifest.json").exists():
         print(
             f"WARNING: no manifest.json in {voicebank_dir} — "
@@ -1846,13 +1936,16 @@ def main() -> None:
         )
 
     cv_root = Path(args.cv_root).expanduser() if args.cv_root else autodetect_cv_root(Path(args.data))
+    # Same artifacts root as the lnvox CLI, so the auto-detected casting and
+    # the prior volumes (series context) are the ones the pipeline uses.
+    artifacts_dir = Path(args.artifacts).expanduser() if args.artifacts else default_artifacts_dir()
     casting_file = (
-        Path(args.casting).expanduser() if args.casting else autodetect_casting_file(Path(args.artifacts))
+        Path(args.casting).expanduser() if args.casting else autodetect_casting_file(artifacts_dir)
     )
 
     app = QApplication(sys.argv)
     store = VoicebankStore(voicebank_dir)
-    win = MainWindow(store, cv_root, casting_file, Path(args.artifacts).expanduser())
+    win = MainWindow(store, cv_root, casting_file, artifacts_dir)
     win.show()
     sys.exit(app.exec())
 

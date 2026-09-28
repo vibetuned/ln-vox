@@ -1,0 +1,271 @@
+{
+  "id": "0598c451-d42e-596c-8d8b-3e7689c08172",
+  "revision": 0,
+  "last_node_id": 5,
+  "last_link_id": 4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LnVoxBook",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        340,
+        484
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "links": [
+            1
+          ]
+        },
+        {
+          "name": "log",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxBook"
+      },
+      "widgets_values": [
+        "series/volume-01",
+        "narration",
+        "My Novel — Volume 1",
+        "novels",
+        "",
+        "",
+        "",
+        ""
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LnVoxRunPipeline",
+      "pos": [
+        380,
+        0
+      ],
+      "size": [
+        340,
+        736
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "links": [
+            2,
+            3
+          ]
+        },
+        {
+          "name": "log",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxRunPipeline"
+      },
+      "widgets_values": [
+        "llama",
+        "dramabox",
+        "",
+        "",
+        0,
+        "",
+        "report",
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        30,
+        3,
+        0
+      ]
+    },
+    {
+      "id": 3,
+      "type": "LnVoxInspect",
+      "pos": [
+        760,
+        0
+      ],
+      "size": [
+        340,
+        316
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxInspect"
+      },
+      "widgets_values": [
+        "summary",
+        ""
+      ]
+    },
+    {
+      "id": 4,
+      "type": "LnVoxLoadAudio",
+      "pos": [
+        760,
+        560
+      ],
+      "size": [
+        340,
+        400
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            4
+          ]
+        },
+        {
+          "name": "path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxLoadAudio"
+      },
+      "widgets_values": [
+        "final_m4b",
+        "",
+        "",
+        0.0,
+        90.0
+      ]
+    },
+    {
+      "id": 5,
+      "type": "PreviewAudio",
+      "pos": [
+        1140,
+        560
+      ],
+      "size": [
+        340,
+        140
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewAudio"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      3,
+      2,
+      0,
+      4,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.65,
+      "offset": [
+        40,
+        80
+      ]
+    }
+  },
+  "version": 0.4
+}

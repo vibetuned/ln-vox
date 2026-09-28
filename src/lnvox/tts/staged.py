@@ -41,9 +41,9 @@ from lnvox.tts.dramabox_client import (
     _DRAMABOX_ROOT,
     DramaboxClient,
     _ensure_path,
-    s4_chunk_cap,
-    s4_decode_dtype,
-    s4_encoder_precision,
+    s4_effective_chunk_cap,
+    s4_effective_decode_dtype,
+    s4_effective_encoder_precision,
     s4_variant_tag,
 )
 
@@ -266,6 +266,69 @@ def _force_split_oversize(
     return [header + (f'"{p}"' if quoted else p) for p in parts]
 
 
+def apply_chunk_policy(params: PlanParams, device: str) -> bool:
+    """Set `params`' chunk caps to the effective policy for `device` and
+    return whether the word-split fallback applies. Shared by build_plan and
+    the Studio's lab engine so both chunk a prompt identically.
+
+    Cap: 22 s by default on every device since the blind A/B
+    (dramabox_client's knob comment has the story); LNVOX_S4_CHUNK_CAP=none
+    restores the chunker's 45 s — except on MPS, where 22 s is a hard floor
+    against a kernel bug (F11, see s4_effective_chunk_cap). Target = cap − 4.
+    Shorter chunks also skip DramaBox's >20.5 s end-of-clip silence-prior
+    path; the decode phase crossfades the seams.
+    """
+    cap = s4_effective_chunk_cap(device)
+    if cap is None:
+        return False
+    params.max_chunk_duration = cap
+    params.target_chunk_duration = max(6.0, cap - 4.0)
+    return True
+
+
+def chunk_texts(
+    prompt: str, params: PlanParams, duration_multiplier: float, force_split: bool
+) -> list[str]:
+    """Same routing as generate_to_file: over the chunk cap → text_chunker
+    slices (each slice re-estimates its own duration exactly like
+    generate_long's inner calls). Caller has run _ensure_ltx_path()."""
+    from text_chunker import chunk_prompt_for_duration
+
+    est = _estimate_duration(prompt, duration_multiplier)
+    if est > params.max_chunk_duration:
+        texts = [
+            c.text
+            for c in chunk_prompt_for_duration(
+                prompt,
+                max_duration_s=params.max_chunk_duration,
+                target_duration_s=params.target_chunk_duration,
+                duration_multiplier=duration_multiplier,
+            )
+        ]
+    else:
+        texts = [prompt]
+    if force_split:
+        # text_chunker splits on sentence boundaries INSIDE the prompt's
+        # quoted body, and treats a fully parenthesized+quoted beat as one
+        # unit — so a long single utterance can come back whole, still over
+        # the cap. Over the cap means the DiT's (T, T) mask enters MPS's
+        # broken boolean-indexing zone (F11), a hard failure — and on CUDA
+        # it means the cap wasn't actually enforced. Force a word-boundary
+        # split as a last resort, replicating the "(voice direction)" header
+        # on every piece; the decode crossfade smooths the mid-sentence seam.
+        texts = [
+            t2
+            for t in texts
+            for t2 in _force_split_oversize(
+                t,
+                params.max_chunk_duration,
+                params.target_chunk_duration,
+                duration_multiplier,
+            )
+        ]
+    return texts
+
+
 def build_plan(
     book_id: str,
     chapters,
@@ -277,37 +340,17 @@ def build_plan(
     device: str = "cuda",
 ) -> StagedPlan:
     _ensure_ltx_path()
-    from text_chunker import chunk_prompt_for_duration
 
     params = PlanParams(**DramaboxClient.DEFAULT_PARAMS)
-    # MPS: torch's boolean-index assignment misbehaves on the DiT's (T, T)
-    # self-attention mask once T×T reaches ~2.6M elements (beats ≳25 s):
-    # `bias[positive] = ...` inside DramaBox's transformer_args raises
-    # "shape mismatch: value tensor of shape [N] cannot be broadcast to
-    # indexing result of shape [M]" with N and M from the SAME mask.
-    # We can't patch DramaBox (DESIGN.md §11.3), but chunking is planner
-    # policy: cap chunks well below the failure zone so the mask never gets
-    # that large. 22 s ≈ 1.3M mask elements — 2× safety margin. The decode
-    # phase already crossfades chunk seams, and shorter chunks also skip
-    # DramaBox's >20.5 s end-of-clip silence-prior path.
-    # NOTE: item_ids are `{cache_key}_cNN` — chunk boundaries are NOT part
-    # of the id, so any change to these caps invalidates single-chunk
-    # latents of beats that would now be split (see MAC_TEST_REPORT.md F11).
-    if device.startswith("mps"):
-        params.max_chunk_duration = 22.0
-        params.target_chunk_duration = 18.0
-    # Chunk cap — default 22 s on every device since the blind A/B
-    # (s4_variant_tag has the story); LNVOX_S4_CHUNK_CAP=none restores the
-    # chunker's 45 s. An explicit value wins over the MPS block above; an
-    # opt-out leaves the MPS 22/18 in place (the kernel bug is a hard
-    # failure there, not a preference).
-    chunk_cap = s4_chunk_cap()
-    if chunk_cap is not None:
-        params.max_chunk_duration = chunk_cap
-        params.target_chunk_duration = max(6.0, chunk_cap - 4.0)
+    # Chunk policy (cap + word-split fallback) per device — see
+    # apply_chunk_policy. Intermediates follow a policy change on their own:
+    # item_ids embed the chunk text hash (F12).
+    force_split = apply_chunk_policy(params, device)
     # Any active override changes the rendered audio → it must re-key the
     # content cache, or an A/B against default renders silently reuses them.
-    model_version = DramaboxClient.MODEL_VERSION + s4_variant_tag()
+    # The tag is built from the EFFECTIVE recipe on this device, so a knob
+    # MPS can't honor doesn't re-key (and re-render) identical audio.
+    model_version = DramaboxClient.MODEL_VERSION + s4_variant_tag(device)
     speaker_to_clip = _build_speaker_to_clip_path(casting, voicebank, voicebank_root)
     if limit is not None:
         chapters = _slice_to_limit(chapters, limit)
@@ -349,44 +392,9 @@ def build_plan(
                 cached = (cache_dir / f"{cache_key}.wav").exists()
                 chunks: list[PlanChunk] = []
                 if not cached:
-                    # Same routing as generate_to_file: over the chunk cap →
-                    # text_chunker slices; each slice re-estimates its own
-                    # duration exactly like generate_long's inner calls.
-                    est = _estimate_duration(beat.prompt, params.duration_multiplier)
-                    if est > params.max_chunk_duration:
-                        texts = [
-                            c.text
-                            for c in chunk_prompt_for_duration(
-                                beat.prompt,
-                                max_duration_s=params.max_chunk_duration,
-                                target_duration_s=params.target_chunk_duration,
-                                duration_multiplier=params.duration_multiplier,
-                            )
-                        ]
-                    else:
-                        texts = [beat.prompt]
-                    if device.startswith("mps") or chunk_cap is not None:
-                        # text_chunker splits on sentence boundaries INSIDE
-                        # the prompt's quoted body, and treats a fully
-                        # parenthesized+quoted beat as one unit — so a long
-                        # single utterance can come back whole, still over
-                        # the cap. Over the cap means the DiT's (T, T) mask
-                        # enters MPS's broken boolean-indexing zone (F11), a
-                        # hard failure — and with an explicit cap it means
-                        # the cap wasn't actually enforced. Force a
-                        # word-boundary split as a last resort, replicating
-                        # the "(voice direction)" header on every piece; the
-                        # decode crossfade smooths the mid-sentence seam.
-                        texts = [
-                            t2
-                            for t in texts
-                            for t2 in _force_split_oversize(
-                                t,
-                                params.max_chunk_duration,
-                                params.target_chunk_duration,
-                                params.duration_multiplier,
-                            )
-                        ]
+                    texts = chunk_texts(
+                        beat.prompt, params, params.duration_multiplier, force_split
+                    )
                     for ci, text in enumerate(texts):
                         gd = _estimate_duration(text, params.duration_multiplier)
                         # The chunk TEXT is part of the item identity. With a
@@ -472,6 +480,95 @@ def pending_renders(plan: StagedPlan, root: Path, cache_dir: Path) -> list[PlanR
     return _live_renders(plan, cache_dir)
 
 
+def _beats_by_chapter(plan: StagedPlan) -> dict[str, list[PlanBeat]]:
+    by_chapter: dict[str, list[PlanBeat]] = {}
+    for b in plan.beats:
+        by_chapter.setdefault(b.chapter_id, []).append(b)
+    return by_chapter
+
+
+_PLACEMENT_MTIME_SLACK_NS = 2_000_000_000
+
+
+def _placement_current(cache_path: Path, wav_path: Path) -> bool:
+    """True iff `wav_path` is an exact placed copy of `cache_path`.
+
+    Placement copies with shutil.copy2, which carries size AND mtime (ns)
+    over — so the pair matches when the placed file is that cache entry.
+    Every other history breaks the match: the cache entry was re-rendered
+    after placement (F13), the plan now names a DIFFERENT key
+    (a casting / direction / recipe revert to an earlier render, whose older
+    cache file an "is the cache newer?" test would wrongly accept), another
+    writer (monolithic s4) replaced the file, or a copy died half-way.
+
+    The mtime slack only absorbs a coarser timestamp grid when the cache and
+    the artifacts dir sit on different filesystems (FAT stores 2 s steps) —
+    without it such a setup would re-copy forever and the driver's
+    verification would never pass. Two different renders of one beat are a
+    whole render run apart, far outside it.
+    """
+    try:
+        c, w = cache_path.stat(), wav_path.stat()
+    except FileNotFoundError:
+        return False
+    return (
+        c.st_size == w.st_size
+        and abs(c.st_mtime_ns - w.st_mtime_ns) <= _PLACEMENT_MTIME_SLACK_NS
+    )
+
+
+def _copy_exact(src: Path, dst: Path) -> None:
+    """copy2 (content + mtime) via tmp + os.replace: `dst` never holds a
+    partial copy, and the result satisfies _placement_current."""
+    tmp = dst.with_name(dst.stem + ".tmp.wav")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _manifest_current(manifest_path: Path, chapter_beats: list[PlanBeat]) -> bool:
+    """The chapter manifest lists exactly the plan's beats + cache keys, with
+    durations measured on the placed WAVs (a stale manifest from an earlier
+    run is NOT done — existence alone would pass it)."""
+    from lnvox.tts.schema import ChapterAudio
+
+    try:
+        manifest = ChapterAudio.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if [(e.beat_id, e.cache_key) for e in manifest.beats] != [
+        (b.beat_id, b.cache_key) for b in chapter_beats
+    ]:
+        return False
+    chapter_dir = manifest_path.parent
+    return all(
+        e.duration_seconds == round(_wav_duration(chapter_dir / f"{e.beat_id}.wav"), 3)
+        for e in manifest.beats
+    )
+
+
+def pending_placements(plan: StagedPlan, root: Path, cache_dir: Path) -> list[str]:
+    """Finalize outputs that don't reflect the plan yet: `<chapter>/<beat>.wav`
+    for a placed WAV that isn't an exact copy of its cache entry, and
+    `<chapter>/manifest.json` for a missing or stale manifest. Part of the
+    decode phase's pending count, so a phase that dies inside _finalize
+    (every cache WAV already written) is re-run instead of passing."""
+    audio_dir = root.parent  # …/05_audio
+    out: list[str] = []
+    for chapter_id, chapter_beats in _beats_by_chapter(plan).items():
+        chapter_dir = audio_dir / chapter_id
+        stale = [
+            f"{chapter_id}/{b.beat_id}.wav"
+            for b in chapter_beats
+            if not _placement_current(
+                cache_dir / f"{b.cache_key}.wav", chapter_dir / f"{b.beat_id}.wav"
+            )
+        ]
+        out.extend(stale)
+        if stale or not _manifest_current(chapter_dir / "manifest.json", chapter_beats):
+            out.append(f"{chapter_id}/manifest.json")
+    return out
+
+
 def count_pending(phase: str, plan: StagedPlan, root: Path, cache_dir: Path) -> int:
     if phase == "refs":
         return len(pending_refs(plan, root, cache_dir))
@@ -482,7 +579,9 @@ def count_pending(phase: str, plan: StagedPlan, root: Path, cache_dir: Path) -> 
     if phase == "denoise":
         return len(pending_latents(plan, root, cache_dir))
     if phase == "decode":
-        return len(pending_renders(plan, root, cache_dir))
+        return len(pending_renders(plan, root, cache_dir)) + len(
+            pending_placements(plan, root, cache_dir)
+        )
     raise ValueError(f"unknown phase {phase!r}")
 
 
@@ -498,7 +597,10 @@ def first_pending(phase: str, plan: StagedPlan, root: Path, cache_dir: Path) -> 
         return p[0][1].item_id if p else None
     if phase == "decode":
         p = pending_renders(plan, root, cache_dir)
-        return p[0].cache_key if p else None
+        if p:
+            return p[0].cache_key
+        placements = pending_placements(plan, root, cache_dir)
+        return f"placement {placements[0]}" if placements else None
     return None
 
 
@@ -628,7 +730,7 @@ def _phase_ctx(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -> No
 
     paths = get_all_paths()
     dev = torch.device(device)
-    dtype, bnb_4bit, _ = _knobs(device)
+    dtype, _, _ = _knobs(device)
     # Gemma is bf16-trained and its activations OVERFLOW fp16: on MPS the
     # fp16 encoder returns all-NaN encodings (verified via --keep-staged:
     # neg.safetensors was 100% NaN, which silently propagated through dit →
@@ -638,11 +740,10 @@ def _phase_ctx(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -> No
     if device.startswith("mps"):
         dtype = torch.bfloat16
     # Unquantized encoder — the staged-path default since the blind A/B
-    # (see s4_variant_tag; LNVOX_S4_ENCODER_PRECISION=bnb4 reverts). ctx is
-    # the only phase that loads the encoder, so the ~23 GB bf16 checkpoint
-    # gets the GPU alone.
-    if s4_encoder_precision() == "bf16":
-        bnb_4bit = False
+    # (see s4_variant_tag; LNVOX_S4_ENCODER_PRECISION=bnb4 reverts, except
+    # on MPS where bnb can't load). ctx is the only phase that loads the
+    # encoder, so the ~23 GB bf16 checkpoint gets the GPU alone.
+    bnb_4bit = s4_effective_encoder_precision(device) == "bnb4"
     from lnvox.tts.dramabox_client import resolve_gemma_root
 
     encoder = PromptEncoder(
@@ -736,6 +837,91 @@ def _build_dit(paths: dict, device, dtype, compile_model: bool):
     return model
 
 
+def denoise_chunk(
+    *,
+    velocity_model,
+    patchifier,
+    n_frames: int,
+    a_ctx,
+    a_ctx_neg,
+    ref_latent,
+    params,
+    dev,
+    dtype,
+):
+    """One chunk through TTSServer's euler recipe → unpatchified latent,
+    including the frame-513 end-of-clip silence-prior fix. Extracted from
+    _phase_denoise so the Studio's TTS-lab engine (lab_engine.py) runs the
+    identical denoise path. Caller holds torch.inference_mode()."""
+    import torch
+    from audio_conditioning import AudioConditionByReferenceLatent
+    from ltx_core.components.diffusion_steps import EulerDiffusionStep
+    from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
+    from ltx_core.components.noisers import GaussianNoiser
+    from ltx_core.components.schedulers import LTX2Scheduler
+    from ltx_core.model.transformer.model import X0Model
+    from ltx_core.tools import AudioLatentTools
+    from ltx_core.types import AudioLatentShape, VideoPixelShape
+    from ltx_pipelines.utils.denoisers import GuidedDenoiser
+    from ltx_pipelines.utils.samplers import euler_denoising_loop
+
+    from inference_server import auto_rescale_for_cfg
+
+    pixel_shape = VideoPixelShape(
+        batch=1, frames=n_frames, height=64, width=64, fps=params.fps
+    )
+    target_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
+    audio_tools = AudioLatentTools(patchifier=patchifier, target_shape=target_shape)
+    state = audio_tools.create_initial_state(device=dev, dtype=dtype)
+
+    if ref_latent is not None:
+        cond = AudioConditionByReferenceLatent(
+            latent=ref_latent.to(dev, dtype), strength=1.0
+        )
+        state = cond.apply_to(state, audio_tools)
+
+    gen = torch.Generator(device=dev).manual_seed(params.seed)
+    state = GaussianNoiser(generator=gen)(state, noise_scale=1.0)
+
+    guider = MultiModalGuider(
+        params=MultiModalGuiderParams(
+            cfg_scale=params.cfg_scale,
+            stg_scale=params.stg_scale,
+            stg_blocks=[29],
+            rescale_scale=auto_rescale_for_cfg(params.cfg_scale),
+            modality_scale=1.0,
+        ),
+        negative_context=a_ctx_neg,
+    )
+    denoiser = GuidedDenoiser(
+        v_context=None, a_context=a_ctx, video_guider=None, audio_guider=guider
+    )
+    sigmas = LTX2Scheduler().execute(steps=params.steps, latent=state.latent).to(dev)
+
+    _, audio_state = euler_denoising_loop(
+        sigmas=sigmas,
+        video_state=None,
+        audio_state=state,
+        stepper=EulerDiffusionStep(),
+        transformer=X0Model(velocity_model),
+        denoiser=denoiser,
+    )
+    audio_state = audio_tools.clear_conditioning(audio_state)
+    audio_state = audio_tools.unpatchify(audio_state)
+
+    # Frame-513 end-of-clip silence-prior fix (TTSServer.generate).
+    latent = audio_state.latent
+    if latent.shape[2] > 513:
+        f0, f1 = 511, 514
+        n = f1 - f0
+        patched = latent.clone()
+        for f in (512, 513):
+            t = (f - f0) / n
+            patched[:, :, f, :] = (1.0 - t) * latent[:, :, f0, :] + t * latent[:, :, f1, :]
+        latent = patched
+    return latent
+
+
 def _phase_denoise(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -> None:
     todo = pending_latents(plan, root, cache_dir)
     if not todo:
@@ -745,20 +931,8 @@ def _phase_denoise(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -
 
     _ensure_ltx_path()
     import torch
-    from audio_conditioning import AudioConditionByReferenceLatent
-    from ltx_core.components.diffusion_steps import EulerDiffusionStep
-    from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
-    from ltx_core.components.noisers import GaussianNoiser
     from ltx_core.components.patchifiers import AudioPatchifier
-    from ltx_core.components.schedulers import LTX2Scheduler
-    from ltx_core.model.transformer.model import X0Model
-    from ltx_core.tools import AudioLatentTools
-    from ltx_core.types import AudioLatentShape, VideoPixelShape
-    from ltx_pipelines.utils.denoisers import GuidedDenoiser
-    from ltx_pipelines.utils.samplers import euler_denoising_loop
     from model_downloader import get_all_paths
-
-    from inference_server import auto_rescale_for_cfg
 
     p = plan.params
     paths = get_all_paths()
@@ -770,7 +944,6 @@ def _phase_denoise(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -
     a_ctx_neg = None
     if p.cfg_scale > 1.0:
         a_ctx_neg = _load_tensor(_neg_file(root), "a_ctx").to(dev, dtype)
-    rescale = auto_rescale_for_cfg(p.cfg_scale)
     ref_cache: dict[str, "torch.Tensor"] = {}
 
     with torch.inference_mode():
@@ -778,63 +951,25 @@ def _phase_denoise(plan: StagedPlan, root: Path, cache_dir: Path, device: str) -
             mark_inflight(root, "denoise", chunk.item_id)
             t0 = time.time()
 
-            pixel_shape = VideoPixelShape(
-                batch=1, frames=chunk.n_frames, height=64, width=64, fps=p.fps
-            )
-            target_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
-            audio_tools = AudioLatentTools(patchifier=patchifier, target_shape=target_shape)
-            state = audio_tools.create_initial_state(device=dev, dtype=dtype)
-
+            ref_latent = None
             if render.ref_hash:
                 ref_latent = ref_cache.get(render.ref_hash)
                 if ref_latent is None:
                     ref_latent = _load_tensor(_ref_file(root, render.ref_hash), "ref_latent")
                     ref_cache[render.ref_hash] = ref_latent
-                cond = AudioConditionByReferenceLatent(
-                    latent=ref_latent.to(dev, dtype), strength=1.0
-                )
-                state = cond.apply_to(state, audio_tools)
-
-            gen = torch.Generator(device=dev).manual_seed(p.seed)
-            state = GaussianNoiser(generator=gen)(state, noise_scale=1.0)
 
             a_ctx = _load_tensor(_ctx_file(root, chunk.item_id), "a_ctx").to(dev, dtype)
-            guider = MultiModalGuider(
-                params=MultiModalGuiderParams(
-                    cfg_scale=p.cfg_scale,
-                    stg_scale=p.stg_scale,
-                    stg_blocks=[29],
-                    rescale_scale=rescale,
-                    modality_scale=1.0,
-                ),
-                negative_context=a_ctx_neg,
+            latent = denoise_chunk(
+                velocity_model=velocity_model,
+                patchifier=patchifier,
+                n_frames=chunk.n_frames,
+                a_ctx=a_ctx,
+                a_ctx_neg=a_ctx_neg,
+                ref_latent=ref_latent,
+                params=p,
+                dev=dev,
+                dtype=dtype,
             )
-            denoiser = GuidedDenoiser(
-                v_context=None, a_context=a_ctx, video_guider=None, audio_guider=guider
-            )
-            sigmas = LTX2Scheduler().execute(steps=p.steps, latent=state.latent).to(dev)
-
-            _, audio_state = euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=None,
-                audio_state=state,
-                stepper=EulerDiffusionStep(),
-                transformer=X0Model(velocity_model),
-                denoiser=denoiser,
-            )
-            audio_state = audio_tools.clear_conditioning(audio_state)
-            audio_state = audio_tools.unpatchify(audio_state)
-
-            # Frame-513 end-of-clip silence-prior fix (TTSServer.generate).
-            latent = audio_state.latent
-            if latent.shape[2] > 513:
-                f0, f1 = 511, 514
-                n = f1 - f0
-                patched = latent.clone()
-                for f in (512, 513):
-                    t = (f - f0) / n
-                    patched[:, :, f, :] = (1.0 - t) * latent[:, :, f0, :] + t * latent[:, :, f1, :]
-                latent = patched
 
             _save_tensors(_latent_file(root, chunk.item_id), {"latent": latent})
             print(
@@ -880,10 +1015,9 @@ def _phase_decode(plan: StagedPlan, root: Path, cache_dir: Path, device: str) ->
         # to fp32 on MPS, which then meets fp16 conv weights. Decode is cheap
         # relative to dit (and latents are already rendered), so run the whole
         # phase in fp32 there instead of chasing the individual op. CUDA keeps
-        # the _knobs() dtype.
-        if device.startswith("mps"):
-            dtype = torch.float32
-        if s4_decode_dtype() == "fp32":
+        # the _knobs() dtype unless LNVOX_S4_DECODE_DTYPE says fp32 (the
+        # default) — s4_effective_decode_dtype holds both rules.
+        if s4_effective_decode_dtype(device) == "fp32":
             dtype = torch.float32
         decoder = AudioDecoder(
             checkpoint_path=paths["audio_components"], dtype=dtype, device=dev, warm=True
@@ -956,14 +1090,14 @@ def _finalize(plan: StagedPlan, root: Path, cache_dir: Path) -> None:
     """Place every beat's WAV from the content cache and write per-chapter
     manifests — same layout and schema as s4_tts.render_chapter."""
     from lnvox.tts.schema import ChapterAudio, RenderedBeat
+    from lnvox.tts.trim import trim_file
 
     audio_dir = root.parent  # …/05_audio
     render_by_key = {r.cache_key: r for r in plan.renders}
-    by_chapter: dict[str, list[PlanBeat]] = {}
-    for b in plan.beats:
-        by_chapter.setdefault(b.chapter_id, []).append(b)
 
-    for chapter_id, chapter_beats in by_chapter.items():
+    for chapter_id, chapter_beats in _beats_by_chapter(plan).items():
+        # Attributes a crash in placement to its chapter (driver diagnostics).
+        mark_inflight(root, "decode", f"finalize:{chapter_id}")
         chapter_dir = audio_dir / chapter_id
         chapter_dir.mkdir(parents=True, exist_ok=True)
         rendered: list[RenderedBeat] = []
@@ -971,32 +1105,26 @@ def _finalize(plan: StagedPlan, root: Path, cache_dir: Path) -> None:
         for b in chapter_beats:
             wav_path = chapter_dir / f"{b.beat_id}.wav"
             cache_path = cache_dir / f"{b.cache_key}.wav"
-            # Refresh the chapter copy when missing OR when the cache entry
-            # was re-rendered after it was placed ("exists → skip" left 45
-            # stale beat wavs in 05_audio after a cache re-render, and s5
-            # silently mixed the old audio). mtime ordering self-stabilizes
-            # with the trim-upgrade below: the refreshed copy is always newer
-            # than its cache source.
-            refresh = not wav_path.exists()
-            if (
-                not refresh
-                and cache_path.exists()
-                and cache_path.stat().st_mtime > wav_path.stat().st_mtime
-            ):
-                refresh = True
-            if refresh:
-                if not cache_path.exists():
-                    raise RuntimeError(
-                        f"Content cache missing for beat {b.beat_id} ({b.cache_key}) — "
-                        "the decode phase should have produced it."
-                    )
-                shutil.copy(cache_path, wav_path)
+            if not cache_path.exists():
+                raise RuntimeError(
+                    f"Content cache missing for beat {b.beat_id} ({b.cache_key}) — "
+                    "the decode phase should have produced it."
+                )
+            # The chapter copy must BE the cache entry this manifest names.
+            # "exists → skip" left 45 stale beat wavs in 05_audio after a
+            # cache re-render (F13); "refresh when the cache is newer" still
+            # missed reverts — going back to a casting / direction / recipe
+            # rendered EARLIER names an older cache file, so the newer audio
+            # stayed while the manifest recorded the reverted key. An exact
+            # copy2 match (size + mtime) catches both, and costs no copy on
+            # an unchanged re-run.
+            if not _placement_current(cache_path, wav_path):
+                _copy_exact(cache_path, wav_path)
             # Edge-silence trim (DESIGN.md §2.6) — idempotent; a real trim
-            # upgrades the cache entry in place so re-runs stay trimmed.
-            from lnvox.tts.trim import trim_file
-
-            if trim_file(wav_path) > 0 and cache_path.exists():
-                shutil.copy(wav_path, cache_path)
+            # upgrades the cache entry in place so re-runs stay trimmed. The
+            # upgrade is an exact copy too, so the pair stays matched.
+            if trim_file(wav_path) > 0:
+                _copy_exact(wav_path, cache_path)
             dur = _wav_duration(wav_path)
             total += dur
             rendered.append(

@@ -475,6 +475,32 @@ long-beat seam artifacts reported after the F12 re-render.
 | `.gitignore` | `logs/` (live-tail symlink `logs/pipeline_current.log`) |
 | `MAC_TEST_REPORT.md` | this report |
 
+## Addendum (2026-08-22) — Voicebank Studio TTS lab on MPS
+
+The Studio's TTS lab used `DramaboxClient` (monolithic `TTSServer`), which
+builds every component with ONE dtype — unfixable on MPS from the wrapper
+(encoder needs bf16 per F10, vocoder fp32 per F9). Per the user's call, the
+lab now generates **staged-style**: new `src/lnvox/tts/lab_engine.py`
+(`StagedLabEngine`) assembles the same components the staged s4 phases use,
+warm and in-process (~32 GB resident), with the staged per-component dtype
+map, the F11 chunk caps + word-split, `staged.denoise_chunk` (extracted
+from `_phase_denoise` so both share one euler path), and the same edge
+trim as s4 placement. The Studio's loader picks it for dramabox-on-MPS;
+CUDA keeps `DramaboxClient`.
+
+Two MPS notes from bring-up:
+
+- Mixing encoder-dtype (bf16) context tensors with fp16 ones trips a hard
+  Metal assertion (`MPSNDArrayMatrixMultiplication` accumulator dtypes) —
+  every ctx tensor must be cast to the DiT dtype at the hand-off, which
+  the staged file round-trip did implicitly.
+- RE-USE voice-ref denoising is unavailable on macOS (`resampy`/`mamba-ssm`
+  have no wheels); refs are used un-denoised, with a graceful warning —
+  same behavior as the staged refs phase on this machine.
+
+Measured: engine warm-load ~51 s; ~6 s audition renders in ~39 s warm
+(30 euler steps ≈ 1.2 s/step).
+
 ## Upstream issues worth filing
 
 1. **mlx-lm**: batched path ignores per-request sampling params; per-request

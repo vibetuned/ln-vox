@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-lnvox"
+description = "ComfyUI nodes that drive the ln-vox novel-to-audiobook pipeline (Gemma 4 casting + direction, Dramabox / VibeVoice TTS, m4b mix, EPUB sync)."
+version = "0.1.0"
+license = { file = "../LICENSE" }
+# No Python dependencies of its own: every stage runs in the ln-vox checkout's
+# own uv venv (see runtime.py). ComfyUI already provides torch + numpy for the
+# AUDIO output; ffmpeg must be on PATH.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/vibetuned/ln-vox"
+
+[tool.comfy]
+PublisherId = "vibetuned"
+DisplayName = "ln-vox"
+includes = []

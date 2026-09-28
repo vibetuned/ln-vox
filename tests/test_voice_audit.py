@@ -67,7 +67,7 @@ def test_cooccurrence_weight_is_the_lesser_speaker(tmp_path):
     assert pairs[("Ada", "Bram")] == 1
 
 
-def test_cooccurrence_ignores_narration_and_sums_scenes(tmp_path):
+def test_cooccurrence_skips_speakerless_beats_and_sums_scenes(tmp_path):
     d = _write_scenes(tmp_path, [
         {"scene_id": "s1", "beats": [{"speaker": None}, {"speaker": "Ada"},
                                      {"speaker": "Bram"}]},
@@ -76,6 +76,35 @@ def test_cooccurrence_ignores_narration_and_sums_scenes(tmp_path):
     beats, pairs = scene_cooccurrence(d)
     assert None not in beats
     assert pairs[("Ada", "Bram")] == 2
+
+
+def test_cooccurrence_counts_02_scenes_narration_as_the_narrator(tmp_path):
+    """First launcher run: Stage A reads 02_scenes/, where narration beats
+    have no speaker. They are the Narrator's (s3 assigns them so), and the
+    Narrator must pair with the characters it shares scenes with."""
+    d = _write_scenes(tmp_path, [{"scene_id": "s1", "beats": [
+        {"type": "narration", "speaker": None},
+        {"type": "dialogue", "speaker": "Ada"},
+        {"type": "narration", "speaker": None},
+        {"type": "dialogue", "speaker": "Ada"},
+        {"type": "narration", "speaker": None},
+        {"type": "dialogue", "speaker": None},          # unattributed line
+    ]}])
+    beats, pairs = scene_cooccurrence(d)
+    assert beats["Narrator"] == 3 and beats["Ada"] == 2
+    assert pairs[("Ada", "Narrator")] == 2
+    assert None not in beats
+
+
+def test_narrator_collision_is_found_from_02_scenes(tmp_path):
+    d = _write_scenes(tmp_path, [{"scene_id": "s1", "beats": [
+        {"type": "narration", "speaker": None}, {"type": "dialogue", "speaker": "Ada"},
+    ] * 4}])
+    _, pairs = scene_cooccurrence(d)
+    casting = BookCasting(book_id="b", castings=[
+        _cast("Narrator", "c_a"), _cast("Ada", "c_b")])
+    cols = find_collisions(casting, ACOUSTICS, pairs)
+    assert [(c.a, c.b) for c in cols] == [("Ada", "Narrator")]
 
 
 def test_characters_in_different_scenes_never_pair(tmp_path):
@@ -177,6 +206,19 @@ def test_replacement_must_clear_every_scene_partner():
     assert applied == [] and len(unfixed) == 1
 
 
+def test_repair_empties_a_descriptor_written_for_the_old_clip():
+    """s3 uses a stored voice_descriptor verbatim, so one describing the clip
+    the audit moved away from would contradict the new voice."""
+    bram = _cast("Bram", "c_b").model_copy(update={"voice_descriptor": "for c_b"})
+    casting = BookCasting(book_id="b", castings=[_cast("Ada", "c_a"), bram])
+    pairs = Counter({("Ada", "Bram"): 5})
+    cols = find_collisions(casting, ACOUSTICS, pairs)
+    repair_collisions(casting, BANK, ACOUSTICS,
+                      Counter({"Ada": 50, "Bram": 4}), pairs, cols)
+    moved = {c.character_name: c for c in casting.castings}["Bram"]
+    assert moved.assigned_clip_id != "c_b" and moved.voice_descriptor == ""
+
+
 def test_repair_records_provenance():
     casting = BookCasting(book_id="b", castings=[_cast("Ada", "c_a"), _cast("Bram", "c_b")])
     pairs = Counter({("Ada", "Bram"): 5})
@@ -252,3 +294,24 @@ def test_a_character_may_move_twice_but_never_returns_to_a_previous_clip():
     final = {c.character_name: c.assigned_clip_id for c in casting.castings}
     assert len(set(final.values())) == 3          # everyone distinct
     assert find_collisions(casting, acoustics, pairs) == []
+
+
+def _run_all():
+    """Standalone runner (no pytest): hands `tmp_path` tests a fresh dir."""
+    import inspect
+    import tempfile
+    from pathlib import Path
+
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        if "tmp_path" in inspect.signature(fn).parameters:
+            with tempfile.TemporaryDirectory() as tmp:
+                fn(Path(tmp))
+        else:
+            fn()
+        print(f"  ok: {fn.__name__}")
+    print(f"\n{len(fns)} test(s) passed.")
+
+
+if __name__ == "__main__":
+    _run_all()

@@ -1,6 +1,7 @@
 from typing import Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 
 Gender = Literal["male", "female", "nonbinary", "unknown"]
@@ -163,6 +164,14 @@ class VoiceProfile(BaseModel):
         default="",
         description="'teen' | 'young_adult' | 'adult' | 'elder' (matches clip).",
     )
+    # What this profile was written for: the casting's `assigned_clip_id` and
+    # locked `voice_descriptor` ('' when unset) at generation time. s3 reuses a
+    # cached profile only while both still match the casting, so a recast
+    # regenerates exactly the recast characters. None = written before this
+    # record existed (see `s3_director._profile_is_current`). Stamped by code,
+    # never by the model: SkipJsonSchema keeps them out of the guided schema.
+    written_for_clip: SkipJsonSchema[str | None] = None
+    written_for_descriptor: SkipJsonSchema[str | None] = None
 
 
 class VoiceProfileList(BaseModel):
@@ -185,8 +194,15 @@ class DirectedBeat(BaseModel):
     type: BeatType
     text: str
     speaker: str  # always set — "Narrator" for narration
-    direction: str  # voice + performance descriptor that prefixes the line
-    prompt: str  # final Dramabox-ready string: `<direction>, "<text>"`
+    # Narration/lecture: the voice descriptor ("<descriptor>, <cue>" on a cued
+    # dialogue line). Scenario mode: only the human-readable cue (the
+    # descriptor + emotion go straight into `prompt`).
+    direction: str
+    # Final Dramabox-ready string from `s3_director.format_prompt`:
+    # `(<direction>) "<text>"` with the direction lowercased and its commas
+    # turned into " - " — e.g. `(adult male - gravelly bass - weary) "Go."`.
+    # The TTS cache key is built from it, so a format change re-renders all.
+    prompt: str
     source_span: str = ""  # carried through from Stage 2 for the sync stage
     # Chapter-global paragraph index this beat was split from (lecture mode
     # only; -1 in narration mode). Lets Stage 6 place ingest-extracted visual
@@ -209,6 +225,17 @@ class DirectedScene(BaseModel):
 
 class ChapterDirected(BaseModel):
     chapter_id: str
+    # Speaker → voice descriptor this chapter's prompts were composed with
+    # (s3 / scenario / lecture). On a re-run, a chapter whose speakers'
+    # CURRENT descriptors differ is re-voiced, so a recast after direction
+    # reaches every chapter. None = written before this record existed:
+    # treated as current (re-directing whole books on upgrade would re-pay
+    # the LLM) and stamped on first load.
+    voice_descriptors: dict[str, str] | None = None
+    # Lecture mode only: whether the speech-normalize pass ran. A switch of
+    # `--no-normalize` redoes the chapter. None = not recorded (other modes,
+    # or a lecture chapter written before this record existed).
+    normalized: bool | None = None
     scenes: list[DirectedScene]
 
 

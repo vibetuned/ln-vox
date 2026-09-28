@@ -150,3 +150,91 @@ def test_shared_distinctive_alias_still_merges():
     clusters = cluster_characters(per_chapter, origins=["c1", "c2"])
     assert len(clusters) == 1
     assert clusters[0].occurrences == 2
+
+
+def test_merge_groups_check_the_gender_of_the_whole_union():
+    # "Ash" (unknown gender) sorts first, so after the first group the union's
+    # root is the unknown cluster. The second group must still see the male
+    # member behind that root and refuse to fuse the female "Cora" in.
+    per_chapter = [
+        _chapter(Character(name="Ash", gender="unknown", approx_age="adult",
+                           description="A hooded figure. ch1.")),
+        _chapter(Character(name="Brom", gender="male", approx_age="adult",
+                           description="A smith. ch2.")),
+        _chapter(Character(name="Cora", gender="female", approx_age="adult",
+                           description="A courier. ch3.")),
+    ]
+    clusters = cluster_characters(per_chapter, origins=["c1", "c2", "c3"])
+    proposal = CharacterMergeProposal(merges=[
+        CharacterMergeGroup(canonical="Brom", names=["Ash", "Brom"]),
+        CharacterMergeGroup(canonical="Cora", names=["Ash", "Cora"]),
+    ])
+    result = _apply_merge_groups(clusters, proposal)
+    assert {c.name for c in result.characters} == {"Brom", "Cora"}, result
+    brom = next(c for c in result.characters if c.name == "Brom")
+    assert brom.gender == "male" and "Ash" in brom.aliases
+
+
+def test_merge_groups_chain_same_gender_through_an_unknown():
+    per_chapter = [
+        _chapter(Character(name="Ash", gender="unknown", approx_age="adult",
+                           description="ch1.")),
+        _chapter(Character(name="Brom", gender="male", approx_age="adult",
+                           description="ch2.")),
+        _chapter(Character(name="Dace", gender="male", approx_age="adult",
+                           description="ch3.")),
+    ]
+    clusters = cluster_characters(per_chapter, origins=["c1", "c2", "c3"])
+    proposal = CharacterMergeProposal(merges=[
+        CharacterMergeGroup(canonical="Brom", names=["Ash", "Brom"]),
+        CharacterMergeGroup(canonical="Brom", names=["Ash", "Dace"]),
+    ])
+    result = _apply_merge_groups(clusters, proposal)
+    assert [c.name for c in result.characters] == ["Brom"]
+
+
+def _entry(name: str, gender: str = "female", aliases=()) -> CharacterList:
+    return _chapter(Character(name=name, aliases=list(aliases), gender=gender,
+                              approx_age="adult", description=f"{name}."))
+
+
+def test_enumerated_role_names_stay_distinct():
+    # Each pair clears the 0.9 fuzzy threshold but names two people.
+    for a, b in [
+        ("Attendant A", "Attendant B"),   # 0.91 — trailing letter
+        ("Guard II", "Guard III"),        # 0.94 — roman numeral
+        ("Royal Knight 1", "Royal Knight 2"),  # 0.93 — digits
+    ]:
+        clusters = cluster_characters([_entry(a), _entry(b)], origins=["c1", "c2"])
+        assert {c.canonical for c in clusters} == {a, b}, (a, b)
+
+
+def test_shared_generic_alias_does_not_merge_enumerated_names():
+    # Both carry the bare role as an alias; "attendant a"/"attendant b" must
+    # not count as variants of one name, so the key stays generic.
+    clusters = cluster_characters(
+        [_entry("Attendant A", aliases=["attendant"]),
+         _entry("Attendant B", aliases=["attendant"])],
+        origins=["c1", "c2"],
+    )
+    assert {c.canonical for c in clusters} == {"Attendant A", "Attendant B"}
+
+
+def test_spelling_variants_still_fuzzy_merge():
+    clusters = cluster_characters(
+        [_entry("Gunther", gender="male"), _entry("Gunter", gender="male")],
+        origins=["c1", "c2"],
+    )
+    assert len(clusters) == 1
+
+
+def _run_all():
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        fn()
+        print(f"  ok: {fn.__name__}")
+    print(f"\n{len(fns)} test(s) passed.")
+
+
+if __name__ == "__main__":
+    _run_all()

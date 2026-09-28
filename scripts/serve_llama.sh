@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # Launch native llama-server (from llama.cpp) with OpenAI-compatible API on
-# localhost:8000 — the third LLM backend, peer to serve_vllm.sh (Linux+CUDA)
-# and serve_mlx.sh (Apple Silicon). See DESIGN.md §14.
+# localhost:8000 — the pipeline-wide DEFAULT LLM backend on every platform
+# (since 2026-07-25), peer to serve_vllm.sh (Linux+CUDA) and serve_mlx.sh
+# (Apple Silicon). See DESIGN.md §14.
 #
 # llama-server is NOT a Python package; install it out-of-band:
 #   macOS:  brew install llama.cpp
 #   Linux:  build from https://github.com/ggerganov/llama.cpp
 #           (cmake -B build -DGGML_CUDA=on && cmake --build build --target llama-server)
 #
-# Defaults (mirror serve_vllm.sh's Gemma 4 conventions):
-#   LNVOX_LLM_MODEL=google/gemma-4-E4B-it-qat-q4_0-gguf
-#                            (Google's official QAT-quantized GGUF for the
-#                            dev model; same E4B used by serve_vllm.sh.
-#                            HF repo id is auto-downloaded; append :Q4_0 etc.
-#                            to pick a quant inside multi-file repos. A
-#                            local .gguf path also works.)
-#                            Heavier prod pick:
+# Defaults:
+#   LNVOX_LLM_MODEL=google/gemma-4-12B-it-qat-q4_0-gguf
+#                            (Google's official QAT-quantized GGUF, ~8 GB —
+#                            validated across narration, lecture and
+#                            scenario runs. HF repo id is auto-downloaded;
+#                            append :Q4_0 etc. to pick a quant inside
+#                            multi-file repos. A local .gguf path also works.)
+#                            Heavier pick:
 #                            google/gemma-4-31B-it-qat-q4_0-gguf
 #   LNVOX_LLM_PORT=8000
 #   LNVOX_LLM_HOST=127.0.0.1

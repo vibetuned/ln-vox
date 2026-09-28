@@ -97,6 +97,9 @@ def run_staged(
         f"({cached} already cached), {total_chunks} denoise chunks, "
         f"{len(plan.refs)} voice refs"
     )
+    # The effective recipe for this device (the cache-key tag) — on MPS the
+    # revert knobs can't apply, and this line is where that shows.
+    progress(f"Render recipe: {plan.model_version}")
 
     stall_limit = int(os.environ.get("LNVOX_S4_STALL_LIMIT", "10"))
 
@@ -106,7 +109,10 @@ def run_staged(
         while True:
             before = count_pending(phase, plan, root, cache_dir)
             # decode always runs at least once: it also places beat WAVs
-            # from the cache and writes the per-chapter manifests.
+            # from the cache and writes the per-chapter manifests. Its
+            # pending count covers those outputs too (staged.pending_
+            # placements), so a phase that dies inside placement AFTER every
+            # cache WAV exists is re-run here, never reported as success.
             if before == 0 and (phase != "decode" or attempt > 0):
                 break
             attempt += 1

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from lnvox.ingest.text import Chapter
+from lnvox.llm.client import is_transport_error
 from lnvox.llm.schemas import (
     ChapterDirected,
     DirectedBeat,
@@ -91,8 +92,11 @@ def split_chapter(chapter: Chapter) -> list[DirectedBeat]:
 def _normalize_beats(client, beats: list[DirectedBeat]) -> None:
     """Speech-normalize each beat's `text` in place (best-effort, batched).
 
-    On any failure for a batch, those beats keep `text == source_span` — a
-    flaky normalize call degrades to literal reading, never a dropped beat.
+    When a batch's answer is bad or unparseable, those beats keep
+    `text == source_span` — a flaky normalize call degrades to literal
+    reading, never a dropped beat. A transport error (server down) is
+    re-raised instead: degrading would cache every remaining chapter
+    un-normalized and the launcher's `ensure_vllm` retry would never run.
     """
     for start in range(0, len(beats), _NORMALIZE_BATCH):
         batch = beats[start : start + _NORMALIZE_BATCH]
@@ -113,7 +117,9 @@ def _normalize_beats(client, beats: list[DirectedBeat]) -> None:
                 schema=NormalizedBeats,
                 max_tokens=budget,
             )
-        except Exception:
+        except Exception as e:
+            if is_transport_error(e):
+                raise
             continue  # keep verbatim source_span for this batch
         by_index = {nb.index: nb.text.strip() for nb in result.beats}
         for i, b in enumerate(batch):
@@ -127,7 +133,8 @@ def direct_chapter(
 ) -> ChapterDirected:
     """Build a single-scene ChapterDirected for one chapter."""
     beats = split_chapter(chapter)
-    if normalize and client is not None and beats:
+    normalized = normalize and client is not None
+    if normalized and beats:
         _normalize_beats(client, beats)
     for b in beats:
         b.direction = descriptor
@@ -137,7 +144,23 @@ def direct_chapter(
         location_hint="",
         beats=beats,
     )
-    return ChapterDirected(chapter_id=chapter.chapter_id, scenes=[scene])
+    return ChapterDirected(
+        chapter_id=chapter.chapter_id,
+        voice_descriptors={NARRATOR_NAME: descriptor},
+        normalized=normalized,
+        scenes=[scene],
+    )
+
+
+def _revoice(result: ChapterDirected, descriptor: str) -> ChapterDirected:
+    """Swap the narrator descriptor into every beat — no LLM needed, since
+    the (normalized) text doesn't depend on the voice."""
+    for scene in result.scenes:
+        for b in scene.beats:
+            b.direction = descriptor
+            b.prompt = format_prompt(descriptor, b.text)
+    result.voice_descriptors = {NARRATOR_NAME: descriptor}
+    return result
 
 
 def run(
@@ -149,16 +172,25 @@ def run(
     normalize: bool = True,
     on_chapter_done: Callable[[ChapterDirected], None] | None = None,
 ) -> list[ChapterDirected]:
-    """Direct every chapter → ``03_directed/<chapter_id>.json``. Idempotent."""
+    """Direct every chapter → ``03_directed/<chapter_id>.json``. Idempotent.
+
+    A cached chapter is reused only while it matches this run: a different
+    normalize setting (``--no-normalize`` toggled, or no client) redoes it; a
+    different narrator descriptor just re-voices its prompts. A chapter
+    written before those were recorded is treated as current and stamped.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     directed_dir = output_dir / "03_directed"
     directed_dir.mkdir(exist_ok=True)
     descriptor = narrator_descriptor(casting)
+    normalized = normalize and client is not None
+    voices = {NARRATOR_NAME: descriptor}
 
     results: list[ChapterDirected] = []
     for chapter in chapters:
         cached = directed_dir / f"{chapter.chapter_id}.json"
         result: ChapterDirected | None = None
+        dirty = False
         if cached.exists():
             try:
                 result = ChapterDirected.model_validate_json(
@@ -166,10 +198,33 @@ def run(
                 )
             except Exception:
                 result = None  # malformed — re-direct
+        if result is not None:
+            if result.normalized is None:
+                result.normalized = normalized
+                dirty = True
+            if result.voice_descriptors is None:
+                result.voice_descriptors = dict(voices)
+                dirty = True
+            if result.normalized != normalized:
+                print(
+                    f"  [lecture] {chapter.chapter_id}: cached "
+                    f"{'with' if result.normalized else 'without'} speech-normalize "
+                    f"— rebuilding {'with' if normalized else 'without'} it"
+                )
+                result = None
+            elif result.voice_descriptors != voices:
+                print(
+                    f"  [lecture] {chapter.chapter_id}: narrator descriptor "
+                    f"changed — re-voiced prompts"
+                )
+                result = _revoice(result, descriptor)
+                dirty = True
         if result is None:
             result = direct_chapter(
                 chapter, descriptor, client=client, normalize=normalize
             )
+            dirty = True
+        if dirty:
             cached.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         results.append(result)
         if on_chapter_done:

@@ -70,6 +70,12 @@ def scene_cooccurrence(scene_dir: Path) -> tuple[Counter, Counter]:
     A pair's weight is ``min(beats_a, beats_b)`` summed over the scenes they
     both speak in — how much they actually converse, not merely whether they
     appear in the same book.
+
+    Narration beats count as the Narrator's, whatever their `speaker`: that
+    is who s3 assigns them to. It matters on a first run, when the audit
+    reads ``02_scenes/`` (narration has ``speaker: null`` there) — without
+    this the Narrator never pairs with anyone until ``03_directed/`` exists,
+    after the casting has already been baked into descriptors.
     """
     beats: Counter = Counter()
     pairs: Counter = Counter()
@@ -82,6 +88,8 @@ def scene_cooccurrence(scene_dir: Path) -> tuple[Counter, Counter]:
             present: Counter = Counter()
             for beat in scene.get("beats", []):
                 speaker = beat.get("speaker")
+                if beat.get("type") == "narration":
+                    speaker = NARRATOR_NAME
                 if speaker:
                     present[speaker] += 1
             beats.update(present)
@@ -273,6 +281,9 @@ def repair_collisions(
         other = col.b if victim == col.a else col.a
         old = cst.assigned_clip_id
         cst.assigned_clip_id = clip.id
+        # A stored descriptor describes the clip being replaced; s3 would use
+        # it verbatim for the new one. Empty it so s3 composes a matching one.
+        cst.voice_descriptor = ""
         cst.audit_note = (
             f"voice audit: was {col.semitones:.1f} semitones from {other}, "
             f"who shares its scenes{tier}"

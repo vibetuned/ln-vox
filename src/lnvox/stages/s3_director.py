@@ -2,7 +2,7 @@ import json
 import re
 from pathlib import Path
 
-from lnvox.llm.client import LLMClient
+from lnvox.llm.client import LLMClient, is_transport_error
 from lnvox.llm.schemas import (
     Beat,
     ChapterDirected,
@@ -105,16 +105,28 @@ def _salvage_voice_profiles(raw: str) -> VoiceProfileList | None:
     return VoiceProfileList(profiles=profiles)
 
 
+def _written_for(name: str, casting_by_name: dict) -> tuple[str, str]:
+    """What a profile for `name` is written for: the casting's
+    ``(assigned_clip_id, voice_descriptor)``, '' for each when unset."""
+    cst = casting_by_name.get(name)
+    if cst is None:
+        return "", ""
+    return cst.assigned_clip_id or "", cst.voice_descriptor or ""
+
+
 def generate_voice_profiles(
     client: LLMClient,
     cast: CharacterList,
     *,
     casting: BookCasting | None = None,
     voicebank: Voicebank | None = None,
+    keep: dict[str, VoiceProfile] | None = None,
 ) -> VoiceProfileList:
     """Write a profile per character, biased to match the assigned voice clip.
 
-    Two paths, per character:
+    Three paths, per character:
+      - In `keep` (a cached profile still current for the casting — see
+        `refresh_voice_profiles`): reused verbatim, no LLM.
       - If the CharacterCasting carries a non-empty `voice_descriptor`
         (e.g. Narrator with --narrator-clip or a reused prior-volume clip),
         use that VERBATIM and skip the LLM. Fills in gender / age_band /
@@ -124,7 +136,11 @@ def generate_voice_profiles(
         the character's personality. Then post-process the LLM output to
         snap gender / age_band / accent back onto the clip's actual values
         (defensive — the LLM occasionally drifts).
+
+    Every returned profile is stamped with what it was written for
+    (`VoiceProfile.written_for_clip` / `written_for_descriptor`).
     """
+    keep = keep or {}
     clip_by_id: dict = {}
     if voicebank:
         clip_by_id = {c.id: c for c in voicebank.clips}
@@ -145,6 +161,8 @@ def generate_voice_profiles(
     cast_for_llm: list[dict] = []
 
     def _consider(name: str, description: str) -> None:
+        if name in keep:
+            return
         clip = _clip_for(name)
         cst = casting_by_name.get(name)
         if cst and cst.voice_descriptor and clip:
@@ -190,6 +208,9 @@ def generate_voice_profiles(
         user = client.render(
             "voice_profiles.jinja",
             cast_with_clips_json=cast_with_clips_json,
+            # A partial refresh (only recast characters) may not include the
+            # Narrator; don't tell the model it's there.
+            includes_narrator=any(e["name"] == NARRATOR_NAME for e in cast_for_llm),
         )
         # Budget scales with the number of characters needing a profile (~400
         # tokens each is ample for a short descriptor) instead of a fixed cap
@@ -244,8 +265,11 @@ def generate_voice_profiles(
         else:
             snapped.append(p.model_copy(update={"voice_descriptor": descriptor}))
 
-    # Merge in the locked profiles (Narrator etc.). Preserve cast order.
+    # Merge in the kept and locked profiles (Narrator etc.). A kept name was
+    # never sent to the LLM, so it wins over a same-named entry the model
+    # invented anyway. Preserve cast order.
     profiles_by_name = {p.name: p for p in snapped}
+    profiles_by_name.update(keep)
     profiles_by_name.update(locked_profiles)
 
     ordered: list[VoiceProfile] = []
@@ -268,11 +292,108 @@ def generate_voice_profiles(
             VoiceProfile(name=NARRATOR_NAME, voice_descriptor=DEFAULT_NARRATOR_DESCRIPTOR)
         )
 
-    return VoiceProfileList(profiles=ordered)
+    stamped: list[VoiceProfile] = []
+    for p in ordered:
+        clip_id, locked = _written_for(p.name, casting_by_name)
+        stamped.append(
+            p.model_copy(
+                update={"written_for_clip": clip_id, "written_for_descriptor": locked}
+            )
+        )
+    return VoiceProfileList(profiles=stamped)
+
+
+def _profile_is_current(
+    p: VoiceProfile, casting_by_name: dict, clip_by_id: dict
+) -> bool:
+    """Whether a cached profile still describes the character's cast voice.
+
+    A recorded profile is current while the clip and locked descriptor it was
+    written for are unchanged. A legacy profile (no record — the launcher used
+    to regenerate profiles on every run) is treated as current unless it
+    provably describes a different voice: generation snaps gender / age_band /
+    accent onto the assigned clip, and copies a locked descriptor verbatim, so
+    a mismatch with the CURRENT clip means the character was recast since.
+    """
+    clip_id, locked = _written_for(p.name, casting_by_name)
+    if p.written_for_clip is not None or p.written_for_descriptor is not None:
+        return (p.written_for_clip or "", p.written_for_descriptor or "") == (
+            clip_id,
+            locked,
+        )
+    clip = clip_by_id.get(clip_id) if clip_id else None
+    if clip is None:
+        return True
+    if locked and p.voice_descriptor != locked:
+        return False
+    return (p.gender, p.age_band, p.accent) == (clip.gender, clip.age_band, clip.accent)
+
+
+def refresh_voice_profiles(
+    client: LLMClient,
+    cast: CharacterList,
+    profiles_path: Path,
+    *,
+    casting: BookCasting | None = None,
+    voicebank: Voicebank | None = None,
+    regen: bool = False,
+) -> tuple[VoiceProfileList, VoiceProfileList | None]:
+    """Load `03_voice_profiles.json`, regenerating only what the casting changed.
+
+    Returns ``(profiles, previous)`` where `previous` is the cache as it was
+    on disk (None if absent/unreadable) — callers use it to date chapters
+    directed before descriptor records existed. `regen=True`
+    (`--regen-profiles`) regenerates every profile. Writes the file only when
+    its content changed.
+    """
+    previous: VoiceProfileList | None = None
+    if profiles_path.exists():
+        try:
+            previous = VoiceProfileList.model_validate_json(
+                profiles_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            previous = None  # malformed / truncated — regenerate
+
+    casting_by_name = {c.character_name: c for c in casting.castings} if casting else {}
+    clip_by_id = {c.id: c for c in voicebank.clips} if voicebank else {}
+    keep: dict[str, VoiceProfile] = {}
+    if previous is not None and not regen:
+        keep = {
+            p.name: p
+            for p in previous.profiles
+            if _profile_is_current(p, casting_by_name, clip_by_id)
+        }
+
+    needed = [c.name for c in cast.characters]
+    if NARRATOR_NAME not in needed:
+        needed.append(NARRATOR_NAME)
+    stale = [n for n in needed if n not in keep]
+    if previous is None or regen:
+        print(f"  [profiles] generating voice profiles for {len(needed)} character(s)")
+    elif stale:
+        print(
+            f"  [profiles] regenerating {len(stale)} voice profile(s) whose casting "
+            f"changed or is new: {', '.join(stale)}"
+        )
+
+    profiles = generate_voice_profiles(
+        client, cast, casting=casting, voicebank=voicebank, keep=keep
+    )
+    if previous is None or profiles.model_dump() != previous.model_dump():
+        profiles_path.write_text(profiles.model_dump_json(indent=2), encoding="utf-8")
+    return profiles, previous
 
 
 def _profile_lookup(profiles: VoiceProfileList) -> dict[str, str]:
     return {p.name: p.voice_descriptor for p in profiles.profiles}
+
+
+def _descriptor_for(speaker: str, profile_map: dict[str, str]) -> str:
+    """The voice descriptor a beat by `speaker` is composed with."""
+    if speaker == NARRATOR_NAME:
+        return profile_map.get(NARRATOR_NAME, DEFAULT_NARRATOR_DESCRIPTOR)
+    return profile_map.get(speaker, "voice unknown")
 
 
 # ---------------- merge consecutive same-speaker beats ----------------
@@ -433,7 +554,13 @@ def direct_scene(
                 max_tokens=budget,
             )
             cues_by_line = {d.line: d.cue.strip() for d in directions.directions}
-        except Exception:
+        except Exception as e:
+            # A bad / unparseable answer only costs this scene its cues. A dead
+            # server must fail the step instead: swallowing it would cache
+            # every remaining chapter cue-less, and the launcher's
+            # `ensure_vllm` retry would never run.
+            if is_transport_error(e):
+                raise
             cues_by_line = {}
 
     profile_map = _profile_lookup(profiles)
@@ -442,12 +569,12 @@ def direct_scene(
     for b in merged_beats:
         if b.type == "narration":
             speaker = NARRATOR_NAME
-            descriptor = profile_map.get(NARRATOR_NAME, DEFAULT_NARRATOR_DESCRIPTOR)
+            descriptor = _descriptor_for(speaker, profile_map)
             direction = descriptor
         else:
             line_no += 1
             speaker = b.speaker or "Unknown"
-            descriptor = profile_map.get(speaker, "voice unknown")
+            descriptor = _descriptor_for(speaker, profile_map)
             cue = cues_by_line.get(line_no, "").strip()
             direction = f"{descriptor}, {cue}" if cue else descriptor
         prompt = format_prompt(direction, b.text)
@@ -472,11 +599,75 @@ def direct_scene(
 # ---------------- chapter / book orchestration ----------------
 
 
+def chapter_voice_descriptors(
+    chapter_scenes: ChapterScenes, profile_map: dict[str, str]
+) -> dict[str, str]:
+    """Speaker → descriptor for every voice in the chapter — the record
+    `ChapterDirected.voice_descriptors` is checked against on a re-run."""
+    speakers = {
+        NARRATOR_NAME if b.type == "narration" else (b.speaker or "Unknown")
+        for s in chapter_scenes.scenes
+        for b in s.beats
+    }
+    return {sp: _descriptor_for(sp, profile_map) for sp in sorted(speakers)}
+
+
 def direct_chapter(
     client: LLMClient, chapter_scenes: ChapterScenes, profiles: VoiceProfileList
 ) -> ChapterDirected:
     directed = [direct_scene(client, s, profiles) for s in chapter_scenes.scenes]
-    return ChapterDirected(chapter_id=chapter_scenes.chapter_id, scenes=directed)
+    return ChapterDirected(
+        chapter_id=chapter_scenes.chapter_id,
+        voice_descriptors=chapter_voice_descriptors(
+            chapter_scenes, _profile_lookup(profiles)
+        ),
+        scenes=directed,
+    )
+
+
+def revoice_chapter(
+    chapter: ChapterDirected, current: dict[str, str]
+) -> ChapterDirected | None:
+    """Re-compose a directed chapter's prompts for changed voice descriptors.
+
+    The performance cues come from the scene text alone (the direction prompt
+    never sees a descriptor), so a recast needs no new LLM call: strip the
+    recorded descriptor off each changed speaker's `direction`, keep the cue,
+    and rebuild `direction` + `prompt` exactly as `direct_scene` would.
+    Returns None when that isn't safe — the speaker set differs (the scenes
+    changed) or a direction doesn't carry the recorded descriptor (a chapter
+    dated from a profiles file it wasn't written with) — and the caller then
+    re-directs it through the LLM.
+    """
+    recorded = chapter.voice_descriptors or {}
+    if recorded.keys() != current.keys():
+        return None
+    changed = {sp for sp in current if current[sp] != recorded[sp]}
+    scenes: list[DirectedScene] = []
+    for scene in chapter.scenes:
+        beats: list[DirectedBeat] = []
+        for b in scene.beats:
+            if b.speaker not in changed:
+                beats.append(b)
+                continue
+            old = recorded[b.speaker]
+            if b.direction == old:
+                cue = ""
+            elif b.direction.startswith(old + ", "):
+                cue = b.direction[len(old) + 2 :]
+            else:
+                return None
+            new = current[b.speaker]
+            direction = f"{new}, {cue}" if cue else new
+            beats.append(
+                b.model_copy(
+                    update={"direction": direction, "prompt": format_prompt(direction, b.text)}
+                )
+            )
+        scenes.append(scene.model_copy(update={"beats": beats}))
+    return chapter.model_copy(
+        update={"voice_descriptors": dict(current), "scenes": scenes}
+    )
 
 
 # Articles carried by a speaker tag but not by the cast entry (or the reverse):
@@ -550,6 +741,7 @@ def run(
     *,
     casting: BookCasting | None = None,
     voicebank: Voicebank | None = None,
+    regen_profiles: bool = False,
     on_chapter_done=None,
 ) -> list[ChapterDirected]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -562,27 +754,32 @@ def run(
         sample = ", ".join(f"{k} → {v}" for k, v in list(remapped.items())[:5])
         print(f"  [s3] canonicalised {changed} beat speaker(s): {sample}")
 
-    profiles_path = output_dir / "03_voice_profiles.json"
-    if profiles_path.exists():
-        profiles = VoiceProfileList.model_validate_json(
-            profiles_path.read_text(encoding="utf-8")
-        )
-    else:
-        profiles = generate_voice_profiles(
-            client, cast, casting=casting, voicebank=voicebank
-        )
-        profiles_path.write_text(
-            profiles.model_dump_json(indent=2), encoding="utf-8"
-        )
+    # Casting-aware: only characters whose clip / locked descriptor changed
+    # get a new profile, so a re-run keeps every other descriptor stable.
+    profiles, previous = refresh_voice_profiles(
+        client,
+        cast,
+        output_dir / "03_voice_profiles.json",
+        casting=casting,
+        voicebank=voicebank,
+        regen=regen_profiles,
+    )
+    profile_map = _profile_lookup(profiles)
+    # A chapter directed before descriptor records existed is dated from the
+    # profiles file as it was on disk — the one the latest chapters were
+    # written with — so a recast since then is still detected below.
+    legacy_map = _profile_lookup(previous) if previous is not None else profile_map
 
     directed_dir = output_dir / "03_directed"
     directed_dir.mkdir(exist_ok=True)
     results: list[ChapterDirected] = []
     for cs in chapters_scenes:
         # Idempotent: a chapter already directed on a prior run is reloaded from
-        # disk instead of re-calling the LLM (voice profiles are cached above).
+        # disk instead of re-calling the LLM — as long as it was written with
+        # its speakers' CURRENT descriptors.
         cached_path = directed_dir / f"{cs.chapter_id}.json"
         result: ChapterDirected | None = None
+        dirty = False
         if cached_path.exists():
             try:
                 result = ChapterDirected.model_validate_json(
@@ -590,8 +787,34 @@ def run(
                 )
             except Exception:
                 result = None  # malformed / truncated — re-direct
+        if result is not None:
+            current = chapter_voice_descriptors(cs, profile_map)
+            if result.voice_descriptors is None:
+                result.voice_descriptors = chapter_voice_descriptors(cs, legacy_map)
+                dirty = True
+            if result.voice_descriptors != current:
+                revoiced = revoice_chapter(result, current)
+                stale = sorted(
+                    sp for sp in current
+                    if (result.voice_descriptors or {}).get(sp) != current[sp]
+                )
+                if revoiced is not None:
+                    print(
+                        f"  [s3] {cs.chapter_id}: voice descriptor changed for "
+                        f"{', '.join(stale)} — re-voiced prompts (cues kept)"
+                    )
+                    result = revoiced
+                    dirty = True
+                else:
+                    print(
+                        f"  [s3] {cs.chapter_id}: directed with other voices "
+                        f"({', '.join(stale) or 'speaker set changed'}) — re-directing"
+                    )
+                    result = None
         if result is None:
             result = direct_chapter(client, cs, profiles)
+            dirty = True
+        if dirty:
             cached_path.write_text(
                 result.model_dump_json(indent=2), encoding="utf-8"
             )

@@ -460,7 +460,7 @@ def seed_from_common_voice(
     *,
     cv_root: Path,
     tsv_name: str = "validated.tsv",
-    max_speakers: int = 200,
+    max_speakers: int = 150,
     target_seconds: float = 12.0,
     min_seconds: float = 8.0,
     output_sr: int = 24000,

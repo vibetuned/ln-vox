@@ -89,6 +89,34 @@ def test_chunk_script_headerless_becomes_one_scene():
     assert len(scenes) == 1 and scenes[0][0] == ""
 
 
+def test_chunk_script_cast_list_without_scene_headers():
+    """No scene header: the play after the cast list is a scene, not roster."""
+    md = (
+        "Titre de la pièce\n\n"
+        "### Personnages\n\n"
+        "- **Gardien → Paul**\n\n"            # loose list: blank line between items
+        "- **Voyageuse → Jeanne**\n\n"
+        "**Gardien** \\- Qui va là ?\n\n"
+        "*Un volet claque.*\n\n"
+        "**Voyageuse** : C'est moi.\n"
+    )
+    roster, scenes = chunk_script(md)
+    assert len(roster) == 1
+    assert "Paul" in roster[0] and "Jeanne" in roster[0]
+    assert "Qui va là" not in roster[0]
+    assert len(scenes) == 1 and scenes[0][0] == ""
+    body = scenes[0][1]
+    assert "Qui va là" in body and "C'est moi" in body and "volet" in body
+    assert "Paul" not in body  # the cast list isn't structured as play text
+
+
+def test_chunk_script_roster_runs_to_the_next_scene_header():
+    # With scene headers the historical rule holds: the roster section runs
+    # up to the first scene header, and the preamble is dropped.
+    roster, scenes = chunk_script(FIXTURE_MD)
+    assert "Titre" not in roster[0] and all("Titre" not in b for _t, b in scenes)
+
+
 def test_split_chunk_respects_blank_lines():
     chunk = "\n\n".join(f"line {i} " + "x" * 50 for i in range(10))
     parts = split_chunk(chunk, max_chars=120)
@@ -209,6 +237,89 @@ def test_cached_structured_hits_and_rekeys():
         # cache_dir=None bypasses entirely.
         _, hit = cached_structured(stub, cache_dir=None, user="chunk A", **kw)
         assert not hit and stub.calls == 5
+
+        # A different system prompt re-keys (it used to be left out).
+        _, hit = cached_structured(
+            stub, cache_dir=cache, user="chunk A", **{**kw, "system": "s2"}
+        )
+        assert not hit and stub.calls == 6
+
+
+def test_cache_refresh_rerolls_and_rewrites():
+    """--no-cache: skip the read, but WRITE, so the next cached run returns
+    the re-rolled result instead of the one it replaced."""
+    from lnvox.llm.schemas import SceneStructure
+
+    first = SceneStructure(items=[ScriptItem(type="dialogue", speaker="A", text="un")])
+    second = SceneStructure(items=[ScriptItem(type="dialogue", speaker="A", text="deux")])
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        kw = dict(system="s", user="chunk", schema=SceneStructure, desired=100, floor=10)
+        stub = StubLLM(first)
+        cached_structured(stub, cache_dir=cache, **kw)
+
+        stub.result = second
+        got, hit = cached_structured(stub, cache_dir=cache, refresh=True, **kw)
+        assert not hit and got.items[0].text == "deux" and stub.calls == 2
+
+        got, hit = cached_structured(stub, cache_dir=cache, **kw)
+        assert hit and got.items[0].text == "deux" and stub.calls == 2
+
+
+class StubScenarioClient(StubLLM):
+    """Answers each structured() call by schema; optionally fails one."""
+
+    def __init__(self, fail_on=None):
+        super().__init__(None)
+        self.fail_on = fail_on
+
+    def render(self, template, **kw):
+        return f"{template}\n{kw}"
+
+    def structured(self, *, schema, **_kw):
+        from lnvox.llm.schemas import CharacterList, RosterList, SceneStructure
+
+        self.calls += 1
+        if schema.__name__ == self.fail_on:
+            raise ConnectionError("server went away")
+        if schema is SceneStructure:
+            return SceneStructure(
+                items=[ScriptItem(type="dialogue", speaker="Gardien", text="Qui va là ?")]
+            )
+        if schema is RosterList:
+            return RosterList(entries=[])
+        return CharacterList(characters=[])
+
+
+def test_run_writes_the_done_marker_last():
+    """00_script.json means "ingest done" to the launcher: a crash in the
+    characters pass must not leave one behind (nor touch older artifacts)."""
+    from lnvox.ingest import scenario as scenario_ingest
+
+    md = "Séquence 1 – La porte\n\n**Gardien** \\- Qui va là ?\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "piece.md"
+        src.write_text(md, encoding="utf-8")
+        out = tmp / "out"
+
+        try:
+            scenario_ingest.run(
+                src, "p", StubScenarioClient(fail_on="CharacterList"), out,
+                cache_dir=None, progress=lambda _m: None,
+            )
+            raise AssertionError("expected the characters pass to fail")
+        except ConnectionError:
+            pass
+        assert not (out / "00_script.json").exists()
+        assert not (out / "00_text.jsonl").exists()
+
+        scenario_ingest.run(
+            src, "p", StubScenarioClient(), out, cache_dir=None, progress=lambda _m: None
+        )
+        for name in ("00_script.json", "00_text.jsonl", "01_characters.json"):
+            assert (out / name).exists(), name
+        assert not list(out.glob(".*.tmp"))
 
 
 # ---- staging-run grouping -------------------------------------------------------

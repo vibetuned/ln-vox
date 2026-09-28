@@ -7,9 +7,11 @@ DirectedScene per staging-delimited run of dialogue — s5's inter-scene pad
 then lands exactly where a staged action happens (the "staging pause").
 
 Per line the LLM adds an `emotion` (the §16.7 7-value enum) and a short
-`cue` in the script's language. The English TTS prompt is composed as
-`(descriptor - emotion) "text"`; the human-readable French cue travels in
-`DirectedBeat.direction` and ends up in the sync file. Text stays verbatim.
+`cue` in the script's language. The English TTS prompt is
+`format_prompt(f"{descriptor}, {emotion}", text)`, i.e.
+`(<descriptor - emotion, lowercased, commas → " - ">) "text"`; the
+human-readable French cue travels in `DirectedBeat.direction` and ends up in
+the sync file. Text stays verbatim.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from lnvox.llm.client import LLMClient
+from lnvox.llm.client import LLMClient, is_transport_error
 from lnvox.llm.schemas import (
     ChapterDirected,
     CharacterList,
@@ -36,7 +38,7 @@ from lnvox.stages.s3_director import (
     _profile_lookup,
     _split_long_text,
     format_prompt,
-    generate_voice_profiles,
+    refresh_voice_profiles,
 )
 from lnvox.ingest.scenario import is_group_label
 from lnvox.voices.schema import BookCasting, Voicebank
@@ -94,6 +96,58 @@ def _scene_context(scene: ScriptScene) -> tuple[str, str, int]:
     return "\n\n".join(context), "\n".join(numbered), line_no
 
 
+def _voice_for(speaker: str, profile_map: dict[str, str]) -> tuple[str, str]:
+    """(render speaker, voice descriptor) for one script speaker label."""
+    narrator_descriptor = profile_map.get(NARRATOR_NAME, DEFAULT_NARRATOR_DESCRIPTOR)
+    if is_group_label(speaker):
+        # Group lines render with the Narrator voice (§17.6); the sync
+        # file keeps the original label from 00_script.json.
+        return NARRATOR_NAME, narrator_descriptor
+    return speaker, profile_map.get(speaker) or narrator_descriptor
+
+
+def scene_voice_descriptors(
+    scene: ScriptScene, profile_map: dict[str, str]
+) -> dict[str, str]:
+    """Render speaker → descriptor for every voice in the scene — the record
+    `ChapterDirected.voice_descriptors` is checked against on a re-run."""
+    voices = dict(
+        _voice_for(item.speaker, profile_map)
+        for item in scene.items
+        if item.type == "dialogue"
+    )
+    return dict(sorted(voices.items()))
+
+
+def revoice_scene(
+    chapter: ChapterDirected, current: dict[str, str]
+) -> ChapterDirected | None:
+    """Re-compose a directed scene's prompts for changed voice descriptors.
+
+    Emotion and cue come from the script alone and are stored on each beat,
+    so the prompt is rebuilt without an LLM call. None when the speaker set
+    differs (the script changed) — the caller re-directs the scene.
+    """
+    recorded = chapter.voice_descriptors or {}
+    if recorded.keys() != current.keys():
+        return None
+    scenes: list[DirectedScene] = []
+    for s in chapter.scenes:
+        beats: list[DirectedBeat] = []
+        for b in s.beats:
+            if b.speaker not in current:
+                return None
+            if current[b.speaker] == recorded[b.speaker]:
+                beats.append(b)
+                continue
+            prompt = format_prompt(f"{current[b.speaker]}, {b.emotion}", b.text)
+            beats.append(b.model_copy(update={"prompt": prompt}))
+        scenes.append(s.model_copy(update={"beats": beats}))
+    return chapter.model_copy(
+        update={"voice_descriptors": dict(current), "scenes": scenes}
+    )
+
+
 def direct_scene(
     client: LLMClient, scene: ScriptScene, profiles: VoiceProfileList
 ) -> ChapterDirected:
@@ -125,11 +179,16 @@ def direct_scene(
             cues_by_line = {
                 d.line: (d.emotion, d.cue.strip()) for d in result.directions
             }
-        except Exception:
+        except Exception as e:
+            # A bad / unparseable answer only costs this scene its cues (all
+            # lines "calm"). A dead server must fail the step instead, or
+            # every remaining scene caches cue-less and the launcher's
+            # `ensure_vllm` retry never runs.
+            if is_transport_error(e):
+                raise
             cues_by_line = {}
 
     profile_map = _profile_lookup(profiles)
-    narrator_descriptor = profile_map.get(NARRATOR_NAME, DEFAULT_NARRATOR_DESCRIPTOR)
 
     directed_scenes: list[DirectedScene] = []
     line_no = 0
@@ -139,14 +198,7 @@ def direct_scene(
             item = scene.items[i]
             line_no += 1
             emotion, cue = cues_by_line.get(line_no, ("calm", ""))
-            if is_group_label(item.speaker):
-                # Group lines render with the Narrator voice (§17.6); the sync
-                # file keeps the original label from 00_script.json.
-                render_speaker = NARRATOR_NAME
-                descriptor = narrator_descriptor
-            else:
-                render_speaker = item.speaker
-                descriptor = profile_map.get(item.speaker) or narrator_descriptor
+            render_speaker, descriptor = _voice_for(item.speaker, profile_map)
             for chunk in _split_long_text(spoken_text(item.text)):
                 beats.append(
                     DirectedBeat(
@@ -168,7 +220,11 @@ def direct_scene(
                     beats=beats,
                 )
             )
-    return ChapterDirected(chapter_id=scene.scene_id, scenes=directed_scenes)
+    return ChapterDirected(
+        chapter_id=scene.scene_id,
+        voice_descriptors=scene_voice_descriptors(scene, profile_map),
+        scenes=directed_scenes,
+    )
 
 
 def run(
@@ -179,20 +235,28 @@ def run(
     *,
     casting: BookCasting | None = None,
     voicebank: Voicebank | None = None,
+    regen_profiles: bool = False,
     on_scene_done: Callable[[ScriptScene, ChapterDirected], None] | None = None,
 ) -> list[ChapterDirected]:
-    """Direct every scene; idempotent per scene like s3 (cached on disk)."""
+    """Direct every scene; idempotent per scene like s3 (cached on disk).
+
+    Casting-aware like s3: profiles regenerate only for recast characters
+    (all of them with `regen_profiles`), and a cached scene whose voices'
+    descriptors changed is re-voiced (prompts rebuilt, emotion/cue kept).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    profiles_path = output_dir / "03_voice_profiles.json"
-    if profiles_path.exists():
-        profiles = VoiceProfileList.model_validate_json(
-            profiles_path.read_text(encoding="utf-8")
-        )
-    else:
-        profiles = generate_voice_profiles(
-            client, cast, casting=casting, voicebank=voicebank
-        )
-        profiles_path.write_text(profiles.model_dump_json(indent=2), encoding="utf-8")
+    profiles, previous = refresh_voice_profiles(
+        client,
+        cast,
+        output_dir / "03_voice_profiles.json",
+        casting=casting,
+        voicebank=voicebank,
+        regen=regen_profiles,
+    )
+    profile_map = _profile_lookup(profiles)
+    # Scenes directed before descriptor records existed are dated from the
+    # profiles file as it was on disk (see s3_director.run).
+    legacy_map = _profile_lookup(previous) if previous is not None else profile_map
 
     directed_dir = output_dir / "03_directed"
     directed_dir.mkdir(exist_ok=True)
@@ -200,6 +264,7 @@ def run(
     for scene in script.scenes:
         cached_path = directed_dir / f"{scene.scene_id}.json"
         result: ChapterDirected | None = None
+        dirty = False
         if cached_path.exists():
             try:
                 result = ChapterDirected.model_validate_json(
@@ -207,8 +272,24 @@ def run(
                 )
             except Exception:
                 result = None
+        if result is not None:
+            current = scene_voice_descriptors(scene, profile_map)
+            if result.voice_descriptors is None:
+                result.voice_descriptors = scene_voice_descriptors(scene, legacy_map)
+                dirty = True
+            if result.voice_descriptors != current:
+                revoiced = revoice_scene(result, current)
+                if revoiced is not None:
+                    print(f"  [scenario] {scene.scene_id}: voice descriptor changed — re-voiced prompts")
+                    result = revoiced
+                    dirty = True
+                else:
+                    print(f"  [scenario] {scene.scene_id}: speaker set changed — re-directing")
+                    result = None
         if result is None:
             result = direct_scene(client, scene, profiles)
+            dirty = True
+        if dirty:
             cached_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         results.append(result)
         if on_scene_done:

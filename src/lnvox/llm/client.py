@@ -1,5 +1,7 @@
+import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Callable, Type, TypeVar
 
@@ -11,6 +13,8 @@ from lnvox.config import Settings
 
 
 T = TypeVar("T", bound=BaseModel)
+
+_log = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _jinja = Environment(
@@ -48,16 +52,64 @@ def _extract_json(text: str) -> str:
     return stripped
 
 
+def is_transport_error(exc: BaseException) -> bool:
+    """True when `exc` means the LLM server is unreachable or failing.
+
+    As opposed to the model returning a bad answer. Stages that tolerate a bad
+    answer (skip a cue, keep a block as prose) must re-raise these: swallowing
+    them caches degraded output for every remaining chapter, and the step
+    never fails, so the launcher's `ensure_vllm` hook never relaunches the
+    server.
+    """
+    import openai
+
+    return isinstance(
+        exc,
+        (openai.APIConnectionError, openai.InternalServerError, ConnectionError),
+    )
+
+
+def _is_retryable_transport_error(exc: BaseException) -> bool:
+    """A failure where re-sending the same request is cheap and may succeed.
+
+    Connection refused/reset (server restarting, port not yet bound) and 503
+    (llama-server's "Loading model", vLLM overload) — nothing was generated.
+    A reset mid-generation means the server died; the retry then fails fast
+    with a refusal and the error propagates within seconds. NOT timeouts —
+    `APITimeoutError` subclasses `APIConnectionError`, but a generation that
+    ran out its per-call timeout will just run it out again — and not other
+    HTTP status errors (a 400 context overflow or a 500 is deterministic).
+    """
+    import openai
+
+    if isinstance(exc, openai.APITimeoutError):
+        return False
+    if isinstance(exc, openai.APIConnectionError):
+        return True
+    return isinstance(exc, openai.APIStatusError) and exc.status_code == 503
+
+
 class LLMClient:
+    # Backoff (seconds) before each transport-level retry of one request in
+    # `structured()`; its length is the retry count. Kept short on purpose:
+    # a server that stays down for longer should fail the stage so the
+    # launcher's `ensure_vllm` step hook relaunches it.
+    _TRANSPORT_RETRY_BACKOFF_S: tuple[float, ...] = (2.0, 5.0)
+
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings()
         # We do NOT set a global timeout on the client because the right
         # timeout varies wildly with the requested max_tokens (e.g. an s2
         # segment_chapter wanting 28k tokens vs. a voice_match wanting 800).
         # Per-call timeouts are computed in `structured()` from the config.
+        # max_retries=0: the SDK's default (2) silently re-sent TIMED-OUT
+        # generations, so one attempt could wait ~3× the per-call timeout
+        # computed below (hours on a slow host). Transport retries are done
+        # explicitly in `structured()` instead, and never for timeouts.
         self.client = OpenAI(
             base_url=self.settings.llm.endpoint,
             api_key=self.settings.llm.api_key,
+            max_retries=0,
         )
 
     def render(self, template: str, **kwargs) -> str:
@@ -99,6 +151,27 @@ class LLMClient:
         cfg = self.settings.llm
         return cfg.timeout_base_seconds + max_tokens * cfg.timeout_seconds_per_token
 
+    def _create_with_transport_retry(self, **request):
+        """`chat.completions.create`, re-sent on retryable transport errors.
+
+        See `structured()` for the policy. The request is re-sent unchanged:
+        nothing was generated, so there's nothing to adapt.
+        """
+        backoffs = self._TRANSPORT_RETRY_BACKOFF_S
+        for retry in range(len(backoffs) + 1):
+            try:
+                return self.client.chat.completions.create(**request)
+            except Exception as e:
+                if retry == len(backoffs) or not _is_retryable_transport_error(e):
+                    raise
+                delay = backoffs[retry]
+                _log.warning(
+                    "LLM request to %s failed (%s: %s); retrying in %.0fs (%d/%d)",
+                    self.settings.llm.endpoint, type(e).__name__, e, delay,
+                    retry + 1, len(backoffs),
+                )
+                time.sleep(delay)
+
     def structured(
         self,
         *,
@@ -114,6 +187,18 @@ class LLMClient:
         `salvage`, if given, is a last resort: when every attempt fails to
         parse (e.g. the model ran past `max_tokens` mid-array), it is handed the
         raw text to recover whatever complete records it can, instead of raising.
+
+        Two independent retry layers:
+        - Validation: up to `attempts` requests, re-sampling after a
+          schema-invalid reply and growing the budget after a length cut
+          (below). Salvage applies only here.
+        - Transport: each request is re-sent after a connection error or an
+          HTTP 503 (normally before any generation), once per entry of
+          `_TRANSPORT_RETRY_BACKOFF_S`, sleeping that long first; then the
+          error propagates (salvage is not tried). Timeouts and every other
+          `openai` error propagate immediately — the SDK itself never
+          retries (max_retries=0), so one request waits at most
+          `_timeout_for(max_tokens)`.
         """
         effective_max = max_tokens or self.settings.llm.max_tokens
         extra_body: dict = {"guided_json": schema.model_json_schema()}
@@ -186,7 +271,7 @@ class LLMClient:
                     f"satisfies the schema. Escape all double quotes inside "
                     f"string values."
                 )
-            response = self.client.chat.completions.create(
+            response = self._create_with_transport_retry(
                 model=self.settings.llm.model,
                 messages=[
                     {"role": "system", "content": system},

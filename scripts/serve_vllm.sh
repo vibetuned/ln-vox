@@ -28,6 +28,8 @@ fi
 
 # Pick a sensible default max-model-len based on the model. NVFP4 31B is
 # memory-tight; smaller defaults prevent CUDA OOM. Override via the env var.
+# run_pipeline.sh mirrors this rule to tell the python client the same
+# window (LNVOX_LLM_MAX_MODEL_LEN) — keep the two in step.
 if [[ "$MODEL" == *31B* || "$MODEL" == *27B* ]]; then
     # KV-cache grows linearly with context. At 31B with fp8 KV cache on a
     # 32GB card, 20K tokens leaves ~2GB of safety margin after weights +

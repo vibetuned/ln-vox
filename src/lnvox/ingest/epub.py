@@ -13,6 +13,10 @@ Reads an EPUB file and writes the layout consumed by `lnvox ingest`:
             ...
         .epub_meta.json    (title, authors, cover_image, image list, chapter map)
 
+The `NN` prefix is zero-padded to the width the chapter count needs (min 2:
+`001-…` for a 100+ chapter book). A re-extraction first removes the chapter
+files the previous run listed in `.epub_meta.json`.
+
 Multi-part chapters (e.g. `chapter1.xhtml` + `chapter1_1.xhtml`) are merged
 into a single .txt by stripping the trailing `_N` suffix and grouping. Image-
 only spine items (insert*, bonus*, color*, cover, TOCimg) are skipped from
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -78,6 +83,25 @@ class EpubMeta:
 
 def _is_skip(stem: str) -> bool:
     return any(p.match(stem) for p in _SKIP_STEM_PATTERNS)
+
+
+def _norm_href(href: str) -> str:
+    """Percent-decoded, `..`/`.`-collapsed form of an OPF-relative href."""
+    return posixpath.normpath(unquote(href.split("#")[0]))
+
+
+def _resolve_href(page_href: str, ref: str) -> str:
+    """Resolve `ref` (as written in the XHTML at `page_href`) to an
+    OPF-relative path comparable with `_norm_href(manifest_href)`.
+
+    Relative references resolve against the page's own directory — both
+    paths are relative to the OPF, so no opf_dir is involved. `pathlib`
+    can't do this: `Path("a/../b").as_posix()` keeps the `..`.
+    """
+    ref = unquote(ref.split("#")[0])
+    if ref.startswith("/"):
+        return posixpath.normpath(ref.lstrip("/"))
+    return posixpath.normpath(posixpath.join(posixpath.dirname(page_href), ref))
 
 
 def _slugify(s: str, max_len: int = 80) -> str:
@@ -136,12 +160,18 @@ def _is_chapter_marker(el) -> bool:
 def _marker_title(el) -> str:
     """Chapter title for a marker element.
 
-    Headings carry their own text. A bare anchor does not — fall back to the
-    alt/title of the image that renders the chapter head (the illustrated
-    case), then to a humanised form of the anchor id.
+    Headings carry their own text. A bare anchor does not — fall back to a
+    heading it wraps, then to the alt/title of the image that renders the
+    chapter head (the illustrated case), then to a humanised form of the
+    anchor id.
     """
     if el.name in _HEADING_TAGS:
         text = el.get_text(" ", strip=True)
+        if text:
+            return text
+    else:
+        inner = el.find(_HEADING_TAGS)
+        text = inner.get_text(" ", strip=True) if inner is not None else ""
         if text:
             return text
     img = el.find_next("img")
@@ -222,8 +252,22 @@ def _nav_titles(zf, opf_dir: str, manifest: dict) -> dict[str, str]:
 
 
 def chapter_markers(soup) -> list:
-    """Chapter-start markers on a page, in document order (DESIGN.md §18.3)."""
-    return [el for el in soup.find_all(True) if _is_chapter_marker(el)]
+    """Chapter-start markers on a page, in document order (DESIGN.md §18.3).
+
+    A marker nested in another marker is the same chapter start, not a second
+    one: Gutenberg writes `<h2><a id="chap01"/>CHAPTER I.</h2>`, which used to
+    count twice — an empty chapter for the heading, then the real text under
+    a bogus title ("chap01", or a later picture's alt text). The outer element
+    is kept (its heading text is the title).
+    """
+    out = []
+    for el in soup.find_all(True):
+        if not _is_chapter_marker(el):
+            continue
+        if any(_is_chapter_marker(p) for p in el.parents if p.name):
+            continue
+        out.append(el)
+    return out
 
 
 def section_key(stem: str, marker, index: int) -> str:
@@ -287,11 +331,15 @@ def _split_page_sections(
 def _xhtml_to_blocks(
     xhtml_bytes: bytes,
     *,
+    stem: str = "",
     classifier: str = "fallback",
     llm=None,
     render_template=None,
 ):
     """Lecture-mode page parse (DESIGN.md §13.2).
+
+    ``stem`` is the spine XHTML's filename stem (``index`` for ``index.xhtml``)
+    — what the boilerplate-stem rule of `page_drop_reason` is written for.
 
     Returns ``(title, paragraphs, blocks)`` where:
       - ``paragraphs`` is the narratable prose (one entry per paragraph), and
@@ -307,9 +355,11 @@ def _xhtml_to_blocks(
     from lnvox.ingest.blocks import classify_page, page_drop_reason
 
     soup = BeautifulSoup(xhtml_bytes, "html.parser")
-    h = soup.find(["h1", "h2"])
-    stem_hint = (h.get_text(" ", strip=True) if h else "")[:40]
-    if page_drop_reason(soup, stem_hint) is not None:
+    # The FILE stem, not the page's heading: the stem rule is a prefix match
+    # (`index…`, `glossary…`), so fed heading text it dropped chapters titled
+    # "Index Funds…" while never looking at index.xhtml itself. Whole-title
+    # headings ("Index", "Contents") are page_drop_reason's own heading rule.
+    if page_drop_reason(soup, stem) is not None:
         return None
 
     title, classified = classify_page(
@@ -325,6 +375,32 @@ def _xhtml_to_blocks(
             continue
         blocks.append((len(paragraphs) - 1, cb))
     return title, paragraphs, blocks
+
+
+def _remove_previous_chapter_files(output_dir: Path) -> int:
+    """Delete the chapter .txt files an earlier `extract_epub` wrote here.
+
+    The list comes from that run's `.epub_meta.json` (`chapters[].file`); a
+    name that isn't a bare `*.txt` in `output_dir` is ignored, so a hand-edited
+    sidecar can't point the delete anywhere else. Returns the count removed.
+    """
+    meta_path = output_dir / ".epub_meta.json"
+    try:
+        chapters = json.loads(meta_path.read_text(encoding="utf-8")).get("chapters") or []
+    except (OSError, ValueError, AttributeError):
+        return 0
+    removed = 0
+    for ch in chapters:
+        name = ch.get("file") if isinstance(ch, dict) else None
+        if not isinstance(name, str) or not name.endswith(".txt"):
+            continue
+        if Path(name).name != name or name.startswith("."):
+            continue
+        path = output_dir / name
+        if path.is_file():
+            path.unlink()
+            removed += 1
+    return removed
 
 
 def _visual_element_for(
@@ -513,8 +589,10 @@ def extract_epub(
             _emit(meta.cover_image)
 
         # Build href → rel for quick lookup of image refs from XHTML spine pages.
+        # Keyed on the normalised, percent-decoded OPF-relative path so it
+        # compares equal to a resolved <img src> (see _resolve_href).
         href_to_rel: dict[str, str] = {
-            href: image_rel_by_iid[iid]
+            _norm_href(href): image_rel_by_iid[iid]
             for iid, (href, mt, _props) in manifest.items()
             if iid in image_rel_by_iid
         }
@@ -533,7 +611,6 @@ def extract_epub(
             from bs4 import BeautifulSoup as _BS
 
             soup_page = _BS(page_bytes, "html.parser")
-            page_dir = Path(href).parent.as_posix()
             for img in soup_page.find_all(["img", "image"]):
                 raw_src = (
                     img.get("src")
@@ -543,25 +620,18 @@ def extract_epub(
                 )
                 if not raw_src:
                     continue
-                # Resolve relative to the page's directory, then to opf_dir.
-                resolved = (
-                    f"{page_dir}/{raw_src}" if page_dir and not raw_src.startswith("/") else raw_src
-                )
-                # Normalize "./foo", "bar/../baz", etc.
-                resolved = Path(resolved).as_posix()
-                rel = href_to_rel.get(resolved)
-                if rel is None:
-                    # Try a stripped lookup (some EPUBs use ../Images/foo.jpg
-                    # while the manifest href is Images/foo.jpg).
-                    candidate = resolved.replace("../", "")
-                    rel = href_to_rel.get(candidate)
+                # `../Images/foo.jpg` from `Text/ch1.xhtml` → `Images/foo.jpg`,
+                # the manifest's own (OPF-relative) spelling.
+                rel = href_to_rel.get(_resolve_href(href, raw_src))
                 if rel is None:
                     # Last resort: match by basename. Loses precision when two
                     # images share a basename in different folders, but covers
-                    # the common case of href-resolution drift.
-                    base = Path(raw_src).name
+                    # EPUBs whose references don't resolve (a src escaping the
+                    # OPF directory, a manifest href that disagrees with the
+                    # file layout).
+                    base = posixpath.basename(unquote(raw_src.split("#")[0]))
                     for h, r in href_to_rel.items():
-                        if Path(h).name == base:
+                        if posixpath.basename(h) == base:
                             rel = r
                             break
                 if rel:
@@ -600,6 +670,7 @@ def extract_epub(
             if mode == "lecture":
                 parsed = _xhtml_to_blocks(
                     xhtml,
+                    stem=stem,
                     classifier=classifier,
                     llm=llm,
                     render_template=(llm.render if llm is not None else None),
@@ -659,6 +730,19 @@ def extract_epub(
             bare = str(_p[3]).split("#")[0]
             stems_per_chapter[bare] = stems_per_chapter.get(bare, 0) + 1
 
+    # A re-extraction with different options (--split-chapters, --mode) yields
+    # different chapter files; the previous run's must not linger, or Stage 0
+    # would ingest both sets. Only the files the previous run itself listed
+    # are removed — anything else in the folder was not written by us.
+    removed = _remove_previous_chapter_files(output_dir)
+    if removed:
+        progress(f"  removed {removed} chapter file(s) from the previous extraction")
+
+    # Zero-padded to the width the chapter count needs (min 2, so books under
+    # 100 chapters keep their historical `NN` ids): every downstream stage
+    # orders chapter ids / files as strings.
+    id_width = max(2, len(str(len(chapter_order))))
+
     for i, base in enumerate(chapter_order, start=1):
         parts = chapter_groups[base]
         # Sort parts by spine index — handles weird manifest ordering.
@@ -678,10 +762,10 @@ def extract_epub(
                 if nav and not _is_bare_numeral_title(nav):
                     title = nav
                     break
-        chapter_id = f"{i:02d}"
+        chapter_id = f"{i:0{id_width}d}"
 
         slug = _slugify(title)
-        filename = f"{i:02d}-{slug}.txt"
+        filename = f"{chapter_id}-{slug}.txt"
 
         if mode == "lecture":
             # Concatenate parts' paragraphs into one chapter-global list so the

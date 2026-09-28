@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from lnvox.ingest.text import Chapter
-from lnvox.llm.client import LLMClient
+from lnvox.llm.client import LLMClient, is_transport_error
 from lnvox.llm.schemas import Character, CharacterList, CharacterMergeProposal
 
 
@@ -103,7 +103,9 @@ def _load_prior_volume_casts(prior_volume_dirs: list[Path]) -> list[CharacterLis
 
 # Fuzzy name match: high cutoff + min length so we don't fuse short distinct
 # names ("Mark"/"Marx"). Catches transliteration / typo variants ("Gunther"/
-# "Gunter", "Tuuli"/"Tuli").
+# "Gunter" 0.92, "Frederick"/"Frederik" 0.94) — but not a dropped letter in a
+# short name ("Tuuli"/"Tuli" scores 0.89): that fusion is left to the LLM
+# merge pass (`merge_clusters`).
 _FUZZY_NAME_THRESHOLD = 0.9
 _FUZZY_MIN_LEN = 4
 
@@ -224,9 +226,25 @@ def sanitize_character_list(cl: CharacterList, chapter_text: str) -> CharacterLi
     return cl.model_copy(update={"characters": kept})
 
 
-def _digits(s: str) -> list[str]:
-    """Runs of digits in a string, e.g. 'Knight 12' → ['12']."""
-    return re.findall(r"\d+", s)
+# Trailing enumerators that tell apart otherwise-identical role names:
+# a single letter ("Attendant A") or a roman numeral up to XXXIX ("Guard II",
+# "Henry IV"). Only i/v/x numerals — "Li", "Di", "Mi" are real name tokens.
+_ROMAN_NUMERAL_RE = re.compile(r"x{0,3}(?:ix|iv|v?i{0,3})")
+
+
+def _enumerators(s: str) -> list[str]:
+    """Enumerator tokens of a normalized name: every digit run plus a
+    trailing single-letter / roman-numeral token, e.g. 'knight 12' → ['12'],
+    'attendant b' → ['b'], 'guard iii' → ['iii'], 'gunther' → []."""
+    found = re.findall(r"\d+", s)
+    tokens = s.split()
+    if len(tokens) >= 2:
+        last = tokens[-1].strip(".")
+        if (len(last) == 1 and last.isalpha()) or (
+            last and _ROMAN_NUMERAL_RE.fullmatch(last)
+        ):
+            found.append(last)
+    return found
 
 
 def _similar(a: str, b: str) -> bool:
@@ -244,7 +262,10 @@ def _similar(a: str, b: str) -> bool:
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     if len(short) >= _FUZZY_MIN_LEN and short in long:
         return True
-    if min(len(a), len(b)) >= _FUZZY_MIN_LEN:
+    # Same enumerator guard as the fuzzy pass in `cluster_characters`:
+    # "Attendant A"/"Attendant B" are 0.91-similar but two people, so a key
+    # they share ("attendant") must read as generic, not as one identity.
+    if min(len(a), len(b)) >= _FUZZY_MIN_LEN and _enumerators(a) == _enumerators(b):
         if difflib.SequenceMatcher(None, a, b).ratio() >= _FUZZY_NAME_THRESHOLD:
             return True
     return False
@@ -412,9 +433,11 @@ def cluster_characters(
                 continue
             if find(i) == find(j):
                 continue
-            # Never fuse enumerated names whose digits differ — "Knight 1" and
-            # "Knight 2" are 0.9-similar but distinct people.
-            if _digits(ni) != _digits(nj):
+            # Never fuse enumerated names whose enumerators differ — "Royal
+            # Knight 1"/"Royal Knight 2" (0.93), "Attendant A"/"Attendant B"
+            # (0.91) and "Guard II"/"Guard III" (0.94) all clear the threshold
+            # but are distinct people.
+            if _enumerators(ni) != _enumerators(nj):
                 continue
             if difflib.SequenceMatcher(None, ni, nj).ratio() >= _FUZZY_NAME_THRESHOLD:
                 union(i, j)
@@ -547,6 +570,14 @@ def _apply_merge_groups(
         if ra != rb:
             parent[rb] = ra
 
+    # Genders present in each current union (keyed by root). The safety net
+    # must check the WHOLE union: checking only each root's own cluster let
+    # [Male, Unknown] then [Unknown, Female] fuse a man and a woman, because
+    # the second group saw the Unknown root, not the Male member behind it.
+    genders: dict[int, set[str]] = {
+        i: ({c.gender} - {"unknown"}) for i, c in enumerate(clusters)
+    }
+
     hints: dict[int, str] = {}
     for g in proposal.merges:
         roots = sorted(
@@ -554,11 +585,12 @@ def _apply_merge_groups(
         )
         if len(roots) < 2:
             continue  # nothing real to merge (unknown or single name)
-        known = {clusters[r].gender for r in roots if clusters[r].gender != "unknown"}
+        known = set().union(*(genders[r] for r in roots))
         if len(known) > 1:
             continue  # safety net: never fuse a known gender split
         for other in roots[1:]:
             union(roots[0], other)
+        genders[find(roots[0])] = known
         if g.canonical:
             hints.setdefault(find(roots[0]), g.canonical)
 
@@ -612,7 +644,12 @@ def merge_clusters(
         proposal = client.structured(
             system=SYSTEM, user=user, schema=CharacterMergeProposal, max_tokens=budget
         )
-    except Exception:
+    except Exception as e:
+        # An unusable proposal just means no cross-name fusions. A dead
+        # server must fail the step instead: falling back would write an
+        # un-merged 01_characters.json that s2 then segments against.
+        if is_transport_error(e):
+            raise
         return _deterministic_merge(clusters)
 
     return _apply_merge_groups(clusters, proposal)

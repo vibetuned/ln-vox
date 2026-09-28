@@ -1,0 +1,322 @@
+---
+title: CLI reference
+description: Every lnvox command and option, generated from the Typer app in src/lnvox/cli.py — arguments, defaults and help text.
+sidebar:
+  order: 1
+---
+
+Every stage of ln-vox is a subcommand of the `lnvox` CLI (`src/lnvox/cli.py`, entry point `lnvox = "lnvox.cli:app"`). Run them from the repository root with `uv run lnvox …` so relative paths (`artifacts/`, `novels/`, `voicebank/`, `cache/`) resolve the way the launcher expects. [`scripts/run_pipeline.sh`](/launcher/run-pipeline/) chains them for you; the pages under **Pipeline stages** explain each one in depth.
+
+This page is generated from the Typer app itself, so option names, types and defaults are exact. `BOOK_ID` is always `<series>/<volume-NN>` or a flat id, and resolves to `artifacts/<BOOK_ID>/` (see [concepts](/start/concepts/)).
+
+:::tip[Global behaviour]
+- The LLM connection for every LLM-calling command comes from [`lnvox.config.Settings`](/library/config/) — `LNVOX_LLM__ENDPOINT`, `LNVOX_LLM_MODEL`, `LNVOX_LLM_MAX_MODEL_LEN`, … (see [environment variables](/reference/environment/)).
+- Every command that reads the voicebank uses `$LNVOX_VOICEBANK` (default `voicebank`).
+- `uv run lnvox --help` and `uv run lnvox <command> --help` print the same information.
+:::
+
+## Stage commands
+
+### `lnvox ingest-epub`
+
+Stage 0a: Extract an EPUB into the novels/-folder layout. See [ingest-epub](/stages/ingest-epub/).
+
+```bash
+uv run lnvox ingest-epub <EPUB_PATH> <OUTPUT_DIR> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `EPUB_PATH` | required |  |
+| `OUTPUT_DIR` | required | Destination folder (e.g. novels/level99/volume-01) |
+| `--mode` `TEXT` | `narration` | narration (multi-voice novel) or lecture (single-voice non-fiction: classify blocks, drop boilerplate, render code/tables to images). See DESIGN.md §13. |
+| `--ingest-classifier` `TEXT` | `fallback` | Lecture mode: 'fallback' (LLM only on untagged blocks) or 'none' (rules only). |
+| `--no-render` | off | Lecture mode: skip rasterizing code/tables to PNG (record HTML-only). |
+| `--split-chapters` | off | Cut a spine page into several chapters at its chapter markers (headings, or Gutenberg `id="Chapter_XI"` anchors). For EPUBs that pack a whole book into a few XHTML files. DESIGN.md §18. |
+
+### `lnvox ingest`
+
+Stage 0: Parse a folder of chapter .txt files into JSONL. See [ingest](/stages/ingest/).
+
+```bash
+uv run lnvox ingest <FOLDER> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `FOLDER` | required |  |
+| `--book-id` `TEXT` | — | Defaults to the folder's path under ./novels (novels/series/volume-01 → series/volume-01), else the folder name. |
+| `--mode` `TEXT` | `narration` | narration (default) or lecture. In lecture mode a Narrator-only 01_characters.json stub is written so `voice cast` runs without s1. |
+
+### `lnvox ingest-scenario`
+
+Scenario mode (DESIGN.md §17): structure a theater script. See [ingest-scenario](/stages/ingest-scenario/).
+
+```bash
+uv run lnvox ingest-scenario <MD_PATH> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `MD_PATH` | required | Theater-script markdown file. |
+| `--id` `TEXT` | required | Artifact id (e.g. 'my-play'). |
+| `--title` `TEXT` | — | Play title (default: filename). |
+| `--language` `TEXT` | `fr` | Script language tag stored in 00_script.json. |
+| `--no-cache` | off | Re-roll the structuring: ignore the cache/scenario/ LLM cache (content-keyed on system + rendered prompt + model) for this run, and overwrite its entries with the fresh results. |
+
+### `lnvox s1`
+
+Stage 1: Extract characters from ingested chapters via Gemma 4. See [s1-characters](/stages/s1-characters/).
+
+```bash
+uv run lnvox s1 <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--chapters` `TEXT` | — | Comma-separated chapter ids (default: all). |
+
+### `lnvox s2`
+
+Stage 2: Split chapters into scenes and tag dialogue speakers. See [s2-scenes](/stages/s2-scenes/).
+
+```bash
+uv run lnvox s2 <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--chapters` `TEXT` | — | Comma-separated chapter ids (default: all). |
+
+### `lnvox s3`
+
+Stage 3: Generate Dramabox-ready stage directions per beat. See [s3-director](/stages/s3-director/).
+
+```bash
+uv run lnvox s3 <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--chapters` `TEXT` | — | Comma-separated chapter ids (default: all). |
+| `--regen-profiles` | off | Force-regenerate EVERY voice profile. Not needed after a recast: profiles of recast characters regenerate on their own. Chapters whose descriptors change are re-voiced (and so re-rendered by s4). |
+
+### `lnvox lecture`
+
+Lecture mode: build single-voice narration beats (replaces s1/s2/s3). See [lecture](/stages/lecture/).
+
+```bash
+uv run lnvox lecture <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--chapters` `TEXT` | — | Comma-separated chapter ids (default: all). |
+| `--no-normalize` | off | Skip the LLM speech-normalize pass; read text verbatim (text == source_span). |
+
+### `lnvox scenario`
+
+Scenario mode direction pass (DESIGN.md §17.3). See [scenario](/stages/scenario/).
+
+```bash
+uv run lnvox scenario <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--regen-profiles` | off | Force-regenerate EVERY voice profile (recast characters regenerate on their own). Scenes whose descriptors change are re-voiced. |
+
+### `lnvox s4`
+
+Stage 4: Render directed beats to audio via the selected TTS backend. See [s4-tts](/stages/s4-tts/).
+
+```bash
+uv run lnvox s4 <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--chapters` `TEXT` | — | Comma-separated chapter ids (default: all). |
+| `--limit` `INTEGER` | — | Render at most N beats overall (smoke-test mode). |
+| `--device` `TEXT` | — | Torch device for Dramabox. Defaults to 'mps' on Apple Silicon when available, else 'cuda'. Pass 'cpu' to force CPU. |
+| `--staged` | off | Run the crash-isolated staged pipeline (DESIGN.md §15): four checkpointed phases, one model in VRAM at a time, subprocess per phase with automatic resume. |
+| `--keep-staged`, `--no-keep-staged` | off | Keep _staged/ intermediates after a successful staged run (debugging). |
+| `--tts-backend` `TEXT` | — | TTS engine: 'dramabox' (default, per-beat → 05_audio/) or 'vibevoice' (multi-speaker sessions → 05_audio_v2/, DESIGN.md §16). Falls back to $LNVOX_TTS_BACKEND, else dramabox. |
+| `--max-session-chars` `INTEGER` | `3000` | vibevoice only: max characters per generation session — the cache-granularity vs prosody-continuity tradeoff (DESIGN.md §16.3). |
+| `--no-trim` | off | Keep the engine-emitted leading/trailing silence (the edge-silence trim is on by default — DESIGN.md §2.6). |
+
+### `lnvox s4-phase` (hidden)
+
+Internal: run ONE staged-s4 phase sweep (DESIGN.md §15). See [staged](/library/tts/staged/).
+
+```bash
+uv run lnvox s4-phase <PHASE> <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `PHASE` | required |  |
+| `BOOK_ID` | required |  |
+| `--device` `TEXT` | — | Torch device (default: auto). |
+
+### `lnvox s5`
+
+Stage 5: Mix rendered beats into a final .m4b with chapter markers. See [s5-mix](/stages/s5-mix/).
+
+```bash
+uv run lnvox s5 <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--chapters` `TEXT` | — | Comma-separated chapter ids (default: all). |
+| `--title` `TEXT` | — | Book title for the m4b (defaults to book_id). |
+| `--intra` `FLOAT` | `0.25` | Intra-scene silence in seconds. |
+| `--inter-scene` `FLOAT` | `1.0` | Inter-scene silence in seconds. |
+| `--inter-chapter` `FLOAT` | `2.0` | Inter-chapter silence in seconds. |
+| `--lead-in` `FLOAT` | `0.0` | Extra silence before EVERY beat. Scenario mode uses 0.35 so the reader app's ~0.3 s playback poll lands in silence before each line (DESIGN.md §17.4); books keep 0. |
+| `--lufs` `FLOAT` | `-18.0` | Target loudness in LUFS. |
+| `--kbps` `INTEGER` | `96` | AAC bitrate (kbps). |
+| `--cover` `PATH` | — | Path to a cover image to embed. Auto-detected from 00_book_meta.json if omitted. |
+| `--images-dir` `PATH` | — | Directory of additional images to embed (illustrations, back cover, etc.). Auto-detected from novels/<book>/images/ if omitted. Each image becomes a separate attached_pic stream with title=<stem>. |
+| `--novels-root` `PATH` | `novels` | Where chapter .txt files (and the images/ sibling) live. |
+| `--v2` | off | Mix from 05_audio_v2/ (VibeVoice session renders, DESIGN.md §16) instead of 05_audio/. |
+| `--keep-work` | off | Keep 06_final/_work/ (per-chapter and full-book WAVs) after a successful mix, for debugging. It is always kept when the mix fails. |
+
+### `lnvox s6`
+
+Stage 6: Wrap original EPUB XHTML with beat spans + sync_manifest.json. See [s6-sync](/stages/s6-sync/).
+
+```bash
+uv run lnvox s6 <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--epub` `PATH` | — | Path to the source EPUB. Defaults to epubs/<book_id>.epub (e.g. epubs/level99/volume-01.epub). |
+| `--novels-root` `PATH` | `novels` | Where the novels/<book_id>/.epub_meta.json lives. |
+| `--title` `TEXT` | — | Which mix to sync against: the `lnvox s5 --title` of 06_final/<title>.m4b. Default: the newest mix in 06_final/. |
+| `--intra` `FLOAT` | — | Override the intra-scene silence. Default: the mix's recorded value, else 0.25. |
+| `--inter-scene` `FLOAT` | — | Override the inter-scene silence. Default: the mix's recorded value, else 1.0. |
+| `--inter-chapter` `FLOAT` | — | Override the inter-chapter silence. Default: the mix's recorded value, else 2.0. |
+| `--lead-in` `FLOAT` | — | Override the per-beat lead-in. Default: the mix's recorded value, else 0. |
+
+### `lnvox scenario-sync`
+
+Scenario mode sync emitter (DESIGN.md §17.4). See [scenario-sync](/stages/scenario-sync/).
+
+```bash
+uv run lnvox scenario-sync <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--title` `TEXT` | — | Which mix to follow: the `lnvox s5 --title` of 06_final/<title>.m4b. Default: the newest mix in 06_final/. |
+| `--intra` `FLOAT` | — | Pad between lines of one run (s5 --intra). Default: the mix's value, else 0.25. |
+| `--staging-pause` `FLOAT` | — | Pause where staging happens (s5 --inter-scene). Default: the mix's value, else 1.0. |
+| `--inter-scene` `FLOAT` | — | Pad between script scenes (s5 --inter-chapter). Default: the mix's value, else 0.75 — the play pacing; 2 s drags (§17.4). |
+| `--lead-in` `FLOAT` | — | Per-beat lead-in silence (s5 --lead-in). Default: the mix's value, else 0.35, which covers the reader app's ~0.3 s poll (§17.4). |
+
+### `lnvox sample`
+
+Cut a small, committable demo sample from a finished book. See [utilities](/stages/utilities/).
+
+```bash
+uv run lnvox sample <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--out` `PATH` | — | Output dir (default: samples/<book>). |
+| `--chapters` `TEXT` | — | Two consecutive chapter ids, e.g. '14,15'. Default: best-scoring pair. |
+| `--minutes` `FLOAT` | `12.0` | Sample length, centred on the boundary. |
+| `--title` `TEXT` | — | Title for the sample. If 06_final/<title>.m4b exists, that mix is sliced; otherwise the one sync_manifest.json was timed against. |
+| `--novels-root` `PATH` | `novels` |  |
+
+## `lnvox voice` — Voicebank management & casting
+
+### `lnvox voice seed-cv`
+
+Populate the voicebank from a locally-extracted Common Voice tarball. See [voicebank](/stages/voicebank/).
+
+```bash
+uv run lnvox voice seed-cv <CV_ROOT> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `CV_ROOT` | required | Path to extracted Common Voice locale dir (contains clips/ and .tsv files) |
+| `--max-speakers` `INTEGER` | `150` | Maximum speakers to keep |
+| `--tsv` `TEXT` | `validated.tsv` | Preferred TSV inside cv_root (falls back to train/dev/test if missing) |
+| `--target-seconds` `FLOAT` | `12.0` | Target ref clip length |
+| `--min-seconds` `FLOAT` | `8.0` | Drop speakers below this total duration |
+| `--accent` `TEXT` (repeatable) | — | Keep only speakers with this accent code; repeat for several (e.g. --accent us --accent england). Default: every accent. |
+| `--rank-by-quality` | off | Select speakers by measured recording quality (bandwidth, SNR, hum, hiss) instead of client_id order, with per-gender/age quotas. Adds a probe pass. DESIGN.md §19. |
+| `--max-candidates` `INTEGER` | — | --rank-by-quality: speakers to probe (default: max-speakers x 6). |
+
+### `lnvox voice list`
+
+Summarise the current voicebank. See [voicebank](/stages/voicebank/).
+
+```bash
+uv run lnvox voice list  [OPTIONS]
+```
+
+### `lnvox voice cast`
+
+LLM-match each character to a voicebank clip; write 04_voice_assignments.json. See [voice-cast](/stages/voice-cast/).
+
+```bash
+uv run lnvox voice cast <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--top-n` `INTEGER` | `3` | Number of candidates to rank per character |
+| `--narrator-clip` `TEXT` | — | Voicebank clip id to use for the Narrator (overrides auto-cast + any prior-volume reuse, but not a Narrator marked "locked": true in this volume's 04_voice_assignments.json). An id not in the voicebank exits 2 before anything is cast. |
+| `--fresh` | off | Re-cast characters with no prior-volume match instead of keeping their clip from this volume's existing 04_voice_assignments.json. Entries marked "locked": true are still kept. |
+
+### `lnvox voice audit`
+
+Check that characters who share scenes have distinguishable voices. See [voice-audit](/stages/voice-audit/).
+
+```bash
+uv run lnvox voice audit <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--fix` | off | Reassign the lower-speaking side of each collision. |
+| `--min-semitones` `FLOAT` | `2.5` | Flag scene-sharing pairs closer than this in pitch. |
+| `--min-shared` `INTEGER` | `3` | Ignore pairs with less shared-scene dialogue than this. |
+
+## `lnvox audio` — Rendered-audio management (purge, inspect)
+
+### `lnvox audio purge`
+
+Delete one speaker's rendered WAVs + content-hash cache entries, so the next s4 run renders them afresh. See [utilities](/stages/utilities/).
+
+```bash
+uv run lnvox audio purge <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--speaker` `TEXT` | required | Speaker name to purge (e.g. 'Narrator', 'Kamijou Touma'). |
+| `--cache-dir` `PATH` | `cache/tts` | TTS cache directory to also clean. |
+| `--yes`, `-y` | off | Skip confirmation prompt. |
+| `--v2` | off | Purge VibeVoice sessions in 05_audio_v2/ instead of Dramabox beats in 05_audio/. A session holds several speakers' lines, so every session the speaker appears in is purged — and re-rendered whole. |
+

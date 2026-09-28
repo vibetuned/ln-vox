@@ -247,6 +247,40 @@ def _soft_filter_by_accent(
     return (preferred + rest)[:max_keep]
 
 
+def _offered_choices(
+    ranked: MatchResult, candidates: list[VoiceClip]
+) -> list[_RankedChoice]:
+    """The ranked choices whose clip_id is one of the candidates offered.
+
+    The ranking LLM only ever sees `candidates`, so any other id is invented
+    (or copied from the prompt's example). Committing it would pass here and
+    fail only at s4, which refuses a casting that names unknown clips — after
+    the rest of the LLM phase has been paid for.
+    """
+    offered = {c.id for c in candidates}
+    return [rc for rc in ranked.ranked_choices if rc.clip_id in offered]
+
+
+def _fallback_choice(
+    ranked: MatchResult, candidates: list[VoiceClip]
+) -> tuple[_RankedChoice, str]:
+    """Deterministic pick when the ranking offered nothing usable: the first
+    candidate in filter order (accent matches first, then manifest order).
+    Returns the choice and an `audit_note` recording why it was made."""
+    n = len(ranked.ranked_choices)
+    why = (
+        "ranking returned no choice"
+        if n == 0
+        else f"none of the {n} ranked clip id(s) was among the {len(candidates)} offered"
+    )
+    choice = _RankedChoice(
+        clip_id=candidates[0].id,
+        score=0.0,
+        reason=f"Fallback: {why}; first candidate in filter order.",
+    )
+    return choice, f"voice cast: {why}; fell back to the first candidate"
+
+
 def rank_candidates(
     client: LLMClient,
     character: Character,
@@ -299,18 +333,42 @@ def cast_book(
     top_n: int = 3,
     max_candidates_per_char: int = 60,
     prior_index: PriorCastIndex | None = None,
+    existing: BookCasting | None = None,
     narrator_clip_override: str | None = None,
     on_character_done=None,
 ) -> BookCasting:
     """Cast each character to a voicebank clip.
+
+    Per character, the first source that applies wins:
+
+      1. `existing` entry with `locked: true` (a deliberate hand edit)
+      2. `narrator_clip_override` (Narrator only)
+      3. `prior_index` match (continuity chains)
+      4. `existing` entry, unlocked (keeps re-runs idempotent)
+      5. fresh cast (LLM), or unassigned for a gender the bank doesn't cover
 
     Args:
         prior_index: If supplied (built from ALL prior volumes in the same
             series), characters whose name or aliases match a prior
             assignment keep that prior clip without an LLM call. Narrator
             also inherits unless `narrator_clip_override` is set.
+        existing: This volume's own current casting (its
+            04_voice_assignments.json), matched by name/alias like a prior
+            volume. A locked entry beats everything, the override included:
+            it is how a hand re-cast of a recurring character survives the
+            next `voice cast`. An unlocked entry is the weakest layer — kept
+            only when no prior volume knows the character, so continuity
+            still wins but a first-appearance character isn't re-rolled.
+            Whenever the assigned clip is the entry's own, its `locked`,
+            `audit_note` and `voice_descriptor` carry over; a descriptor
+            written for a different clip never does.
         narrator_clip_override: Explicit clip id for the Narrator. Overrides
             both the LLM auto-cast AND any prior-volume Narrator assignment.
+
+    Raises:
+        ValueError: `narrator_clip_override` is not in the voicebank. Checked
+            before any LLM call — the synthesised Narrator is cast LAST, so a
+            late check wastes every other character's calls.
     """
 
     profiles_by_name: dict = {}
@@ -319,27 +377,52 @@ def cast_book(
 
     # Voicebank lookup by clip id for resolving overrides + reuses.
     clip_by_id = {c.id: c for c in voicebank.clips}
+    if narrator_clip_override and narrator_clip_override not in clip_by_id:
+        raise ValueError(
+            f"--narrator-clip {narrator_clip_override!r} not in voicebank."
+        )
+
+    cast = list(cast)
+    # This volume's own entries, looked up the same way as a prior volume's
+    # so an s1 re-run that renamed a character still finds its entry. The
+    # current cast is the alias source, exactly as the entries were written.
+    own_index: PriorCastIndex | None = None
+    if existing is not None and existing.castings:
+        own_index = PriorCastIndex()
+        own_index.add_volume(existing, cast)
 
     # Synthesize a Narrator Character if it's not in the s1 cast already.
     # In the v2 order (voice cast before s3), there's no profiles file yet,
-    # so we MUST look at every other source before falling back to defaults:
-    #   1. --narrator-clip override   → derive from the chosen clip
-    #   2. Prior volume's casting     → reuse the prior Narrator's demographics
-    #   3. Existing profiles file     → legacy path (s3 ran before voice cast)
-    #   4. Default ("male" / "adult") → first volume, no override
-    cast = list(cast)
+    # so we MUST look at every other source before falling back to defaults.
+    # Same precedence as the per-character decision below:
+    #   1. This volume's LOCKED Narrator → its demographics
+    #   2. --narrator-clip override   → derive from the chosen clip
+    #   3. Prior volume's casting (else this volume's unlocked one)
+    #                                 → reuse that Narrator's demographics
+    #   4. Existing profiles file     → legacy path (s3 ran before voice cast)
+    #   5. Default (DEFAULT_NARRATOR_*: "female" / "adult") → first volume,
+    #      no override
     if not any(c.name == "Narrator" for c in cast):
         n_gender = DEFAULT_NARRATOR_GENDER
         n_age = DEFAULT_NARRATOR_AGE
         n_desc = "Neutral audiobook narrator for a modern action/fantasy young-adult novel."
+        own_n = own_index.lookup("Narrator") if own_index else None
         prior_n = prior_index.lookup("Narrator") if prior_index else None
-        if narrator_clip_override and narrator_clip_override in clip_by_id:
+        reuse_n = (
+            own_n
+            if own_n is not None
+            and own_n.locked
+            and own_n.assigned_clip_id in clip_by_id
+            else None
+        )
+        if reuse_n is None and narrator_clip_override:
             override_clip = clip_by_id[narrator_clip_override]
             n_gender = override_clip.gender
             n_age = override_clip.age_band
-        elif prior_n is not None:
-            n_gender = prior_n.target.gender or n_gender
-            n_age = prior_n.target.age_band or n_age
+        elif reuse_n is not None or prior_n is not None or own_n is not None:
+            reuse_n = reuse_n or prior_n or own_n
+            n_gender = reuse_n.target.gender or n_gender
+            n_age = reuse_n.target.age_band or n_age
         elif "Narrator" in profiles_by_name:
             np = profiles_by_name["Narrator"]
             n_gender, n_age = _derive_narrator_demographics(np.voice_descriptor)
@@ -355,16 +438,89 @@ def cast_book(
             )
         )
 
+    def _consistent(entry: CharacterCasting, character: Character) -> bool:
+        """Whether a stored assignment is safe to reuse unattended.
+
+        Its clip must still be in the bank. And a clip whose gender
+        contradicts BOTH the current character and the stored target is an
+        internally-inconsistent assignment (e.g. a hand-edit pointed at the
+        wrong clip) — recast rather than propagate it through the series.
+        """
+        clip = clip_by_id.get(entry.assigned_clip_id)
+        if clip is None:
+            return False
+        known = {character.gender, entry.target.gender} & {"male", "female"}
+        return not (known and clip.gender not in known)
+
+    def _descriptor(entry: CharacterCasting, character: Character) -> str:
+        # Prefer the stored voice_descriptor, otherwise (legacy assignments)
+        # derive one from the clip for the Narrator. Other characters keep an
+        # empty descriptor — s3 writes theirs with full personality detail.
+        if entry.voice_descriptor:
+            return entry.voice_descriptor
+        if character.name == "Narrator":
+            return descriptor_from_clip(clip_by_id[entry.assigned_clip_id])
+        return ""
+
     castings: list[CharacterCasting] = []
+
+    def _emit(
+        character: Character,
+        casting: CharacterCasting,
+        own: CharacterCasting | None,
+        note: str = "",
+    ) -> None:
+        # Provenance survives as long as the clip does: when the clip picked
+        # by another rule is the one this volume's entry already had, keep
+        # that entry's note and (hand-written or clip-derived) descriptor.
+        if own is not None and own.assigned_clip_id == casting.assigned_clip_id:
+            if own.voice_descriptor:
+                casting.voice_descriptor = own.voice_descriptor
+            if own.audit_note:
+                casting.audit_note = own.audit_note
+        if note and not casting.audit_note:
+            casting.audit_note = note
+        castings.append(casting)
+        if on_character_done:
+            on_character_done(character, casting)
+
     for character in cast:
-        # --- Narrator override takes priority over everything else ----------
-        if character.name == "Narrator" and narrator_clip_override:
-            clip = clip_by_id.get(narrator_clip_override)
-            if not clip:
-                raise ValueError(
-                    f"--narrator-clip {narrator_clip_override!r} not in voicebank."
+        own = (
+            own_index.lookup(character.name, character.aliases, character.gender)
+            if own_index
+            else None
+        )
+        note = ""
+
+        # --- A locked entry of this volume wins over everything -------------
+        # A lock is a deliberate hand edit (ComfyUI Set Voice, or JSON),
+        # so no automatic rule — prior volume, --narrator-clip, gender sanity
+        # check — may undo it. The only exception is a clip that no longer
+        # exists: keeping it would just fail at s4.
+        if own is not None and own.locked:
+            if own.assigned_clip_id in clip_by_id:
+                casting = own.model_copy(
+                    deep=True,
+                    update={
+                        "character_name": character.name,
+                        "voice_descriptor": _descriptor(own, character),
+                    },
                 )
-            castings.append(
+                _emit(character, casting, None)
+                continue
+            note = (
+                f"voice cast: locked clip {own.assigned_clip_id} is not in "
+                "the voicebank; re-cast"
+            )
+            own = None
+        elif own is not None and not _consistent(own, character):
+            own = None
+
+        # --- Narrator override: beats everything but a lock -----------------
+        if character.name == "Narrator" and narrator_clip_override:
+            clip = clip_by_id[narrator_clip_override]
+            _emit(
+                character,
                 CharacterCasting(
                     character_name="Narrator",
                     target=VoiceTarget(
@@ -380,55 +536,55 @@ def cast_book(
                     }],
                     assigned_clip_id=clip.id,
                     voice_descriptor=descriptor_from_clip(clip),
-                )
+                ),
+                own,
+                note,
             )
-            if on_character_done:
-                on_character_done(character, castings[-1])
             continue
 
         # --- Reuse prior-volume assignment if available ---------------------
+        # Beats this volume's own unlocked entry: that is what keeps a voice
+        # continuous across the series.
         prior = (
             prior_index.lookup(character.name, character.aliases, character.gender)
             if prior_index
             else None
         )
-        if prior and prior.assigned_clip_id in clip_by_id:
-            clip = clip_by_id[prior.assigned_clip_id]
-            # A clip whose gender contradicts BOTH the current character and
-            # the prior target is an internally-inconsistent assignment (e.g.
-            # a hand-edit pointed at the wrong clip) — recast rather than
-            # propagate it through the whole series.
-            known = {character.gender, prior.target.gender} & {"male", "female"}
-            if known and clip.gender not in known:
-                prior = None
-        else:
-            prior = None
-        if prior:
-            clip = clip_by_id[prior.assigned_clip_id]
-            # Prefer the prior's voice_descriptor if it was set there,
-            # otherwise (legacy assignments) derive one from the clip.
-            descriptor = prior.voice_descriptor or (
-                descriptor_from_clip(clip)
-                if character.name == "Narrator"
-                else ""
-            )
-            castings.append(
+        if prior is not None and _consistent(prior, character):
+            _emit(
+                character,
                 CharacterCasting(
                     character_name=character.name,
                     target=prior.target,
                     candidates_considered=prior.candidates_considered,
                     ranked=prior.ranked,
                     assigned_clip_id=prior.assigned_clip_id,
-                    voice_descriptor=descriptor,
-                )
+                    voice_descriptor=_descriptor(prior, character),
+                ),
+                own,
+                note,
             )
-            if on_character_done:
-                on_character_done(character, castings[-1])
+            continue
+
+        # --- Reuse this volume's own (unlocked) assignment ------------------
+        # Weakest layer: a character first cast on an earlier run of THIS
+        # volume keeps its clip instead of being re-rolled by the LLM, so a
+        # re-run is idempotent and already-rendered audio stays valid.
+        if own is not None:
+            casting = own.model_copy(
+                deep=True,
+                update={
+                    "character_name": character.name,
+                    "voice_descriptor": _descriptor(own, character),
+                },
+            )
+            _emit(character, casting, None, note)
             continue
 
         # --- Skip characters CV doesn't cover (nonbinary / unknown) ---------
         if character.gender not in ("male", "female"):
-            castings.append(
+            _emit(
+                character,
                 CharacterCasting(
                     character_name=character.name,
                     target=VoiceTarget(
@@ -438,18 +594,19 @@ def cast_book(
                     candidates_considered=0,
                     ranked=[],
                     assigned_clip_id="",
-                )
+                ),
+                None,
+                note,
             )
-            if on_character_done:
-                on_character_done(character, castings[-1])
             continue
 
         # --- Explicit Narrator default (no override, no prior volume) -------
         # Skip the LLM target inference: the Narrator's "personality" comes
         # from a synthetic description and inferring against it tends to drift.
-        # Use a fixed `female / adult / england` target, fall back to relaxed
-        # filters if the voicebank is sparse, and derive the descriptor from
-        # the chosen clip.
+        # Use a fixed `female / adult` target with `england` as an accent
+        # PREFERENCE (the soft filter puts those clips first; the hard filter
+        # never looks at accent), fall back to relaxed filters if the
+        # voicebank is sparse, and derive the descriptor from the chosen clip.
         if character.name == "Narrator":
             primary = VoiceTarget(
                 gender=DEFAULT_NARRATOR_GENDER,
@@ -457,19 +614,11 @@ def cast_book(
                 accent_keywords=[DEFAULT_NARRATOR_ACCENT],
             )
             candidates = _hard_filter(voicebank, primary)
-            relaxation = "exact (female/adult/england)"
-            # Fallback ladder: drop accent → drop age → drop gender.
+            relaxation = "female/adult, england first"
+            # Fallback ladder: drop age → drop gender. (Accent needs no rung:
+            # it is only an ordering preference, so it never empties the set.)
             if not candidates:
-                relaxation = "relaxed accent (female/adult/any)"
-                candidates = _hard_filter(
-                    voicebank,
-                    VoiceTarget(
-                        gender=DEFAULT_NARRATOR_GENDER,
-                        age_band=DEFAULT_NARRATOR_AGE,
-                    ),
-                )
-            if not candidates:
-                relaxation = "relaxed age (female/any-age/any)"
+                relaxation = "relaxed age (female/any age)"
                 candidates = [
                     c for c in voicebank.clips if c.gender == DEFAULT_NARRATOR_GENDER
                 ]
@@ -496,29 +645,31 @@ def cast_book(
                 ]
             elif len(soft) > 1:
                 ranked = rank_candidates(client, character, primary, soft, top_n=top_n)
-                ranked_choices = ranked.ranked_choices
-                if ranked_choices:
-                    top_id = ranked_choices[0].clip_id
-                    assigned_clip = clip_by_id.get(top_id) or soft[0]
-                else:
-                    assigned_clip = soft[0]
+                ranked_choices = _offered_choices(ranked, soft)
+                if not ranked_choices:
+                    fallback, fb_note = _fallback_choice(ranked, soft)
+                    ranked_choices = [fallback]
+                    note = "; ".join(filter(None, (note, fb_note)))
+                assigned_clip = clip_by_id[ranked_choices[0].clip_id]
 
             descriptor = (
                 descriptor_from_clip(assigned_clip)
                 if assigned_clip
                 else "adult, British, female, warm clear voice, measured and engaging storyteller"
             )
-            casting = CharacterCasting(
-                character_name="Narrator",
-                target=primary,
-                candidates_considered=len(soft),
-                ranked=ranked_choices,
-                assigned_clip_id=assigned_clip.id if assigned_clip else "",
-                voice_descriptor=descriptor,
+            _emit(
+                character,
+                CharacterCasting(
+                    character_name="Narrator",
+                    target=primary,
+                    candidates_considered=len(soft),
+                    ranked=ranked_choices,
+                    assigned_clip_id=assigned_clip.id if assigned_clip else "",
+                    voice_descriptor=descriptor,
+                ),
+                None,
+                note,
             )
-            castings.append(casting)
-            if on_character_done:
-                on_character_done(character, casting)
             continue
 
         prof = profiles_by_name.get(character.name)
@@ -531,7 +682,12 @@ def cast_book(
         hard = _hard_filter(voicebank, target)
         soft = _soft_filter_by_accent(hard, target, max_keep=max_candidates_per_char)
         ranked = rank_candidates(client, character, target, soft, top_n=top_n)
-        assigned = ranked.ranked_choices[0].clip_id if ranked.ranked_choices else ""
+        ranked_choices = _offered_choices(ranked, soft)
+        if soft and not ranked_choices:
+            fallback, fb_note = _fallback_choice(ranked, soft)
+            ranked_choices = [fallback]
+            note = "; ".join(filter(None, (note, fb_note)))
+        assigned = ranked_choices[0].clip_id if ranked_choices else ""
 
         # For the Narrator (auto-cast path), lock in a clip-derived descriptor
         # so s3 doesn't compose a free-text one that contradicts the chosen
@@ -541,16 +697,18 @@ def cast_book(
         if character.name == "Narrator" and assigned in clip_by_id:
             narrator_descriptor = descriptor_from_clip(clip_by_id[assigned])
 
-        casting = CharacterCasting(
-            character_name=character.name,
-            target=target,
-            candidates_considered=len(soft),
-            ranked=ranked.ranked_choices,
-            assigned_clip_id=assigned,
-            voice_descriptor=narrator_descriptor,
+        _emit(
+            character,
+            CharacterCasting(
+                character_name=character.name,
+                target=target,
+                candidates_considered=len(soft),
+                ranked=ranked_choices,
+                assigned_clip_id=assigned,
+                voice_descriptor=narrator_descriptor,
+            ),
+            None,
+            note,
         )
-        castings.append(casting)
-        if on_character_done:
-            on_character_done(character, casting)
 
     return BookCasting(book_id=book_id, castings=castings)

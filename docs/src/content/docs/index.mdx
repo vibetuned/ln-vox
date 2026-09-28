@@ -1,0 +1,58 @@
+---
+title: ln-vox
+description: Turn a novel, a non-fiction book or a theater script into a multi-voice, chaptered .m4b with text sync — on one workstation, fully offline.
+template: splash
+hero:
+  tagline: A self-hosted pipeline that reads a book, casts every character from a voicebank, directs each line, performs it with local TTS and mixes a chaptered .m4b that stays in sync with the EPUB.
+  actions:
+    - text: Quickstart
+      link: /start/quickstart/
+      icon: right-arrow
+    - text: How the pipeline works
+      link: /stages/overview/
+      variant: minimal
+    - text: ComfyUI nodes
+      link: /guides/comfyui/
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+```text
+LLM phase — Gemma 4 on llama.cpp · vLLM · mlx
+  EPUB / .txt ─► ingest ─► s1 cast ─► s2 scenes ─► voice cast ─► audit ─► s3 director
+                                                                               │
+TTS phase — Dramabox · VibeVoice, then ffmpeg                                  ▼
+  .m4b ◄── s5 mix ◄── s4 TTS ◄──────────────────────────────────────── directed beats
+    └──► s6 sync ──► synced EPUB + sync_manifest.json
+```
+
+<CardGrid>
+	<Card title="Three modes" icon="open-book">
+		**Narration** for novels (multi-voice, acted), **lecture** for non-fiction (one steady
+		voice, verbatim, code and tables shown as images) and **scenario** for plays (verbatim
+		lines, per-line emotion, a timed sync file).
+	</Card>
+	<Card title="Two GPU phases, one launcher" icon="rocket">
+		`scripts/run_pipeline.sh` starts the LLM server, runs every LLM stage, hands the GPU to
+		the TTS model, then mixes and syncs — swapping the venv between the incompatible
+		torch builds each phase needs.
+	</Card>
+	<Card title="Idempotent, cached stages" icon="setting">
+		Every stage is its own `lnvox` command writing JSON under `artifacts/<book>/`. Re-running
+		resumes; the TTS cache is content-addressed, so editing one line re-renders one beat.
+	</Card>
+	<Card title="Series-aware" icon="list-format">
+		Volumes of a series share voices: recurring characters and the narrator keep their
+		clips from volume to volume automatically.
+	</Card>
+</CardGrid>
+
+## Where to go next
+
+<CardGrid>
+	<LinkCard title="Install" description="Linux + CUDA or Apple Silicon, Dramabox, llama.cpp and a voicebank." href="/start/installation/" />
+	<LinkCard title="Concepts" description="Book ids, the artifacts directory, caches and the LLM ↔ TTS hand-off." href="/start/concepts/" />
+	<LinkCard title="The launcher" description="Every option of run_pipeline.sh and every shell function inside it." href="/launcher/run-pipeline/" />
+	<LinkCard title="Library API" description="Each module of the lnvox package: classes, functions, file formats." href="/library/overview/" />
+</CardGrid>

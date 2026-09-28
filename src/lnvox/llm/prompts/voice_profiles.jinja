@@ -24,8 +24,12 @@ Strict rules for each profile:
 - Single comma-separated phrase, no period, no quotation marks.
 - Do NOT use the character's name inside the descriptor.
 
+{% if includes_narrator | default(true) %}
 The cast includes one entry named exactly `"Narrator"` — apply the same rules
 to it. The Narrator's accent and demographics come from its assigned clip.
+
+{% endif %}
+Write exactly one profile per cast entry below, and no others.
 
 ---
 Cast with assigned clip metadata (JSON):

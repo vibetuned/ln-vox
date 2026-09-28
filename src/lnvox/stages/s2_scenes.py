@@ -91,7 +91,15 @@ def _detect_boundaries(
         numbered_paragraphs=numbered,
     )
     # Boundaries are tiny: a handful of scenes, each a short metadata record.
-    budget = max(1024, min(8192, 80 * len(chunk.paragraphs) + 512))
+    # Clamped to what the served context leaves after this (up to ~40K-char)
+    # prompt: a fixed budget 400s (input + output > context) on a smaller
+    # --max-model-len.
+    budget = client.budget_for(
+        system=BOUNDARY_SYSTEM,
+        user=user,
+        desired=max(1024, min(8192, 80 * len(chunk.paragraphs) + 512)),
+        floor=1024,
+    )
     # Exceptions from `structured` (dead vLLM, persistent truncation) propagate
     # so the pipeline-level retry + `ensure_vllm` can restart the server. The
     # *only* in-band fallback below is "the LLM successfully returned an empty
@@ -127,6 +135,67 @@ def _detect_boundaries(
     return cleaned
 
 
+def _tile_boundaries(
+    boundaries: list[SceneBoundary], n_paragraphs: int
+) -> tuple[list[SceneBoundary], list[str]]:
+    """Repair Pass 2a's ranges so the scenes tile paragraphs 1..N exactly once.
+
+    The prompt asks for a gap-free, overlap-free tiling, but nothing enforced
+    it: Pass 2b only beat-tags the paragraphs inside a scene's range, so a
+    GAP left those paragraphs out of the audio entirely, and an OVERLAP
+    voiced them twice. Sort by start, clamp to the chapter, fold a gap into
+    the earlier scene (the head gap into the first one), trim an overlap off
+    the later scene (dropping one it fully covers), and stretch the last
+    scene to the final paragraph. Returns ``(tiled, repair notes)``.
+    """
+    if n_paragraphs <= 0 or not boundaries:
+        return boundaries, []
+    notes: list[str] = []
+    ordered: list[SceneBoundary] = []
+    for b in boundaries:
+        start = max(1, min(b.start_paragraph, n_paragraphs))
+        end = max(start, min(b.end_paragraph, n_paragraphs))
+        if (start, end) != (b.start_paragraph, b.end_paragraph):
+            notes.append(
+                f"clamped {b.start_paragraph}–{b.end_paragraph} to "
+                f"{start}–{end} (chapter has {n_paragraphs} paragraphs)"
+            )
+        ordered.append(
+            b.model_copy(update={"start_paragraph": start, "end_paragraph": end})
+        )
+    ordered.sort(key=lambda b: (b.start_paragraph, b.end_paragraph))
+
+    tiled: list[SceneBoundary] = []
+    next_para = 1  # first paragraph not yet covered
+    for b in ordered:
+        if b.end_paragraph < next_para:
+            notes.append(
+                f"dropped {b.start_paragraph}–{b.end_paragraph} "
+                f"(already covered by the previous scene)"
+            )
+            continue
+        if b.start_paragraph > next_para:
+            gap = f"{next_para}–{b.start_paragraph - 1}"
+            if tiled:
+                tiled[-1].end_paragraph = b.start_paragraph - 1
+                notes.append(f"gap {gap} folded into the previous scene")
+            else:
+                notes.append(f"head {gap} folded into the first scene")
+                b.start_paragraph = next_para
+        elif b.start_paragraph < next_para:
+            notes.append(
+                f"overlap {b.start_paragraph}–{next_para - 1} trimmed off "
+                f"{b.start_paragraph}–{b.end_paragraph}"
+            )
+            b.start_paragraph = next_para
+        tiled.append(b)
+        next_para = b.end_paragraph + 1
+    if next_para <= n_paragraphs:
+        notes.append(f"tail {next_para}–{n_paragraphs} folded into the last scene")
+        tiled[-1].end_paragraph = n_paragraphs
+    return tiled, notes
+
+
 def _tag_scene_beats(
     client: LLMClient,
     boundary: SceneBoundary,
@@ -146,12 +215,19 @@ def _tag_scene_beats(
     # `source_span`) plus keys/escapes — measured ~5.2x the scene chars on
     # dialogue-dense chapters, i.e. ~1.6 output tokens per source char; 1.4
     # under-shot those and died on finish_reason=length. 2.0 gives margin,
-    # capped well inside the context window; the client also grows the budget
-    # on a length cut now. Exceptions propagate (a dead vLLM here used to be
-    # silently swallowed into empty beats, which cached as a degenerate
-    # "1 scene, 0 beats" result and corrupted every subsequent chapter until
-    # the cache was wiped).
-    budget = max(4096, min(32000, int(len(scene_text) * 2.0) + 1024))
+    # capped at 32K and clamped by `budget_for` to what the served context
+    # leaves after the prompt (the scene text is IN the prompt, so a long
+    # scene on a 32K context would otherwise ask for more than fits and 400);
+    # the client also grows the budget on a length cut now. Exceptions
+    # propagate (a dead vLLM here used to be silently swallowed into empty
+    # beats, which cached as a degenerate "1 scene, 0 beats" result and
+    # corrupted every subsequent chapter until the cache was wiped).
+    budget = client.budget_for(
+        system=BEATS_SYSTEM,
+        user=user,
+        desired=max(4096, min(32000, int(len(scene_text) * 2.0) + 1024)),
+        floor=4096,
+    )
     return client.structured(
         system=BEATS_SYSTEM, user=user, schema=SceneBeats, max_tokens=budget
     )
@@ -180,6 +256,9 @@ def segment_chapter(
                 client, chapter, chunk, cast_json=cast_json, title=title
             )
         )
+    boundaries, repairs = _tile_boundaries(boundaries, len(paragraphs))
+    for note in repairs:
+        print(f"  [s2] {chapter.chapter_id}: scene ranges — {note}")
 
     # Pass 2b — beats per scene, sliced from the chapter-global paragraph list.
     all_scenes: list[Scene] = []

@@ -111,15 +111,49 @@ def is_roster_header(line: str) -> bool:
     return heading_shaped
 
 
+# A markdown list item (`- x`, `* x`, `+ x`, `1. x`) — how cast lists are
+# written. `**Name**` (bold) and `*staging*` (italic) are not list items.
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s+\S")
+
+
+def _split_cast_list(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Cut a cast-list section that no scene header ends into (cast, rest).
+
+    With no scene header nothing marks where the cast list stops and the play
+    starts. The cast list is the first block of lines under the heading,
+    extended across blank lines only while the next block is a markdown list
+    (a loose bullet list); the first other block starts the play.
+    """
+    i, n = 0, len(lines)
+    while i < n and not lines[i].strip():
+        i += 1
+    while i < n:
+        while i < n and lines[i].strip():
+            i += 1
+        j = i
+        while j < n and not lines[j].strip():
+            j += 1
+        if j < n and _LIST_ITEM_RE.match(lines[j]):
+            i = j
+            continue
+        break
+    return lines[:i], lines[i:]
+
+
 def chunk_script(md_text: str) -> tuple[list[str], list[tuple[str, str]]]:
     """Split a script into (roster_chunks, [(scene_title, scene_chunk), …]).
 
-    A chunk runs from one detected header to the next. Text before the first
-    header is kept as scene 0 only if it contains enough lines to matter
-    (title pages / cue legends are dropped into no-man's-land otherwise).
+    A chunk runs from one detected header (scene or cast-list heading) to the
+    next. When the script has scene headers, text before the first header of
+    any kind (title page, cue legend) is dropped.
+
+    A script with NO scene header is one scene (title ""): everything except
+    its cast list — the preamble plus whatever follows the cast list. (It used
+    to keep only the preamble, so the whole play after a "Personnages" heading
+    was filed under the roster and never structured.)
     """
     lines = md_text.splitlines()
-    roster_chunks: list[str] = []
+    roster_sections: list[list[str]] = []
     scenes: list[tuple[str, str]] = []
 
     current_title: str | None = None
@@ -129,11 +163,11 @@ def chunk_script(md_text: str) -> tuple[list[str], list[tuple[str, str]]]:
 
     def flush() -> None:
         nonlocal current, current_title, in_roster
-        body = "\n".join(current).strip()
-        if body:
-            if in_roster:
-                roster_chunks.append(body)
-            elif current_title is not None:
+        if in_roster:
+            roster_sections.append(current)
+        else:
+            body = "\n".join(current).strip()
+            if body and current_title is not None:
                 scenes.append((current_title, body))
         current = []
 
@@ -154,9 +188,22 @@ def chunk_script(md_text: str) -> tuple[list[str], list[tuple[str, str]]]:
         current.append(line)
     flush()
 
+    has_scene_header = any(is_scene_header(ln) for ln in lines)
+    roster_chunks: list[str] = []
+    remainder: list[str] = list(preamble)
+    for section in roster_sections:
+        cast, rest = (
+            (section, []) if has_scene_header else _split_cast_list(section)
+        )
+        body = "\n".join(cast).strip()
+        if body:
+            roster_chunks.append(body)
+        if rest:
+            remainder += [""] + rest
+
     if not scenes:
-        # No recognizable headers — the whole document is one scene.
-        body = "\n".join(preamble).strip()
+        # No recognizable scene headers — the whole play is one scene.
+        body = "\n".join(remainder).strip()
         if body:
             scenes.append(("", body))
     return roster_chunks, scenes
@@ -258,22 +305,31 @@ def cached_structured(
     schema,
     desired: int,
     floor: int,
+    refresh: bool = False,
 ):
     """`client.structured` behind a content-addressed disk cache.
 
-    Same philosophy as the s4 beat cache (§2.6): key = hash of the RENDERED
-    prompt + schema name + model, so editing the script re-keys only the
-    changed scenes, and a template or model change re-keys everything —
-    stale results can't survive by construction. A crash mid-ingest resumes
-    paying only for the chunks it hasn't structured yet.
+    Same philosophy as the s4 beat cache (§2.6): key = hash of the schema
+    name + system prompt + RENDERED user prompt + model, so editing the
+    script re-keys only the changed scenes, and a template, system-prompt or
+    model change re-keys everything — stale results can't survive by
+    construction. A crash mid-ingest resumes paying only for the chunks it
+    hasn't structured yet.
+
+    ``refresh`` skips the read but still writes: a re-roll replaces the
+    cached entry, so the NEXT cached run returns the new result rather than
+    the one the re-roll was meant to discard. ``cache_dir=None`` disables the
+    cache entirely.
 
     Returns (result, was_cache_hit).
     """
     path: Path | None = None
     if cache_dir is not None:
-        key = _cache_key(schema.__name__, user, client.settings.llm.model)
+        # The system prompt joined the key after the fact, so entries written
+        # before then simply miss once and are re-paid.
+        key = _cache_key(schema.__name__, system, user, client.settings.llm.model)
         path = cache_dir / f"{key}.json"
-        if path.exists():
+        if path.exists() and not refresh:
             try:
                 return schema.model_validate_json(path.read_text(encoding="utf-8")), True
             except Exception:
@@ -284,12 +340,24 @@ def cached_structured(
     )
     if path is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(result.model_dump_json(), encoding="utf-8")
+        _atomic_write_text(path, result.model_dump_json())
     return result, False
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a sibling temp file + rename, so a crash never leaves a
+    half-written file under the final name."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def structure_chunk(
-    client: LLMClient, chunk: str, cache_dir: Path | None = None
+    client: LLMClient,
+    chunk: str,
+    cache_dir: Path | None = None,
+    *,
+    refresh: bool = False,
 ) -> tuple[SceneStructure, bool]:
     user = client.render("scenario_structure.jinja", chunk=chunk)
     return cached_structured(
@@ -300,11 +368,16 @@ def structure_chunk(
         schema=SceneStructure,
         desired=max(4096, int(len(chunk) * 1.2)),
         floor=4096,
+        refresh=refresh,
     )
 
 
 def extract_roster(
-    client: LLMClient, roster_chunks: list[str], cache_dir: Path | None = None
+    client: LLMClient,
+    roster_chunks: list[str],
+    cache_dir: Path | None = None,
+    *,
+    refresh: bool = False,
 ) -> tuple[list[RosterEntry], int]:
     entries: list[RosterEntry] = []
     hits = 0
@@ -318,6 +391,7 @@ def extract_roster(
             schema=RosterList,
             desired=4096,
             floor=2048,
+            refresh=refresh,
         )
         entries.extend(result.entries)
         hits += cached
@@ -329,6 +403,8 @@ def extract_characters(
     roster: list[RosterEntry],
     scenes: list[ScriptScene],
     cache_dir: Path | None = None,
+    *,
+    refresh: bool = False,
 ) -> CharacterList:
     """Build the casting roster: script-given info + LLM gap-fill (§17.3).
 
@@ -375,6 +451,7 @@ def extract_characters(
         schema=CharacterList,
         desired=max(4096, 200 * len(payload) + 1024),
         floor=4096,
+        refresh=refresh,
     )
     # The LLM fills gender/age/description; the roster of names is ours.
     by_name = {c.name: c for c in result.characters}
@@ -398,12 +475,20 @@ def run(
     title: str = "",
     language: str = "fr",
     cache_dir: Path | None = Path("cache") / "scenario",
+    refresh_cache: bool = False,
     progress: Callable[[str], None] = print,
 ) -> ScenarioScript:
     """Structure one script markdown into artifacts/<id>/ (§17.3).
 
     LLM results are content-cached under `cache_dir` (None disables) — a
     re-run or crash-resume only pays for scenes whose text actually changed.
+    ``refresh_cache`` re-rolls every call and overwrites the cached entries
+    (`--no-cache`).
+
+    Every LLM pass runs before anything is written, and `00_script.json` is
+    written LAST (atomically): the launcher treats its existence as "ingest
+    done", so it must never sit next to a missing or stale
+    `01_characters.json` / `00_text.jsonl` after a crash.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     md_text = md_path.read_text(encoding="utf-8")
@@ -416,7 +501,9 @@ def run(
     llm_calls = 0
     roster: list[RosterEntry] = []
     if roster_chunks:
-        roster, hits = extract_roster(client, roster_chunks, cache_dir)
+        roster, hits = extract_roster(
+            client, roster_chunks, cache_dir, refresh=refresh_cache
+        )
         cache_hits += hits
         llm_calls += len(roster_chunks)
     if roster:
@@ -430,7 +517,9 @@ def run(
         scene_hits = 0
         parts = split_chunk(chunk)
         for part in parts:
-            structured, cached = structure_chunk(client, part, cache_dir)
+            structured, cached = structure_chunk(
+                client, part, cache_dir, refresh=refresh_cache
+            )
             validated, demoted = validate_items(structured.items, part)
             items.extend(validated)
             total_demoted += demoted
@@ -472,8 +561,11 @@ def run(
         roster=roster,
         scenes=scenes,
     )
-    (out_dir / "00_script.json").write_text(
-        script.model_dump_json(indent=2), encoding="utf-8"
+
+    # The characters pass is the last LLM call — run it BEFORE writing any
+    # artifact, so a crash here leaves the previous run's files untouched.
+    characters = extract_characters(
+        client, roster, scenes, cache_dir, refresh=refresh_cache
     )
 
     # One "chapter" per scene so s5 picks up titles for m4b chapter markers.
@@ -486,12 +578,12 @@ def run(
         for sc in script.scenes
     ]
     write_jsonl(chapters, out_dir / "00_text.jsonl")
-
-    characters = extract_characters(client, roster, scenes, cache_dir)
-    (out_dir / "01_characters.json").write_text(
-        characters.model_dump_json(indent=2), encoding="utf-8"
+    _atomic_write_text(
+        out_dir / "01_characters.json", characters.model_dump_json(indent=2)
     )
     progress(f"  ✓ {len(characters.characters)} character(s) for casting")
+    # Last, atomically: this file is the "ingest done" marker (see docstring).
+    _atomic_write_text(out_dir / "00_script.json", script.model_dump_json(indent=2))
     if cache_dir is not None:
         progress(f"  LLM cache: {cache_hits}/{llm_calls + 1} call(s) served from {cache_dir}/")
     return script

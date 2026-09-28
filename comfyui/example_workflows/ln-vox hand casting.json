@@ -1,0 +1,424 @@
+{
+  "id": "a36957e5-fc56-5ff6-a857-b860fdbd861b",
+  "revision": 0,
+  "last_node_id": 9,
+  "last_link_id": 7,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LnVoxBook",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        340,
+        484
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "links": [
+            1,
+            2,
+            4,
+            5
+          ]
+        },
+        {
+          "name": "log",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxBook"
+      },
+      "widgets_values": [
+        "series/volume-01",
+        "narration",
+        "",
+        "novels",
+        "",
+        "",
+        "",
+        ""
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LnVoxInspect",
+      "pos": [
+        380,
+        0
+      ],
+      "size": [
+        340,
+        316
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxInspect"
+      },
+      "widgets_values": [
+        "voicebank",
+        "female adult"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "LnVoxLoadAudio",
+      "pos": [
+        760,
+        0
+      ],
+      "size": [
+        340,
+        400
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            3
+          ]
+        },
+        {
+          "name": "path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxLoadAudio"
+      },
+      "widgets_values": [
+        "voicebank_clip",
+        "cv_REPLACE_ME",
+        "",
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": 4,
+      "type": "PreviewAudio",
+      "pos": [
+        1140,
+        0
+      ],
+      "size": [
+        340,
+        140
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PreviewAudio"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 5,
+      "type": "LnVoxInspect",
+      "pos": [
+        380,
+        560
+      ],
+      "size": [
+        340,
+        316
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxInspect"
+      },
+      "widgets_values": [
+        "casting",
+        ""
+      ]
+    },
+    {
+      "id": 6,
+      "type": "LnVoxSetVoice",
+      "pos": [
+        760,
+        560
+      ],
+      "size": [
+        340,
+        372
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "links": [
+            6
+          ]
+        },
+        {
+          "name": "log",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxSetVoice"
+      },
+      "widgets_values": [
+        "Narrator = cv_REPLACE_ME\n# Other Character = cv_…",
+        true,
+        "set by hand in ComfyUI",
+        0
+      ]
+    },
+    {
+      "id": 7,
+      "type": "LnVoxVoiceAudit",
+      "pos": [
+        1140,
+        560
+      ],
+      "size": [
+        340,
+        372
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "links": [
+            7
+          ]
+        },
+        {
+          "name": "log",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxVoiceAudit"
+      },
+      "widgets_values": [
+        "report",
+        2.5,
+        3,
+        0
+      ]
+    },
+    {
+      "id": 8,
+      "type": "LnVoxInspect",
+      "pos": [
+        1520,
+        560
+      ],
+      "size": [
+        340,
+        316
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "book",
+          "type": "LNVOX_BOOK",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LnVoxInspect"
+      },
+      "widgets_values": [
+        "casting",
+        ""
+      ]
+    },
+    {
+      "id": 9,
+      "type": "Note",
+      "pos": [
+        0,
+        560
+      ],
+      "size": [
+        340,
+        240
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "Note"
+      },
+      "widgets_values": [
+        "Hand casting — the --stop-after-audit loop, in ComfyUI.\n\nRun after Voice Cast + Casting Audit (e.g. the one-shot launcher with stop_after_audit) and BEFORE the Director (s3): descriptors are baked from the casting there.\n\nBrowse the bank (filter: gender / age / accent words), audition a clip, write 'Name = clip_id' lines into Set Voice, and re-check with the audit."
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      2,
+      1,
+      0,
+      3,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "AUDIO"
+    ],
+    [
+      4,
+      1,
+      0,
+      5,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      5,
+      1,
+      0,
+      6,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      6,
+      6,
+      0,
+      7,
+      0,
+      "LNVOX_BOOK"
+    ],
+    [
+      7,
+      7,
+      0,
+      8,
+      0,
+      "LNVOX_BOOK"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.65,
+      "offset": [
+        40,
+        80
+      ]
+    }
+  },
+  "version": 0.4
+}

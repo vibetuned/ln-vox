@@ -55,7 +55,19 @@ class VibeVoiceClient:
         "seed": 42,
     }
 
-    MODEL_VERSION = "vibevoice-large-cfg1.3-ddpm10-48k"
+    # Cache-key model version. The DDPM step count changes the audio, so it
+    # is part of the version — `model_version_for(steps)` is the key a
+    # render with `steps` must use; MODEL_VERSION is the default-steps one
+    # (unchanged, so existing default renders stay cached).
+    _MODEL_VERSION_FMT = "vibevoice-large-cfg1.3-ddpm{steps}-48k"
+    MODEL_VERSION = _MODEL_VERSION_FMT.format(steps=DEFAULT_PARAMS["ddpm_steps"])
+
+    @classmethod
+    def model_version_for(cls, ddpm_steps: int | None = None) -> str:
+        """Model version for a client built with `ddpm_steps` (None = default).
+        Classmethod so the lazy s4 path can key the cache before any load."""
+        steps = int(ddpm_steps or cls.DEFAULT_PARAMS["ddpm_steps"])
+        return cls._MODEL_VERSION_FMT.format(steps=steps)
 
     # Everything downstream (s5 silence pads, concat demuxer) assumes
     # 48 kHz stereo (DESIGN.md §2.6/§16.4); VibeVoice emits 24 kHz mono,
@@ -85,6 +97,10 @@ class VibeVoiceClient:
         self.device = device
         self.model_path = _resolve_model_path(model_path)
         self._ddpm_steps = ddpm_steps or int(self.DEFAULT_PARAMS["ddpm_steps"])
+        # The version THIS instance renders — s4_vibevoice.run checks it
+        # against the key version it was given (a steps override keyed with
+        # the class default would silently reuse other-step renders).
+        self.model_version = self.model_version_for(self._ddpm_steps)
 
         # Per-device knobs (DESIGN.md §16.5): bf16 on CUDA; fp32 on MPS
         # (the fork's MPS branch — fp16 produces artifacts) and CPU.

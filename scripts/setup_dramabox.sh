@@ -2,20 +2,26 @@
 # Clone Dramabox and install its requirements into the active uv venv.
 # Dramabox is not pip-installable; we vendor it at external/DramaBox.
 #
-# Platform handling:
-#   - x86_64 Linux     → install Dramabox's requirements.txt verbatim (pins torch==2.8.0+cu128).
+# Platform handling (run_pipeline.sh's install_dramabox_reqs mirrors it):
+#   - x86_64 Linux     → install Dramabox's requirements (keeping its
+#                        torch==2.8.0+cu128 pin) MINUS mamba-ssm/causal-conv1d,
+#                        then their prebuilt cu12torch2.8 wheels — sdist builds
+#                        link the wrong torch ABI (see the x86_64 branch).
 #   - aarch64 Linux (DGX Spark / Grace Hopper / Jetson)
-#                      → install Dramabox's requirements MINUS torch/torchaudio
-#                        (the pinned 2.8.0 has no CUDA-enabled aarch64 wheel),
-#                        then pull torch>=2.10 from the cu130 index which DOES
-#                        ship aarch64+sbsa builds with CUDA.
+#                      → install Dramabox's requirements MINUS torch/
+#                        torchaudio/torchvision (the pinned 2.8.0 has no
+#                        CUDA-enabled aarch64 wheel) and the mamba kernels,
+#                        then torch==2.10.* from the cu130 index (which DOES
+#                        ship aarch64+sbsa CUDA builds) and the prebuilt
+#                        cu13torch2.10 kernel wheels.
 #   - Darwin (Apple Silicon, secondary target — see DESIGN.md §11)
-#                      → install Dramabox's requirements MINUS torch/torchaudio
-#                        AND minus bitsandbytes (CUDA-only, no macOS wheel);
-#                        let pip pull the default MPS-capable torch wheel and
-#                        verify torch.backends.mps instead of torch.cuda.
-#                        DramaboxClient sets bnb_4bit=False on MPS, so the
-#                        missing bitsandbytes doesn't break the warm Gemma load.
+#                      → install Dramabox's requirements MINUS torch/
+#                        torchaudio/torchvision AND bitsandbytes (CUDA-only,
+#                        no macOS wheel), then MPS-capable PyPI torch
+#                        (>=2.10,<2.12) and verify torch.backends.mps instead
+#                        of torch.cuda. Without bnb the Gemma encoder loads
+#                        unquantized (dramabox_client.resolve_gemma_root —
+#                        an extra ~23 GB download on the first s4).
 #
 # The DramaboxClient wrapper monkey-patches torchaudio.save so version drift
 # between Dramabox's expected 2.8 and the 2.10+ we install on aarch64 doesn't
@@ -143,7 +149,7 @@ PY
     then
         echo "==> ✓ Dramabox ready at $EXTERNAL (MPS backend)"
         echo "    First model run will auto-download weights from HuggingFace (~15 GB)."
-        echo "    Expect 5-10x real-time render on Apple Silicon — see DESIGN.md §11.3."
+        echo "    Expect ~4 h of render per hour of audio (M4 Max, staged s4 — MAC_TEST_REPORT.md)."
     else
         echo "" >&2
         echo "==> ⚠  torch is installed but MPS is NOT available." >&2

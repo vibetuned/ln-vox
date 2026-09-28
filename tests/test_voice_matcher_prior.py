@@ -54,11 +54,12 @@ def _clip(clip_id, gender="male", age="teen"):
 
 
 class StubClient:
-    """LLM stand-in: fixed target inference + fixed top-ranked clip."""
+    """LLM stand-in: fixed target inference + fixed ranking (one id or a
+    list, in rank order)."""
 
-    def __init__(self, target: VoiceTarget, pick: str):
+    def __init__(self, target: VoiceTarget, pick):
         self.target = target
-        self.pick = pick
+        self.picks = [pick] if isinstance(pick, str) else list(pick)
         self.calls: list[str] = []
 
     def render(self, template, **kwargs):
@@ -69,7 +70,9 @@ class StubClient:
         if schema is VoiceTarget:
             return self.target
         return MatchResult(
-            ranked_choices=[_RankedChoice(clip_id=self.pick, score=0.9, reason="stub")]
+            ranked_choices=[
+                _RankedChoice(clip_id=p, score=0.9, reason="stub") for p in self.picks
+            ]
         )
 
 
@@ -218,3 +221,187 @@ def test_cast_book_recasts_internally_contradictory_prior():
     by_name = {c.character_name: c for c in result.castings}
     assert by_name["Miss Hollis"].assigned_clip_id == "f_good"
     assert client.calls  # a fresh LLM cast actually happened
+
+
+# --- This volume's own casting (`existing`): locks survive a re-cast --------
+
+
+def _locked(name, clip_id, note="set by hand", gender="male", age="teen", descriptor=""):
+    c = _casting(name, clip_id, gender=gender, age=age)
+    return c.model_copy(
+        update={"locked": True, "audit_note": note, "voice_descriptor": descriptor}
+    )
+
+
+def _series_bank():
+    return Voicebank(clips=[
+        _clip("m1"), _clip("m2"), _clip("m3"),
+        _clip("f_nar", gender="female", age="adult"),
+        _clip("f_alt", gender="female", age="adult"),
+    ])
+
+
+def _vol1_index():
+    idx = PriorCastIndex()
+    idx.add_volume(
+        _volume("s/volume-01", [
+            _casting("Aldric", "m1"),
+            _casting("Narrator", "f_nar", gender="female", age="adult"),
+        ]),
+        [_char("Aldric")],
+    )
+    return idx
+
+
+def test_locked_own_entry_beats_prior_volume_and_keeps_its_fields():
+    """A hand re-cast of a recurring character used to be undone by the next
+    `voice cast`: the prior volume won, and locked/audit_note were dropped."""
+    existing = _volume("s/volume-02", [_locked("Aldric", "m2", note="deeper voice")])
+    client = StubClient(VoiceTarget(gender="male", age_band="teen"), "m3")
+    result = cast_book(
+        client, "s/volume-02", [_char("Aldric")], _series_bank(),
+        prior_index=_vol1_index(), existing=existing,
+    )
+    aldric = {c.character_name: c for c in result.castings}["Aldric"]
+    assert aldric.assigned_clip_id == "m2"          # not vol-1's m1
+    assert aldric.locked and aldric.audit_note == "deeper voice"
+    assert client.calls == []
+
+
+def test_unlocked_own_entry_loses_to_prior_but_keeps_first_appearances():
+    existing = _volume("s/volume-02", [
+        _casting("Aldric", "m2").model_copy(update={"audit_note": "old note"}),
+        _casting("Brann", "m3").model_copy(update={"audit_note": "voice audit: moved"}),
+    ])
+    client = StubClient(VoiceTarget(gender="male", age_band="teen"), "m1")
+    result = cast_book(
+        client, "s/volume-02", [_char("Aldric"), _char("Brann")], _series_bank(),
+        prior_index=_vol1_index(), existing=existing,
+    )
+    by = {c.character_name: c for c in result.castings}
+    # Continuity chain wins over an unlocked own entry...
+    assert by["Aldric"].assigned_clip_id == "m1"
+    assert by["Aldric"].audit_note == ""            # note was about m2
+    # ...but a first-appearance character keeps its clip and provenance.
+    assert by["Brann"].assigned_clip_id == "m3"
+    assert by["Brann"].audit_note == "voice audit: moved"
+    assert not by["Brann"].locked
+    assert client.calls == []
+
+
+def test_voice_descriptor_carries_over_only_while_the_clip_is_unchanged():
+    existing = _volume("s/volume-02", [
+        # Written for m2, but vol-1 puts Aldric back on m1: must not follow.
+        _casting("Aldric", "m2").model_copy(update={"voice_descriptor": "for m2"}),
+        _casting("Brann", "m3").model_copy(update={"voice_descriptor": "for m3"}),
+    ])
+    result = cast_book(
+        StubClient(VoiceTarget(gender="male", age_band="teen"), "m1"),
+        "s/volume-02", [_char("Aldric"), _char("Brann")], _series_bank(),
+        prior_index=_vol1_index(), existing=existing,
+    )
+    by = {c.character_name: c for c in result.castings}
+    assert by["Aldric"].voice_descriptor == ""
+    assert by["Brann"].voice_descriptor == "for m3"
+
+
+def test_locked_narrator_beats_narrator_clip_override():
+    existing = _volume("s/volume-02", [
+        _locked("Narrator", "f_alt", gender="female", age="adult"),
+    ])
+    result = cast_book(
+        StubClient(VoiceTarget(gender="male", age_band="teen"), "m1"),
+        "s/volume-02", [], _series_bank(),
+        prior_index=_vol1_index(), existing=existing,
+        narrator_clip_override="f_nar",
+    )
+    narrator = result.castings[-1]
+    assert narrator.character_name == "Narrator"
+    assert narrator.assigned_clip_id == "f_alt" and narrator.locked
+    # Set Voice empties the descriptor; the Narrator's is rebuilt from the clip.
+    assert "female" in narrator.voice_descriptor
+
+
+def test_locked_entry_with_vanished_clip_is_recast_and_says_so():
+    existing = _volume("s/volume-02", [_locked("Brann", "m_gone")])
+    client = StubClient(VoiceTarget(gender="male", age_band="teen"), "m3")
+    result = cast_book(
+        client, "s/volume-02", [_char("Brann")], _series_bank(), existing=existing,
+    )
+    brann = {c.character_name: c for c in result.castings}["Brann"]
+    assert brann.assigned_clip_id == "m3" and not brann.locked
+    assert "m_gone" in brann.audit_note
+
+
+def test_unknown_narrator_clip_raises_before_any_llm_call():
+    client = StubClient(VoiceTarget(gender="male", age_band="teen"), "m1")
+    try:
+        cast_book(
+            client, "s/volume-01", [_char("Aldric"), _char("Brann")], _series_bank(),
+            narrator_clip_override="f_typo",
+        )
+    except ValueError as e:
+        assert "f_typo" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+    assert client.calls == []   # nobody was cast (or paid for) first
+
+
+# --- Ranked clip ids are checked against the candidates offered -------------
+
+
+def test_invented_clip_id_is_dropped_from_the_ranking():
+    client = StubClient(
+        VoiceTarget(gender="male", age_band="teen"), ["cv_invented", "m2", "f_nar"]
+    )
+    result = cast_book(client, "b", [_char("Aldric")], _series_bank())
+    aldric = {c.character_name: c for c in result.castings}["Aldric"]
+    # f_nar exists in the bank but was never offered (wrong gender/age).
+    assert [r.clip_id for r in aldric.ranked] == ["m2"]
+    assert aldric.assigned_clip_id == "m2"
+    assert aldric.audit_note == ""
+
+
+def test_no_offered_id_falls_back_to_first_candidate_and_records_it():
+    client = StubClient(VoiceTarget(gender="male", age_band="teen"), ["cv_nope"])
+    result = cast_book(client, "b", [_char("Aldric")], _series_bank())
+    aldric = {c.character_name: c for c in result.castings}["Aldric"]
+    assert aldric.assigned_clip_id == "m1"          # first in filter order
+    assert aldric.ranked[0].clip_id == "m1" and aldric.ranked[0].score == 0.0
+    assert "fell back" in aldric.audit_note
+
+
+# --- Narrator auto-cast relaxation ladder ------------------------------------
+
+
+def _narrator_only(bank, picks=()):
+    client = StubClient(VoiceTarget(gender="female", age_band="adult"), list(picks))
+    return cast_book(client, "b", [], bank).castings[-1]
+
+
+def test_narrator_ladder_prefers_england_but_never_filters_on_accent():
+    us = _clip("f_us", gender="female", age="adult")          # accent "us"
+    bank = Voicebank(clips=[us, _clip("m1")])
+    n = _narrator_only(bank)
+    assert n.assigned_clip_id == "f_us"
+    assert n.ranked[0].reason == "Sole candidate (female/adult, england first)."
+
+
+def test_narrator_ladder_relaxes_age_then_gender():
+    n = _narrator_only(Voicebank(clips=[_clip("f_ya", gender="female", age="young_adult"),
+                                        _clip("m1")]))
+    assert n.assigned_clip_id == "f_ya" and "relaxed age" in n.ranked[0].reason
+    n = _narrator_only(Voicebank(clips=[_clip("m1")]))
+    assert n.assigned_clip_id == "m1" and "any clip" in n.ranked[0].reason
+
+
+def _run_all():
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for fn in fns:
+        fn()
+        print(f"  ok: {fn.__name__}")
+    print(f"\n{len(fns)} test(s) passed.")
+
+
+if __name__ == "__main__":
+    _run_all()

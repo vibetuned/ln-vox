@@ -16,7 +16,11 @@ chapter-marker navigation. Runs on a single workstation with one consumer
 GPU (24 GB+ VRAM recommended).
 
 See [DESIGN.md](DESIGN.md) for the full architecture; this README focuses on
-how to actually run the pipeline.
+how to actually run the pipeline. The in-depth reference — every stage, flag,
+environment variable and artifact — is the documentation site in `docs/`
+(Astro Starlight): `cd docs && npm install && npm run dev`. To drive the
+stages as a node graph instead of the launcher, there's a ComfyUI node pack in
+`comfyui/` (docs site: *Guides → ComfyUI nodes*).
 
 ---
 
@@ -24,9 +28,9 @@ how to actually run the pipeline.
 
 ```
 ingest → s1 cast → s2 scenes → voice cast → s3 director → s4 tts → s5 mix → .m4b
-            ↑                       ↑                        ↑          ↑
-       prior volume's          prior volume's          Dramabox    ffmpeg
-       cast (merged)         clips (reused) +           (GPU)     loudnorm
+                                    ↑                        ↑          ↑
+                               prior volumes'          Dramabox    ffmpeg
+                             clips (reused) +           (GPU)     loudnorm
                               --narrator-clip                       + AAC
 ```
 
@@ -132,10 +136,13 @@ add `--llm-backend mlx`:
 
 What the Mac path does automatically:
 
-- **s4 auto-detects MPS** and applies the working per-phase dtype map:
-  Gemma prompt-encoder in bf16 (fp16 overflows to NaN → silent audio),
-  DiT in fp16, vocoder in fp32. The first run downloads the **unquantized**
-  encoder checkpoint (~23 GB) because the bnb-4bit one is CUDA-only.
+- **s4 auto-detects MPS** and, on the staged path (the launcher default),
+  applies the working per-phase dtype map: Gemma prompt-encoder in bf16
+  (fp16 overflows to NaN → silent audio), DiT in fp16, vocoder in fp32. The
+  first run downloads the **unquantized** encoder checkpoint (~23 GB) because
+  the bnb-4bit one is CUDA-only. Monolithic s4 (`lnvox s4` without
+  `--staged`, or `LNVOX_S4_STAGED=0` in the launcher) can't apply that map, so
+  it refuses MPS with exit 2 instead of rendering silence.
 - **Render chunks are capped at 22 s** — originally an MPS necessity (a
   boolean-indexing bug breaks the DiT mask on longer beats), now the
   default everywhere after blind-testing *better* than long chunks; see
@@ -150,9 +157,12 @@ mlx backend notes:
   mlx-lm release > 0.31.3 — released versions can't load Gemma 4 12B
   conversions). `gemma-4-E4B-it-4bit` fits 16 GB Macs but is structurally
   unreliable on s1/s2; the 31B QAT works but is far too slow for real books.
-- `mlx_lm.server` ignores per-request sampling and replays identical
+- `mlx_lm server` ignores per-request sampling and replays identical
   completions — `serve_mlx.sh` serves with `--temp` (`LNVOX_LLM_TEMP`,
   default 0.2) and the client feeds validation errors back into retries.
+- `mlx_lm server` has no context-window flag (the window comes from the
+  model's config), but the launcher's `--max-model-len` still tells the
+  client, so its output budgets fit.
 
 Sizing: 36 GB+ unified memory recommended (the bf16 encoder alone is
 ~24 GB). Measured on an M4 Max: ~3.6× real-time denoise ≈ **4 h of render
@@ -221,7 +231,10 @@ novels/
         ├── …
 ```
 
-The first non-empty line of each file is taken as the chapter title.
+The first non-empty line of each file is taken as the chapter title. For a
+hand-made folder, pad the prefixes to one width (`01-…` … `10-…`): Stage 0
+orders files numerically, but later stages sort chapter ids as strings, so
+`9-…` next to `10-…` would come out of order. (`ingest-epub` pads for you.)
 
 ---
 
@@ -240,27 +253,47 @@ The first non-empty line of each file is taken as the chapter title.
     --book-title "My Novel — Volume 2"
 ```
 
-The launcher manages vLLM and Dramabox transparently:
-1. **Starts vLLM** in the background (waits for the `/v1/models` endpoint).
-2. Runs ingest → s1 → s2 → voice cast → s3 against the local vLLM.
-3. **Stops vLLM** to free the GPU.
-4. Runs s4 (Dramabox, with auto-retry) → s5 (mix to .m4b).
+The launcher manages the LLM server and Dramabox transparently:
+1. **Starts the LLM server** in the background — llama-server by default,
+   vLLM or mlx with `--llm-backend` — and waits for its `/v1/models` endpoint.
+2. Runs ingest → s1 → s2 → voice cast → s3 against it.
+3. **Stops the LLM server** to free the GPU.
+4. Runs s4 (Dramabox, staged by default: crash-isolated phases that resume on
+   their own) → s5 (mix to .m4b).
 5. Runs s6 (sync layer) when the source EPUB is present — produces the synced
    EPUB + `sync_manifest.json`. Skipped automatically for a `.txt`-only book;
    pass `--skip-sync` to opt out, or `--epub <path>` to point at a non-default
    EPUB location.
 
-If you already have a vLLM serving (e.g. on a separate GPU), pass
-`--vllm-url http://host:8000/v1` to skip auto-start..gitignore
-often OOMs.** The 31B path is best for:
+A step that fails is retried (`--step-retries`, default 3) — except on exit 2,
+which is lnvox's "deterministic refusal" status (a mistyped `--narrator-clip`,
+a bad option or knob value): the launcher stops at once so you can fix the
+arguments. It reads only exported variables, never `.env`, and exports the
+model, endpoint and context length it picked to every stage.
+
+If you already have an LLM server running (e.g. on a separate GPU), pass
+`--vllm-url http://host:8000/v1` to skip auto-start (the flag name is
+historical; it works for any backend). Without it the server URL is
+`$LNVOX_LLM__ENDPOINT`, else `$LNVOX_LLM_ENDPOINT`, else
+`http://localhost:${LNVOX_LLM_PORT:-8000}/v1` — the probe and the stages
+always use the same one.
+
+**Bigger models (Gemma 4 31B on vLLM).** On a 32 GB desktop card the NVFP4
+31B only fits at a 20,480-token window — `serve_vllm.sh`'s default for
+31B/27B models, which the launcher also hands to the client so its
+output budgets fit — and a desktop session sharing the GPU often OOMs it.
+The 31B path is best for:
 - DGX-class machines (DGX Spark / H100 / B100) with ≥48 GB VRAM, or
 - Headless servers where no other process touches the GPU.
 
-On a roomy machine you can also bump `--max-model-len` higher:
+On a roomy machine you can also bump `--max-model-len` higher. It sizes the
+server **and** the client's output budgets (the launcher exports it as
+`LNVOX_LLM_MAX_LEN`, `LNVOX_LLM_MAX_MODEL_LEN` and `LNVOX_LLM__MAX_MODEL_LEN`):
 
 ```bash
 # DGX Spark or similar with abundant VRAM
 ./scripts/run_pipeline.sh novel-name/volume-01 \
+    --llm-backend vllm \
     --llm-model "nvidia/Gemma-4-31B-IT-NVFP4" \
     --max-model-len 65536 \
     --narrator-clip cv_051e865815e5
@@ -281,26 +314,37 @@ Stop the pipeline at the one point where fixing is free:
 ```
 
 That runs ingest → s1 → s2 → voice cast → **the casting audit (report only)**
-and stops. Nothing has been rendered, and s3 hasn't yet baked a voice
-descriptor per character from the casting — edit after s3 and the descriptor
-describes the old voice; edit after s4 and you pay a re-render.
+and stops. Nothing has been directed or rendered yet, so a fix costs nothing.
+Later is still fine, just not free: after s3, the next run regenerates the
+recast characters' voice descriptors and re-voices their chapters (no new
+direction calls); after s4, their beats re-render.
 
 Fix what it reported, in the Studio's Casting tab:
 
 ```bash
-LNVOX_VOICEBANK=voicebank uv run python scripts/voicebank_studio.py \
+uv run python scripts/voicebank_studio.py \
     --casting artifacts/novel-name/volume-01/04_voice_assignments.json
 uv run lnvox voice audit novel-name/volume-01        # re-check by the numbers
 ```
 
+(Prefix both with `LNVOX_VOICEBANK=…` for a non-default bank that isn't set
+in your `.env` — the launcher prints the exact commands for your run.)
+
 Then re-run the same command **without** `--stop-after-audit` to continue.
-s1/s2 and the voice cast are all cached, so it resumes rather than repeats.
+s1/s2 are cached per chapter and voice cast keeps the existing casting, so it
+resumes rather than repeats.
 
-Two things to know while casting:
+Three things to know while casting:
 
-- Set `"locked": true` on an assignment you want `--audit-cast fix` to leave
-  alone — deliberate sharing (a narrator who is also a character) is otherwise
-  indistinguishable from a mistake.
+- **Locks are what survive.** The Studio saves a re-cast as `"locked": true`.
+  A locked entry is kept by every later `voice cast` — over prior volumes,
+  `--fresh`, even over `--narrator-clip` for a locked Narrator (it warns and
+  ignores the flag) — and `--audit-cast fix` leaves it alone. For an edit made
+  in the JSON itself, set `"locked": true` yourself: an unlocked edit to a
+  character a prior volume already knows is undone by the next voice cast
+  (series continuity wins).
+- Locking is also how you mark deliberate sharing (a narrator who is also a
+  character), which the audit otherwise can't tell from a mistake.
 - The audit only flags pairs that **share scenes**. Two characters who never
   speak together can sound identical without anyone noticing.
 
@@ -312,7 +356,10 @@ want, and pass it via `--narrator-clip` on the FIRST volume only.
 
 Subsequent volumes auto-reuse the prior volume's narrator clip — you can
 omit `--narrator-clip` entirely. Pass it again only when you intentionally
-want to change the narrator mid-series.
+want to change the narrator mid-series. (A Narrator locked in this volume's
+casting wins over the flag — unlock it first. A clip id that isn't in the
+voicebank stops voice cast with exit 2 and a "Did you mean" hint, before any
+LLM call.)
 
 ### Stage-by-stage (advanced / re-runs)
 
@@ -323,14 +370,21 @@ outputs.
 |---|---|---|---|
 | 0a | `lnvox ingest-epub epubs/<series>/<vol>.epub novels/<series>/<vol>` | `.epub` | `novels/<series>/<vol>/*.txt` + `images/` + `.epub_meta.json` |
 | 0 | `lnvox ingest novels/novel-name/volume-01` | `.txt` files | `00_text.jsonl` |
-| 1 | `lnvox s1 novel-name/volume-01` | `00_text.jsonl` (+ prior `01_characters.json`) | `01_characters.json` |
+| 1 | `lnvox s1 novel-name/volume-01` | `00_text.jsonl` | `01_characters.json` |
 | 2 | `lnvox s2 novel-name/volume-01` | `00_text.jsonl` + `01_characters.json` | `02_scenes/*.json` |
-| V | `lnvox voice cast novel-name/volume-01 --narrator-clip cv_…` | `01_characters.json` + voicebank | `04_voice_assignments.json` |
+| V | `lnvox voice cast novel-name/volume-01 --narrator-clip cv_…` | `01_characters.json` + voicebank (+ prior volumes' `04_voice_assignments.json`) | `04_voice_assignments.json` |
 | A | `lnvox voice audit novel-name/volume-01 [--fix]` | `02_scenes/*.json` + `04_voice_assignments.json` | flags characters who share scenes but not distinguishable voices |
-| 3 | `lnvox s3 novel-name/volume-01 --regen-profiles` | `02_scenes/*.json` + `04_voice_assignments.json` | `03_directed/*.json` + `03_voice_profiles.json` |
-| 4 | `./scripts/s4_retry.sh novel-name/volume-01` | `03_directed/*.json` + `04_voice_assignments.json` | `05_audio/<ch>/*.wav` |
-| 5 | `lnvox s5 novel-name/volume-01 --title "…"` | `05_audio/<ch>/*.wav` | `06_final/<title>.m4b` |
-| 6 | `lnvox s6 <book>` | `03_directed/*.json` + `05_audio/<ch>/manifest.json` + original EPUB | `07_sync/<book>.epub` + `sync_manifest.json` |
+| 3 | `lnvox s3 novel-name/volume-01` | `02_scenes/*.json` + `04_voice_assignments.json` | `03_directed/*.json` + `03_voice_profiles.json` |
+| 4 | `lnvox s4 novel-name/volume-01 --staged` | `03_directed/*.json` + `04_voice_assignments.json` | `05_audio/<ch>/*.wav` + `manifest.json` |
+| 5 | `lnvox s5 novel-name/volume-01 --title "…"` | `05_audio/<ch>/*.wav` | `06_final/<title>.m4b` + `<title>.timings.json` |
+| 6 | `lnvox s6 <book>` | `03_directed/*.json` + `05_audio/<ch>/manifest.json` + the mix's `.timings.json` + original EPUB | `07_sync/<book>.epub` + `sync_manifest.json` |
+
+s3's caches are casting-aware: after a recast it regenerates only the recast
+characters' voice profiles and re-voices the cached chapters they speak in,
+without new direction calls. `--regen-profiles` forces *every* descriptor
+(and so a whole-book re-render in s4) — only for when you changed the
+descriptor prompt itself. Stage 4 without `--staged` is the monolithic path;
+run it under `./scripts/s4_retry.sh <book>` (see [s4 stability](#s4-stability)).
 
 ---
 
@@ -381,7 +435,8 @@ Flags specific to lecture mode:
   skipping s1/s2/s3.
 - `--no-normalize` — read the text verbatim (no speech-normalize LLM pass).
   Combined with `--narrator-clip`, the launcher makes **zero** LLM calls and
-  **skips vLLM entirely** — the run is ingest → cast → split → TTS → mix.
+  **skips the LLM server entirely** — the run is ingest → cast → split → TTS →
+  mix.
 
 ### The `render` extra (code/table images)
 
@@ -405,7 +460,7 @@ renderer. Pass `--no-render` to `ingest-epub` to skip rasterization explicitly.
 | 0 | `lnvox ingest novels/<book> --book-id <book> --mode lecture` | Writes `00_text.jsonl` + a Narrator-only `01_characters.json` stub (no s1). |
 | V | `lnvox voice cast <book> --narrator-clip cv_…` | Casts only the Narrator. |
 | L | `lnvox lecture <book> [--no-normalize]` | Split + speech-normalize → `03_directed/*.json`. **Replaces s1/s2/s3.** |
-| 4–6 | (unchanged) | `s4_retry.sh`, `lnvox s5`, `lnvox s6` run exactly as in narration mode. |
+| 4–6 | (unchanged) | `lnvox s4 --staged`, `lnvox s5`, `lnvox s6` run exactly as in narration mode. |
 
 `--ingest-classifier` controls the block classifier: `fallback` (default — the
 LLM is consulted *only* for untagged/ambiguous blocks) or `none` (rules-only,
@@ -479,17 +534,20 @@ TRAVELLER: (whispering) It's me. Open up.
 
 The launcher runs: ingest-scenario → voice cast → scenario direction (all on
 the LLM server it manages) → s4 TTS → s5 mix → **scenario-sync**. Stage 6
-(EPUB sync) is skipped — scenario mode has its own sync emitter.
+(EPUB sync) is skipped — scenario mode has its own sync emitter. Without
+`--scenario-file` it reuses the previous ingest, but only a complete one
+(`00_script.json` **and** `01_characters.json`); after editing the script,
+pass the file again — only the changed scenes cost LLM calls.
 
 ### Scenario-mode stages (advanced / re-runs)
 
 | Stage | Command | Notes |
 |---|---|---|
-| 0 | `lnvox ingest-scenario scenarios/<play>.md --id <id> [--no-cache]` | LLM structure + roster + characters → `00_script.json`, `01_characters.json`. Content-cached under `cache/scenario/` — re-runs only re-pay scenes whose text changed; `--no-cache` re-rolls. |
+| 0 | `lnvox ingest-scenario scenarios/<play>.md --id <id> [--no-cache]` | LLM structure + roster + characters → `00_script.json`, `01_characters.json`. Content-cached under `cache/scenario/` — re-runs only re-pay scenes whose text changed; `--no-cache` re-rolls and overwrites the cached entries, so the re-roll sticks. |
 | V | `lnvox voice cast <id>` | Same casting as narration mode. **Check it by ear in the Studio** — the matcher may assign the same clip to two characters who share scenes; recast by hand where it matters. |
 | S | `lnvox scenario <id>` | Direction pass (emotion + cue per line) → `03_directed/*.json`. Idempotent per scene. |
-| 4–5 | `lnvox s4 <id>` / `lnvox s5 <id>` | Unchanged (Dramabox, `--staged` fine). VibeVoice renders audio too, but session WAVs carry no per-line timing, so scenario-sync requires the per-beat Dramabox path. |
-| Y | `lnvox scenario-sync <id>` | Timing plan → `07_sync/<scene>.json` + `play.json` + `play.srt`. |
+| 4–5 | `lnvox s4 <id> --staged` / `lnvox s5 <id> --inter-chapter 0.75 --lead-in 0.35` | Unchanged Dramabox rendering; the launcher mixes with play pacing. VibeVoice renders audio too, but session WAVs carry no per-line timing, so scenario-sync requires the per-beat Dramabox path. |
+| Y | `lnvox scenario-sync <id>` | Timing plan → `07_sync/<scene>.json` + `play.json` + `play.srt`. Follows the mix's `06_final/<title>.timings.json` (pads, lead-in, scene list); `--title` picks the mix, default the newest. |
 
 ### Outputs
 
@@ -515,10 +573,16 @@ EPUB is present (skip it with `--skip-sync`, or run it standalone with
 `lnvox s6 <book>`). For players that highlight the current beat in sync with
 audio playback (WebKit-based reader apps, Plex audiobooks, Audiobookshelf, a
 custom front-end) it re-aligns the Stage-3 beats back onto the original EPUB's
-XHTML. The output is a copy of the EPUB with `<span id="<beat_id>">` wrappers
-around each beat's text plus a sidecar JSON mapping `beat_id → span_id →
-audio timing`. In lecture mode the same `sync_manifest.json` also carries the
+XHTML. The output is a copy of the EPUB with
+`<span class="lnvox-beat" data-beat-id="<beat_id>">` wrappers around each
+beat's text plus a sidecar `sync_manifest.json` mapping each beat to its start
+and end time in the m4b. In lecture mode the same manifest also carries the
 `visual_elements` (rendered code/tables/figures) with their `trigger_seconds`.
+
+Stage 6 follows the Stage-5 mix it syncs against — its pads, its lead-in,
+the chapters it contained and the order it embedded pictures in, all read
+from `06_final/<title>.timings.json`. No s5 flags need repeating; `--title`
+picks the mix (default: the newest).
 
 ### Algorithm
 
@@ -533,16 +597,21 @@ audio timing`. In lecture mode the same `sync_manifest.json` also carries the
    - Lowercase.
    - Smart quotes (`"` `"` `'` `'`) → straight (`"` `'`).
    - Em / en dashes (`—`, `–`) → ASCII `-`.
-   - Ligatures (`ﬁ`, `ﬂ`) → component letters (`fi`, `fl`).
-   - Collapse runs of whitespace / newlines / `…` ellipsis → a single space.
+   - Collapse runs of whitespace / newlines → a single space.
+
+   Ligatures (`ﬁ`, `ﬂ`) and the `…` ellipsis are deliberately **not**
+   expanded: that would change the character-count mapping and make
+   re-aligning the wrap back to the original DOM offsets fragile.
 
 3. **Anchor-based sequential matching.** Naive `indexOf(beat.text)` fails on
    real data — s3 strips attribution tags so `"…", she said, "…"` collapses
-   into one merged beat whose text doesn't appear verbatim in the source. Use
-   the first ~20 and last ~20 chars of each beat as anchors, find them in
-   sequence, treat the inclusive span as the matched range. **Always start
-   beat N+1's search at beat N's end-index** to keep repeated dialogue
-   (`"Yes."` twice in a row) from collapsing onto the same span.
+   into one merged beat whose text doesn't appear verbatim in the source.
+   First try the beat's verbatim `source_span` (Stage 2's grounding — the
+   common path, `span-exact`); otherwise use the first 30 and last 30 chars of
+   the beat's text as anchors, find them in sequence, and treat the inclusive
+   span as the matched range. **Always start beat N+1's search at beat N's
+   end-index** to keep repeated dialogue (`"Yes."` twice in a row) from
+   collapsing onto the same span.
 
 4. **DOM wrapping.** For each matched `[start, end)` shadow-string range, use
    the index map to identify which DOM nodes contain those characters. Wrap
@@ -555,37 +624,46 @@ audio timing`. In lecture mode the same `sync_manifest.json` also carries the
 The matcher runs in **two passes per chapter** (all of a chapter's
 `source_parts` XHTML are concatenated into one "master shadow" first):
 
-- **Pass 1 — strict, forward-only.** Accept only `exact` (short beats) and
-  `anchored` (head + tail both found) matches, advancing a cursor. Lenient
-  fallbacks are *off* here because a loose match can false-positive on a
-  recurring phrase and jump the cursor, stranding everything after it. A
+- **Pass 1 — strict, forward-only.** Accept only `span-exact`, `exact`
+  (short beats) and `anchored` (head + tail both found) matches, advancing a
+  cursor. Lenient fallbacks are *off* here because a loose match can
+  false-positive on a recurring phrase and jump the cursor, stranding
+  everything after it. A
   per-match **forward-jump cap** (`_MAX_FORWARD_JUMP = 8000` chars) is the
   single most important guard — without it, one bad anchored match leaping to
   the chapter's end drops the whole tail of the chapter.
 - **Pass 2 — lenient gap-fill.** For each beat Pass 1 missed, search only the
   gap between its bracketing matches (with ~2 KB of backward slack, since
-  Stage 2 sometimes reorders dialogue attribution). Fallbacks: `head-only`,
-  `tail-only`, `backtrack`, then fuzzy `SequenceMatcher`. Repeated up to 3
-  rounds, each round shrinking the remaining gaps.
+  Stage 2 sometimes reorders dialogue attribution). After the strict rungs it
+  falls back to `head-only`, `tail-only`, then fuzzy `SequenceMatcher`.
+  Repeated up to 3 rounds, each round shrinking the remaining gaps. (The old
+  `backtrack` rung is gone — the backward slack covers its window; its
+  histogram key stays, always 0.)
 
 5. **Outputs.** Three artifacts under `artifacts/<book>/07_sync/`:
    - `<book>.epub` — same structure as the original EPUB, with
      `<span class="lnvox-beat" data-beat-id="…">` wrappers added.
    - `sync_manifest.json` — `beats[]` (per matched beat:
      `{beat_id, data_beat_id, chapter_id, xhtml, type, speaker,
-       start_seconds, end_seconds, match_confidence}`) + `images[]` + a
-     top-level `match_confidence` histogram. Audio timings are cumulative
-     through the Stage-5 silence layout (the silence flags must match Stage 5).
-   - `images[]` in the same manifest — one entry per embedded illustration,
-     including novel insert/color/bonus pages that live as their own
-     spine items: `{src, xhtml, spine_page, after_chapter, before_chapter,
-       after_beat_id, before_beat_id, trigger_seconds}`. The player flips to
-     `src` when playback reaches `trigger_seconds` (= the start of
-     `before_beat_id`). Front matter (cover, TOC) triggers at 0 s;
-     end-matter art (bonus/color plates after the afterword) has
-     `before_beat_id: null` and is shown after the final beat. Placement is
-     per-XHTML-part, so an insert between `chapterN.xhtml` and
-     `chapterN_1.xhtml` triggers at the correct mid-chapter beat.
+       start_seconds, end_seconds, match_confidence}`) + `images[]` +
+     `visual_elements[]` + a top-level `match_confidence` histogram, plus the
+     `silences` it used (lead-in included) and the `m4b` they describe. Beat
+     times are rebuilt from the Stage-4 manifests with the mix's recorded
+     layout, and each chapter starts at the offset s5 measured for it; a
+     chapter re-rendered after the mix gets a `[WARN]` (re-run s5, then s6).
+   - `images[]` in the same manifest — one entry per picture **embedded in
+     the m4b**, in embed order (cover first), so `images[i]` is the i-th
+     embedded picture: `{src, xhtml, chapter_id, trigger_seconds,
+       after_beat_id, before_beat_id}`. The player flips to `src` when
+     playback reaches `trigger_seconds` (= the start of `before_beat_id`).
+     A picture on a front-matter page triggers at the first beat (≈ 0 s);
+     `trigger_seconds: null` is for end-matter plates after the last chapter
+     and pictures no page references (often the cover image itself). Placement
+     is per-XHTML-part, so an insert between `chapterN.xhtml` and
+     `chapterN_1.xhtml` triggers at the correct mid-chapter beat. Every
+     individual occurrence is also listed in `visual_elements[]` as
+     `kind: "image"` (image-only spine pages add `spine_page`,
+     `after_chapter` and `before_chapter`).
    - `unmatched.json` — beats the matcher couldn't anchor (usually genuine
      Stage-2 paraphrases/hallucinations).
 
@@ -637,8 +715,7 @@ flag the low-confidence (`fuzzy`, `tail-only`) wraps.
 | `_MAX_FORWARD_JUMP` | 8000 | Max chars a Pass-1 match may sit ahead of the cursor. Lower if you still see a chapter's tail dropping; raise if a chapter legitimately has very long unmatched runs. |
 | `HEAD_ANCHOR_LEN` / `TAIL_ANCHOR_LEN` | 30 / 30 | Anchor length. Longer = fewer false positives but more misses when the head/tail is lightly paraphrased. |
 | `_FUZZY_MIN_RATIO` | 0.20 | Min fraction of the beat the fuzzy longest-common substring must cover. Lower to match more aggressively (risks false positives). |
-| `_BACKTRACK_WINDOW` | 1500 | How far before the cursor a lenient match may look. |
-| `_PASS2_BACKWARD_SLACK` | 2000 | How far before a gap's start Pass 2 searches (for reordered attribution). |
+| `_PASS2_BACKWARD_SLACK` | 2000 | How far before a gap's start Pass 2 searches (for reordered attribution). A local constant inside `run`. |
 
 ---
 
@@ -651,17 +728,29 @@ Drop volume-02 next to volume-01 and re-run the launcher:
     --book-title "A Certain Novel — Volume 2"
 ```
 
-The pipeline auto-detects `artifacts/novel-name/volume-01/` and:
-- Adds volume-01's `01_characters.json` to s1's merge step so recurring
-  characters keep their established affiliation / origin / personality.
-- Loads volume-01's `04_voice_assignments.json` and skips voice-casting for
-  any character whose canonical name matches a prior assignment.
-- If `--narrator-clip` is omitted, the prior volume's narrator clip is
+The pipeline auto-detects the earlier volumes under `artifacts/novel-name/`
+— sibling folders with the same prefix and a smaller number, compared
+numerically (`volume-9` comes before `volume-10`, padded or not) — and, at
+voice cast:
+- Folds **every** prior volume's `04_voice_assignments.json` into one index,
+  newest volume winning, and reuses the clip of any character it recognises —
+  by canonical name, token-order variant or alias (alias matches also need
+  the same gender) — without an LLM call. A character who skips a volume
+  still gets their voice back.
+- If `--narrator-clip` is omitted, the prior volumes' narrator clip is
   reused (so the listener hears the same narrator across the series).
 
-To intentionally change a recurring voice (e.g. a character's casting was
-wrong in volume-01), edit the new volume's `04_voice_assignments.json`
-manually after voice cast runs, then re-run from s3.
+s1 builds each volume's cast on its own; continuity is voice cast's job.
+
+To intentionally change a recurring voice in this volume only (e.g. a
+character's casting was wrong in volume-01), re-cast it in the Studio — which
+saves it as `"locked": true` — or edit the new volume's
+`04_voice_assignments.json` and set `"locked": true` on the entry yourself.
+Without the lock, the next voice cast restores the prior volume's voice. Then
+re-run the launcher: s3 re-voices that character's chapters on its own, and
+s4 re-renders just their beats. To change the voice for the rest of the
+series instead, change it in the newest earlier volume that has the
+character; later volumes inherit it.
 
 ---
 
@@ -669,8 +758,9 @@ manually after voice cast runs, then re-run from s3.
 
 ### GPU handoff
 
-Both Gemma (vLLM) and Dramabox want most of the GPU's VRAM. Always:
-- **Stop vLLM before starting Dramabox**, and vice versa.
+Both Gemma (the LLM server — llama-server, vLLM or mlx) and Dramabox want
+most of the GPU's VRAM. The launcher handles this; by hand, always:
+- **Stop the LLM server before starting Dramabox**, and vice versa.
 - `nvidia-smi` to confirm the GPU is idle before starting the next phase.
 - `set -o pipefail` if you write your own bash wrappers — `tee` masks
   upstream failures otherwise.
@@ -678,10 +768,21 @@ Both Gemma (vLLM) and Dramabox want most of the GPU's VRAM. Always:
 ### s4 stability
 
 Long Dramabox runs (10+ min continuous denoising) sometimes SIGKILL. Cause
-appears to be CUDA memory fragmentation on RTX 50-series. **Use
-`scripts/s4_retry.sh`**, never `lnvox s4` directly. The content-hash cache
-ensures every restart is a near-zero-cost resume from the last successful
-beat.
+appears to be CUDA memory fragmentation on RTX 50-series. The launcher's
+default, the **staged** path (`lnvox s4 <book> --staged`), is built for it:
+four single-model phases, each in its own subprocess, with checkpoints the
+driver resumes from after a crash — no outer retry loop needed. Use it when
+running s4 by hand too.
+
+The monolithic path (`lnvox s4` without `--staged`, or `LNVOX_S4_STAGED=0`
+in the launcher) holds everything in one process — run it under
+**`scripts/s4_retry.sh <book>`**, never bare. The script restarts it until
+it exits cleanly (`MAX_ATTEMPTS`, default 100; the launcher passes
+`--max-retries`, default 30), `RETRY_DELAY` seconds apart (default 5), and
+logs every attempt to `$LNVOX_ARTIFACTS_DIR/<book>/_s4_full.log`. It stops
+at once on exit 2, a deterministic refusal a retry would only replay (a bad
+knob value, monolithic on MPS). Either way the content-hash cache makes
+every restart a near-zero-cost resume from the last finished beat.
 
 ### Beat length
 
@@ -723,10 +824,16 @@ The effective recipe is part of the TTS cache key (default runs are tagged
 `+enc-bf16+cap22+dec-fp32`; the old recipe is untagged), so renders from
 different recipes never collide in `cache/tts/` — which also means changing
 the recipe mid-book re-renders everything. Pick a recipe per book and keep
-it. Two scope notes: the cap and decode knobs exist only on the staged
-path (`lnvox s4` without `--staged` refuses explicit values), and the
-monolithic path keeps the old `bnb4` encoder default because the bf16
-encoder doesn't fit alongside the DiT + vocoder in one process.
+it. Scope notes: the cap and decode knobs exist only on the staged path
+(`lnvox s4` without `--staged` refuses explicit values with exit 2, as it
+does any invalid knob value); the monolithic path keeps the old `bnb4`
+encoder default because the bf16 encoder doesn't fit alongside the DiT +
+vocoder in one process; and on a Mac the reverts can't take effect (MPS
+always runs bf16 / 22 s / fp32), so its cache key follows the effective
+recipe and the reverts re-key nothing (an explicit numeric cap still does). Switching recipes back and forth is
+safe for the placed files: the staged path re-copies any
+`05_audio/<ch>/<beat>.wav` that isn't an exact copy of the cache entry its
+manifest names.
 
 ### Disk
 
@@ -755,14 +862,15 @@ on cloned-from-living-people references without explicit consent.
 | `Dramabox not found at external/DramaBox` | Setup step skipped | `./scripts/setup_dramabox.sh` |
 | `FileNotFoundError: ltx-2.3-22b-dev.safetensors` | Old Dramabox config path baked in | Update `DramaboxClient` to use `model_downloader.get_all_paths()` (already done in `src/lnvox/tts/dramabox_client.py`) |
 | `Python.h not found` during JIT compile | System Python lacks dev headers | `sudo apt install python3.13-dev` OR use uv-managed Python |
-| `BadRequestError: maximum context length` from vLLM | `LNVOX_LLM_MAX_LEN` too low | `LNVOX_LLM_MAX_LEN=131072 ./scripts/serve_vllm.sh` |
-| `httpx.ReadTimeout` mid-s2 with a slow model | Default timeout assumes >20 tok/s; 31B on DGX Spark is ~6 tok/s, so a 28k-token s2 chunk runs ~80 min and the connection drops | Bump `LNVOX_LLM__TIMEOUT_SECONDS_PER_TOKEN` — default 0.25 gives ~7000s for a 28k-token call. For very slow hosts use 0.35–0.5. (Per-call timeout = `timeout_base_seconds + max_tokens × timeout_seconds_per_token`.) |
+| `BadRequestError: maximum context length` | The server's context is smaller than the client assumes (65,536 by default), so its output budgets overflow the window | Pass `--max-model-len N` to the launcher — it sizes the serve script **and** reaches the client. By hand, export `LNVOX_LLM_MAX_LEN=N` for both the serve script and the stages (the client reads it too). |
+| `openai.APITimeoutError` mid-s2 with a slow model | Default timeout assumes >20 tok/s; 31B on DGX Spark is ~6 tok/s, so a 28k-token s2 chunk runs ~80 min. A timed-out request is **not** re-sent (the SDK's own retries are off, so one call never waits a multiple of its timeout): the stage fails and the launcher retries the step, resuming from cache | Bump `LNVOX_LLM__TIMEOUT_SECONDS_PER_TOKEN` — default 0.25 gives ~7000s for a 28k-token call. For very slow hosts use 0.35–0.5. (Per-call timeout = `timeout_base_seconds + max_tokens × timeout_seconds_per_token`.) |
 | `AssertionError: Torch not compiled with CUDA enabled` on DGX Spark / Jetson | aarch64 platform; Dramabox's pinned `torch==2.8.0` only has CPU-only aarch64 wheels | Re-run `./scripts/setup_dramabox.sh` — it auto-detects aarch64 and pulls `torch>=2.10+cu130` (which **does** ship aarch64+sbsa CUDA wheels) instead. x86_64 is unaffected. |
-| s4 crashes after 10–15 min | CUDA fragmentation | Use `scripts/s4_retry.sh` (auto-resumes from cache) |
-| Narrator voice doesn't match descriptor | Stage order pre-dates the v2 fix | Re-run s3 with `--regen-profiles` AFTER voice cast |
+| s4 crashes after 10–15 min | CUDA fragmentation | The staged path (launcher default) relaunches the crashed phase itself; for the monolithic path use `scripts/s4_retry.sh` (auto-resumes from cache) |
+| `… refused its input (exit 2) — not retrying` | A deterministic refusal: mistyped `--narrator-clip`, invalid `LNVOX_S4_*` value, staged-only knob on the monolithic path, monolithic s4 on MPS | Fix the argument / variable the message above names and re-run; a retry would only replay it |
+| Narrator (or any) voice doesn't match its descriptor | The casting changed after s3 wrote the descriptor | Re-run the launcher (or `lnvox s3`) after voice cast: s3's profile cache is casting-aware, so it regenerates the recast characters' descriptors and re-voices their chapters on its own. `--regen-profiles` rewrites *every* descriptor (whole-book re-render) — only for a changed descriptor prompt |
 | Empty `accent` distribution in voicebank | TSV had pipe-separated accents | Fix `_normalize_accent` (already in `voices/common_voice.py`); re-seed |
 | Dramabox renders sound rushed | Long beats (>60 s) | Lower `MAX_MERGED_BEAT_CHARS` in `s3_director.py`, re-run s3 |
-| `No module named 'av'` / `requires accelerate` / `mamba-ssm` build fails when loading Dramabox | Dramabox env mixed with `--extra serve` (torch 2.8 vs 2.11 conflict), or `uv sync` pruned Dramabox's deps | Use a TTS-only env: `uv sync --extra voice --extra tts && ./scripts/setup_dramabox.sh` (see [Voicebank Studio & TTS Lab](#voicebank-studio--tts-lab)) |
+| `No module named 'av'` / `requires accelerate` / `mamba-ssm` build fails when loading Dramabox | Dramabox env mixed with `--extra serve` (torch 2.8 vs 2.11 conflict), or `uv sync` pruned Dramabox's deps | Use a TTS-only env: `./scripts/run_pipeline.sh --prepare-env tts` (or `uv sync --extra voice --extra tts && ./scripts/setup_dramabox.sh`; see [Voicebank Studio & TTS Lab](#voicebank-studio--tts-lab)) |
 
 ---
 
@@ -800,6 +908,13 @@ what causes `No module named 'av'` and the `mamba-ssm` build failures. Use the
 TTS env above for the Studio; run `uv sync --extra serve …` again when you go
 back to the LLM stages.
 
+The launcher's own swap is available on its own:
+`./scripts/run_pipeline.sh --prepare-env tts` (or `llm` — per
+`--llm-backend` — or `vibevoice`) prepares that phase's venv exactly as a
+full run would, then exits without running any stage; no book id needed.
+It's what the ComfyUI nodes call between LLM and TTS nodes, and the easy way
+to get the right env before running a stage by hand.
+
 ---
 
 ## File map cheat sheet
@@ -812,7 +927,7 @@ novels/<series>/<volume-NN>/             Stage 0a output → Stage 0 input
 ├── images/                              Cover + every illustration
 └── .epub_meta.json                      Title / authors / publisher / chapter map
 
-artifacts/<series>/<volume-NN>/
+artifacts/<series>/<volume-NN>/          ($LNVOX_ARTIFACTS_DIR, default artifacts/)
 ├── 00_book_meta.json                    EPUB metadata propagated from .epub_meta.json
 ├── 00_text.jsonl                        Ingested chapters (one JSON line each)
 ├── 01_characters.json                   Merged book cast
@@ -823,7 +938,8 @@ artifacts/<series>/<volume-NN>/
 ├── 04_voice_assignments.json            Character → ref clip mapping
 ├── 05_audio/<chapter>/                  Rendered beat WAVs + manifest.json
 ├── 05_audio_v2/<chapter>/               VibeVoice session renders (s4 --tts-backend vibevoice)
-├── 06_final/<title>.m4b                 Final audiobook + timings.json
+├── 06_final/<title>.m4b                 Final audiobook
+├── 06_final/<title>.timings.json        The mix's layout contract (s6 / scenario-sync / sample follow it)
 └── 07_sync/                             Synced EPUB + sync_manifest.json + unmatched.json
 
 artifacts/<scenario-id>/                 Scenario mode (theater scripts)
@@ -841,7 +957,7 @@ voicebank-fr/                            French bank (select with LNVOX_VOICEBAN
 └── clips/cv_<id>.wav                    Reference clips (10–20 s each)
 
 cache/tts/<sha256>.wav                   Content-addressed TTS cache (survives book deletions)
-cache/scenario/<sha256>.json             Scenario-ingest LLM cache (keyed on prompt + model)
+cache/scenario/<sha256>.json             Scenario-ingest LLM cache (keyed on schema + system + rendered prompt + model)
 
 external/DramaBox/                       Cloned Dramabox repo (sys.path-injected)
 external/VibeVoice/                      Community fork (pip -e; scripts/setup_vibevoice.sh)

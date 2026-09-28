@@ -43,10 +43,9 @@ def _book_dir(book_id: str) -> Path:
 def _voicebank_dir() -> Path:
     # DESIGN.md §17.5: a per-language bank (e.g. voicebank-fr, seeded from the
     # French Common Voice corpus) is selected once via env, not per-command
-    # flags. Default stays the historical English bank.
-    import os
-
-    return Path(os.environ.get("LNVOX_VOICEBANK", "voicebank"))
+    # flags. Default stays the historical English bank. Read through
+    # Settings (`LNVOX_VOICEBANK`) so a `.env` entry works too.
+    return Settings().voicebank
 
 
 def _filter_chapters(chapters, selected: Optional[str]):
@@ -59,7 +58,13 @@ def _filter_chapters(chapters, selected: Optional[str]):
 @app.command()
 def ingest(
     folder: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True),
-    book_id: Optional[str] = typer.Option(None, help="Defaults to folder name."),
+    book_id: Optional[str] = typer.Option(
+        None,
+        help=(
+            "Defaults to the folder's path under ./novels (novels/series/"
+            "volume-01 → series/volume-01), else the folder name."
+        ),
+    ),
     mode: str = typer.Option(
         "narration",
         "--mode",
@@ -78,7 +83,15 @@ def ingest(
     import json as _json
     import shutil
 
-    book_id = book_id or folder.name
+    if not book_id:
+        # Book ids are hierarchical (`<series>/volume-NN`, which cross-volume
+        # continuity keys on), and the folder's last name alone loses the
+        # series: novels/series/volume-01 would land in artifacts/volume-01.
+        try:
+            rel = folder.resolve().relative_to(Path("novels").resolve())
+        except ValueError:
+            rel = None
+        book_id = rel.as_posix() if rel and rel.parts else folder.name
     chapters = ingest_folder(folder)
     if not chapters:
         console.print(f"[red]No .txt files found in {folder}[/]")
@@ -161,7 +174,8 @@ def ingest_epub(
 
     Writes `NN-slug.txt` per narrative chapter, dumps every illustration to
     `images/`, and stores `.epub_meta.json` so the cover can later be embedded
-    in the final m4b.
+    in the final m4b. Re-running into the same folder first removes the
+    chapter files the previous extraction listed in `.epub_meta.json`.
 
     Run `lnvox ingest <output_dir>` next to feed it into the rest of the pipeline.
     """
@@ -231,13 +245,18 @@ def stage1(
         f"[dim]endpoint={client.settings.llm.endpoint} model={client.settings.llm.model}[/]"
     )
 
-    # Auto-detect prior volumes in the same series and feed their cast lists
-    # into the merge step (cross-volume continuity).
+    # Auto-detect prior volumes in the same series. s1 only loads their cast
+    # lists (which forces the cluster/merge path even for a one-chapter
+    # book); merge_clusters deliberately ignores them — sending prior casts
+    # to the merge LLM blew its context. Cross-volume continuity (recurring
+    # characters keeping their voice) happens at `voice cast`, which reads
+    # the priors' 04_voice_assignments.json.
     artifacts_dir = Settings().artifacts_dir
     priors = find_prior_volumes(artifacts_dir, book_id)
     if priors:
         console.print(
-            f"[dim]Found {len(priors)} prior volume(s): {[p.name for p in priors]}[/]"
+            f"[dim]Found {len(priors)} prior volume(s): {[p.name for p in priors]} "
+            f"— their voices are reused at `voice cast`, not merged here[/]"
         )
     console.print(f"Extracting characters from {len(selected)} chapter(s)…")
 
@@ -331,13 +350,20 @@ def stage3(
     regen_profiles: bool = typer.Option(
         False,
         "--regen-profiles",
-        help="Delete and re-generate the cached voice profiles before directing.",
+        help=(
+            "Force-regenerate EVERY voice profile. Not needed after a recast: "
+            "profiles of recast characters regenerate on their own. Chapters "
+            "whose descriptors change are re-voiced (and so re-rendered by s4)."
+        ),
     ),
 ):
     """Stage 3: Generate Dramabox-ready stage directions per beat.
 
     Run AFTER `lnvox voice cast` — the director consults the assigned voice
     clip's metadata to write descriptors matching the actual reference voice.
+    Casting-aware on re-runs: a character's cached profile is reused only
+    while its clip (and any locked descriptor) is unchanged, and a cached
+    chapter whose speakers' descriptors changed has its prompts re-voiced.
     """
     out_dir = _book_dir(book_id)
     cast_file = out_dir / "01_characters.json"
@@ -356,12 +382,7 @@ def stage3(
         )
         raise typer.Exit(1)
     if regen_profiles:
-        prof_file = out_dir / "03_voice_profiles.json"
-        if prof_file.exists():
-            prof_file.unlink()
-            console.print(
-                f"[dim]Removed cached voice profiles at {prof_file}; will regenerate.[/]"
-            )
+        console.print("[dim]--regen-profiles: regenerating every voice profile.[/]")
 
     cast = CharacterList.model_validate_json(cast_file.read_text(encoding="utf-8"))
     wanted = {s.strip() for s in chapters.split(",")} if chapters else None
@@ -405,6 +426,7 @@ def stage3(
         out_dir,
         casting=casting,
         voicebank=voicebank,
+        regen_profiles=regen_profiles,
         on_chapter_done=_progress,
     )
 
@@ -509,8 +531,9 @@ def ingest_scenario(
         False,
         "--no-cache",
         help=(
-            "Bypass the cache/scenario/ LLM cache (content-keyed on script "
-            "text + prompt + model) — use to re-roll the structuring."
+            "Re-roll the structuring: ignore the cache/scenario/ LLM cache "
+            "(content-keyed on system + rendered prompt + model) for this run, "
+            "and overwrite its entries with the fresh results."
         ),
     ),
 ):
@@ -536,7 +559,10 @@ def ingest_scenario(
         out_dir,
         title=title or "",
         language=language,
-        cache_dir=None if no_cache else Path("cache") / "scenario",
+        # --no-cache still WRITES the cache: otherwise the next cached run
+        # would hand back the very structuring the re-roll replaced.
+        cache_dir=Path("cache") / "scenario",
+        refresh_cache=no_cache,
         progress=lambda m: console.print(f"[dim]{m}[/]"),
     )
     n_items = sum(len(s.items) for s in script.scenes)
@@ -548,7 +574,17 @@ def ingest_scenario(
 
 
 @app.command(name="scenario")
-def stage_scenario(book_id: str):
+def stage_scenario(
+    book_id: str,
+    regen_profiles: bool = typer.Option(
+        False,
+        "--regen-profiles",
+        help=(
+            "Force-regenerate EVERY voice profile (recast characters regenerate "
+            "on their own). Scenes whose descriptors change are re-voiced."
+        ),
+    ),
+):
     """Scenario mode direction pass (DESIGN.md §17.3).
 
     Adds per-line emotion (7-value enum) + a short cue in the script's
@@ -556,6 +592,8 @@ def stage_scenario(book_id: str):
     s4/s5 run unchanged (one chapter per scene; staging pauses become
     DirectedScene boundaries). Run AFTER `lnvox voice cast` so descriptors
     match the assigned clips. Group lines render with the Narrator voice.
+    Casting-aware on re-runs, like s3: a recast regenerates that character's
+    profile and re-voices the cached scenes it speaks in.
     """
     from lnvox.stages import scenario as scenario_stage
 
@@ -603,6 +641,7 @@ def stage_scenario(book_id: str):
         out_dir,
         casting=casting,
         voicebank=voicebank,
+        regen_profiles=regen_profiles,
         on_scene_done=_progress,
     )
     total = sum(len(s.beats) for r in results for s in r.scenes)
@@ -617,26 +656,35 @@ def stage_scenario(book_id: str):
 @app.command(name="scenario-sync")
 def stage_scenario_sync(
     book_id: str,
-    intra: float = typer.Option(
-        0.25, help="Pad between lines of one run — MUST match `lnvox s5 --intra`."
-    ),
-    staging_pause: float = typer.Option(
-        1.0,
-        help="Pause where staging happens — MUST match `lnvox s5 --inter-scene`.",
-    ),
-    inter_scene: float = typer.Option(
-        scenario_sync.SCENARIO_INTER_SCENE,
+    title: Optional[str] = typer.Option(
+        None,
+        "--title",
         help=(
-            "Pad between script scenes — MUST match `lnvox s5 --inter-chapter`. "
-            "Play default 0.75 s: the 2 s book pad drags between scenes (§17.4)."
+            "Which mix to follow: the `lnvox s5 --title` of 06_final/<title>.m4b. "
+            "Default: the newest mix in 06_final/."
         ),
     ),
-    lead_in: float = typer.Option(
-        scenario_sync.SCENARIO_LEAD_IN,
+    intra: Optional[float] = typer.Option(
+        None,
+        help="Pad between lines of one run (s5 --intra). Default: the mix's value, else 0.25.",
+    ),
+    staging_pause: Optional[float] = typer.Option(
+        None,
+        help="Pause where staging happens (s5 --inter-scene). Default: the mix's value, else 1.0.",
+    ),
+    inter_scene: Optional[float] = typer.Option(
+        None,
+        help=(
+            "Pad between script scenes (s5 --inter-chapter). Default: the "
+            "mix's value, else 0.75 — the play pacing; 2 s drags (§17.4)."
+        ),
+    ),
+    lead_in: Optional[float] = typer.Option(
+        None,
         "--lead-in",
         help=(
-            "Per-beat lead-in silence — MUST match `lnvox s5 --lead-in`. "
-            "0.35 s covers the reader app's ~0.3 s playback poll (§17.4)."
+            "Per-beat lead-in silence (s5 --lead-in). Default: the mix's value, "
+            "else 0.35, which covers the reader app's ~0.3 s poll (§17.4)."
         ),
     ),
 ):
@@ -644,8 +692,9 @@ def stage_scenario_sync(
 
     Emits 07_sync/<scene>.json + play.json + play.srt: one timed entry per
     script item (dialogue spans, staging pauses, zero-duration cues),
-    computed from the same plan as the s5 mix so both agree. Requires
-    per-beat rendering (dramabox backend).
+    computed from the same plan as the s5 mix so both agree. The pads and
+    scene list are read from the mix's 06_final/<title>.timings.json; the
+    flags only override them. Requires per-beat rendering (dramabox backend).
     """
     out_dir = _book_dir(book_id)
     if not (out_dir / "00_script.json").exists():
@@ -658,6 +707,7 @@ def stage_scenario_sync(
             staging_pause=staging_pause,
             inter_scene=inter_scene,
             lead_in=lead_in,
+            mix_title=title,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )
     except (ValueError, FileNotFoundError) as e:
@@ -768,6 +818,44 @@ def stage4(
             "crashes).[/]"
         )
         raise typer.Exit(2)
+    if backend == "dramabox":
+        from lnvox.tts.dramabox_client import (
+            s4_chunk_cap,
+            s4_decode_dtype,
+            s4_encoder_precision,
+        )
+
+        # Validate the render-quality knobs before any work: a bad value is
+        # a deterministic refusal (exit 2 — s4_retry.sh doesn't replay it),
+        # not a traceback halfway through planning.
+        try:
+            s4_encoder_precision()
+            chunk_cap = s4_chunk_cap()
+            decode_dtype = s4_decode_dtype()
+        except ValueError as e:
+            console.print(f"[red]{e}[/]")
+            raise typer.Exit(2)
+        # Chunk cap and decode dtype are staged-planner policies; the
+        # monolithic path delegates chunking/decoding to DramaBox's TTSServer
+        # internals and keeps the old v1 recipe as ITS default (the staged-
+        # path defaults don't apply here). Only an EXPLICIT request for those
+        # knobs is refused — rendering different audio under the requested
+        # cache key would poison any A/B against the staged path. An empty
+        # value is unset (the helpers read it as the default), not a request.
+        explicit = [
+            name
+            for name, val in (
+                ("LNVOX_S4_CHUNK_CAP", chunk_cap),
+                ("LNVOX_S4_DECODE_DTYPE", decode_dtype),
+            )
+            if os.environ.get(name, "").strip() and val is not None
+        ]
+        if explicit and not staged:
+            console.print(
+                f"[red]{' / '.join(explicit)} need the staged path — re-run "
+                "with --staged (LNVOX_S4_ENCODER_PRECISION works on both).[/]"
+            )
+            raise typer.Exit(2)
     if no_trim:
         # Read by tts.trim / VibeVoiceClient; inherited by the staged-phase
         # subprocesses, so one env var covers all three render paths.
@@ -873,30 +961,21 @@ def stage4(
         )
         return
 
-    import os as _os
+    from lnvox.tts.dramabox_client import DramaboxClient, s4_variant_tag
 
-    from lnvox.tts.dramabox_client import (
-        DramaboxClient,
-        s4_chunk_cap,
-        s4_decode_dtype,
-        s4_variant_tag,
-    )
-
-    # Chunk cap and decode dtype are staged-planner policies; the monolithic
-    # path delegates chunking/decoding to DramaBox's TTSServer internals and
-    # keeps the old v1 recipe as ITS default (the staged-path defaults don't
-    # apply here). Only an EXPLICIT request for those knobs errors — refusing
-    # beats rendering different audio under the requested cache key, which
-    # would poison any A/B against the staged path.
-    if ("LNVOX_S4_CHUNK_CAP" in _os.environ and s4_chunk_cap() is not None) or (
-        "LNVOX_S4_DECODE_DTYPE" in _os.environ and s4_decode_dtype() is not None
-    ):
+    # Monolithic Dramabox on MPS renders SILENCE with exit 0: TTSServer is
+    # single-dtype and no single dtype works there (fp16 Gemma encodings are
+    # all-NaN — MAC_TEST_REPORT.md F10; the vocoder needs fp32 — F9). Only
+    # the staged path applies the per-component dtype map. Refuse before any
+    # placement or model load; exit 2 so s4_retry.sh doesn't replay it.
+    if device.startswith("mps"):
         console.print(
-            "[red]LNVOX_S4_CHUNK_CAP / LNVOX_S4_DECODE_DTYPE need the staged "
-            "path — re-run with --staged (LNVOX_S4_ENCODER_PRECISION works on "
-            "both).[/]"
+            "[red]Monolithic Dramabox can't render on MPS (no single dtype "
+            "works there — MAC_TEST_REPORT.md F9/F10; it would produce silent "
+            "audio). Re-run with --staged — the launcher default; "
+            "LNVOX_S4_STAGED=0 is what selects this path.[/]"
         )
-        raise typer.Exit(1)
+        raise typer.Exit(2)
 
     s4_tts.run(
         chapters_loaded,
@@ -906,7 +985,7 @@ def stage4(
         audio_dir,
         cache_dir,
         client_factory=_factory,
-        model_version=DramaboxClient.MODEL_VERSION + s4_variant_tag(staged=False),
+        model_version=DramaboxClient.MODEL_VERSION + s4_variant_tag(device, staged=False),
         progress=_progress,
         limit=limit,
     )
@@ -989,8 +1068,21 @@ def stage5(
             "instead of 05_audio/."
         ),
     ),
+    keep_work: bool = typer.Option(
+        False,
+        "--keep-work",
+        help=(
+            "Keep 06_final/_work/ (per-chapter and full-book WAVs) after a "
+            "successful mix, for debugging. It is always kept when the mix fails."
+        ),
+    ),
 ):
-    """Stage 5: Mix rendered beats into a final .m4b with chapter markers."""
+    """Stage 5: Mix rendered beats into a final .m4b with chapter markers.
+
+    Also writes 06_final/<title>.timings.json, recording the pads, lead-in,
+    chapters and pictures of this mix; `lnvox s6`, `lnvox scenario-sync` and
+    `lnvox sample` follow it, so their flags need not repeat these.
+    """
     from lnvox.tts.schema import ChapterAudio
 
     out_dir = _book_dir(book_id)
@@ -1029,11 +1121,11 @@ def stage5(
     console.print(
         f"Mixing {len(chapters_audio)} chapter(s), "
         f"{sum(len(c.beats) for c in chapters_audio)} beat(s) total. "
-        f"Output: {final_dir}/{book_title}.m4b"
+        f"Output: {final_dir}/{s5_mix.safe_filename(book_title)}.m4b"
     )
 
-    # Same resolution Stage 6 and `lnvox sample` use to align manifest images
-    # with embedded pictures — see s5_mix.resolve_book_images.
+    # The embed order is recorded in the timings sidecar, which Stage 6 reads
+    # to align manifest images with these pictures — see resolve_book_images.
     novel_dir = novels_root / book_id
     cover_image, extra_images = s5_mix.resolve_book_images(
         out_dir, novel_dir, cover=cover, images_dir=images_dir,
@@ -1057,6 +1149,8 @@ def stage5(
         aac_kbps=kbps,
         cover_image=cover_image,
         images=extra_images,
+        audio_dir=audio_root.name,
+        keep_work=keep_work,
         progress=lambda m: console.print(f"[dim]{m}[/]"),
     )
     console.print(f"[green]✓[/] {output_m4b}")
@@ -1073,7 +1167,14 @@ def sample_cmd(
         help="Two consecutive chapter ids, e.g. '14,15'. Default: best-scoring pair.",
     ),
     minutes: float = typer.Option(12.0, help="Sample length, centred on the boundary."),
-    title: Optional[str] = typer.Option(None, "--title", help="Title for the sample."),
+    title: Optional[str] = typer.Option(
+        None,
+        "--title",
+        help=(
+            "Title for the sample. If 06_final/<title>.m4b exists, that mix is "
+            "sliced; otherwise the one sync_manifest.json was timed against."
+        ),
+    ),
     novels_root: Path = typer.Option(Path("novels"), "--novels-root"),
 ):
     """Cut a small, committable demo sample from a finished book.
@@ -1105,6 +1206,7 @@ def sample_cmd(
         summary = sample_mod.build(
             book_dir, novel_dir, out_dir,
             book_title=book_title, chapters=pair, minutes=minutes,
+            mix_title=title,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )
     except (FileNotFoundError, ValueError, KeyError) as e:
@@ -1140,16 +1242,38 @@ def stage6(
         "--novels-root",
         help="Where the novels/<book_id>/.epub_meta.json lives.",
     ),
-    intra: float = typer.Option(0.25, help="Intra-scene silence (must match Stage 5)."),
-    inter_scene: float = typer.Option(1.0, help="Inter-scene silence (must match Stage 5)."),
-    inter_chapter: float = typer.Option(2.0, help="Inter-chapter silence (must match Stage 5)."),
+    title: Optional[str] = typer.Option(
+        None,
+        "--title",
+        help=(
+            "Which mix to sync against: the `lnvox s5 --title` of "
+            "06_final/<title>.m4b. Default: the newest mix in 06_final/."
+        ),
+    ),
+    intra: Optional[float] = typer.Option(
+        None, help="Override the intra-scene silence. Default: the mix's recorded value, else 0.25."
+    ),
+    inter_scene: Optional[float] = typer.Option(
+        None, help="Override the inter-scene silence. Default: the mix's recorded value, else 1.0."
+    ),
+    inter_chapter: Optional[float] = typer.Option(
+        None, help="Override the inter-chapter silence. Default: the mix's recorded value, else 2.0."
+    ),
+    lead_in: Optional[float] = typer.Option(
+        None,
+        "--lead-in",
+        help="Override the per-beat lead-in. Default: the mix's recorded value, else 0.",
+    ),
 ):
     """Stage 6: Wrap original EPUB XHTML with beat spans + sync_manifest.json.
 
     Lets a custom audiobook player highlight the active beat by querying
     `[data-beat-id="…"]` in the EPUB and looking up start_seconds/end_seconds
-    in `sync_manifest.json`. The silence flags MUST match what was used at
-    Stage 5 — otherwise the in-m4b timings drift.
+    in `sync_manifest.json`. Timings follow the Stage-5 mix recorded in
+    06_final/<title>.timings.json — its pads, lead-in, chapter list and
+    picture order — so no flag has to be repeated from the s5 run. The pad
+    flags only override that record (for a book with no mix, they replace
+    the s5 defaults).
     """
     out_dir = _book_dir(book_id)
     directed_dir = out_dir / "03_directed"
@@ -1177,17 +1301,23 @@ def stage6(
         f"  output    = {sync_dir}"
     )
 
-    manifest = s6_sync.run(
-        book_id=book_id,
-        book_dir=out_dir,
-        epub_path=epub_path,
-        novel_dir=novel_dir,
-        output_dir=sync_dir,
-        intra_silence=intra,
-        inter_scene_silence=inter_scene,
-        inter_chapter_silence=inter_chapter,
-        progress=lambda m: console.print(f"[dim]{m}[/]"),
-    )
+    try:
+        manifest = s6_sync.run(
+            book_id=book_id,
+            book_dir=out_dir,
+            epub_path=epub_path,
+            novel_dir=novel_dir,
+            output_dir=sync_dir,
+            intra_silence=intra,
+            inter_scene_silence=inter_scene,
+            inter_chapter_silence=inter_chapter,
+            lead_in_silence=lead_in,
+            mix_title=title,
+            progress=lambda m: console.print(f"[dim]{m}[/]"),
+        )
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1)
 
     pct = 100.0 * manifest["matched"] / max(1, manifest["total_beats"])
     style = "green" if manifest["unmatched"] == 0 else "yellow"
@@ -1225,20 +1355,43 @@ def audio_purge(
         "-y",
         help="Skip confirmation prompt.",
     ),
+    v2: bool = typer.Option(
+        False,
+        "--v2",
+        help=(
+            "Purge VibeVoice sessions in 05_audio_v2/ instead of Dramabox beats "
+            "in 05_audio/. A session holds several speakers' lines, so every "
+            "session the speaker appears in is purged — and re-rendered whole."
+        ),
+    ),
 ):
-    """Delete rendered WAVs + content-hash cache entries for one speaker.
+    """Delete one speaker's rendered WAVs + content-hash cache entries, so the
+    next s4 run renders them afresh.
 
-    Useful after switching a character's voice clip — the next s4 run will
-    re-render the affected beats with the new reference clip.
+    Switching a character to a different voice clip does NOT need this: the
+    s4 cache key includes the reference clip's file name, so the new clip
+    misses the cache and re-renders on its own. Purge when that key can't
+    change — a clip file was replaced in place under the same name, or you
+    want new takes of a speaker with the same clip and prompts.
     """
     from lnvox.tts.schema import ChapterAudio
 
     out_dir = _book_dir(book_id)
-    audio_root = out_dir / "05_audio"
+    audio_root = out_dir / ("05_audio_v2" if v2 else "05_audio")
     if not audio_root.exists():
-        console.print(f"[red]Missing {audio_root}. Nothing to purge.[/]")
+        other = out_dir / ("05_audio" if v2 else "05_audio_v2")
+        hint = f" ({other.name}/ exists — {'drop' if v2 else 'add'} --v2)" if other.exists() else ""
+        console.print(f"[red]Missing {audio_root}. Nothing to purge.{hint}[/]")
         raise typer.Exit(1)
 
+    def _speaks(entry_speaker: str) -> bool:
+        # A VibeVoice session manifest names all its voices as "A + B + C"
+        # (s4_vibevoice.render_chapter); a Dramabox beat names one.
+        if v2:
+            return speaker in (s.strip() for s in entry_speaker.split(" + "))
+        return entry_speaker == speaker
+
+    unit = "session" if v2 else "beat"
     targets: list[tuple[Path, Path | None]] = []
     for chap_dir in sorted(audio_root.iterdir()):
         manifest = chap_dir / "manifest.json"
@@ -1246,7 +1399,7 @@ def audio_purge(
             continue
         ca = ChapterAudio.model_validate_json(manifest.read_text(encoding="utf-8"))
         for beat in ca.beats:
-            if beat.speaker != speaker:
+            if not _speaks(beat.speaker):
                 continue
             wav = chap_dir / f"{beat.beat_id}.wav"
             cache_wav = (
@@ -1256,15 +1409,20 @@ def audio_purge(
 
     if not targets:
         console.print(
-            f"[yellow]No beats found for speaker '{speaker}' in {audio_root}.[/]"
+            f"[yellow]No {unit}s found for speaker '{speaker}' in {audio_root}.[/]"
         )
         return
 
     console.print(
         f"About to delete:\n"
-        f"  - {len(targets)} rendered WAV(s) under {audio_root}\n"
+        f"  - {len(targets)} rendered {unit} WAV(s) under {audio_root}\n"
         f"  - {sum(1 for _, c in targets if c)} cache entries under {cache_dir}"
     )
+    if v2:
+        console.print(
+            "[dim]Each session also holds other speakers' lines; they are "
+            "re-rendered with it.[/]"
+        )
     if not yes:
         confirm = typer.confirm("Proceed?", default=False)
         if not confirm:
@@ -1285,8 +1443,10 @@ def audio_purge(
         f"[green]✓[/] Deleted {rendered_deleted} rendered WAV(s) and "
         f"{cache_deleted} cache entry(ies) for '{speaker}'."
     )
+    rerun = "lnvox s4 --tts-backend vibevoice" if v2 else "lnvox s4"
     console.print(
-        "[dim]Re-run `lnvox s4` (or the pipeline launcher) to re-render with the current voice assignment.[/]"
+        f"[dim]Re-run `{rerun}` (or the pipeline launcher) to re-render, then "
+        f"s5 and the sync stage — the durations change.[/]"
     )
 
 
@@ -1509,13 +1669,17 @@ def voice_cast(
     narrator_clip: Optional[str] = typer.Option(
         None,
         "--narrator-clip",
-        help="Voicebank clip id to use for the Narrator (overrides auto-cast + any prior-volume reuse).",
+        help="Voicebank clip id to use for the Narrator (overrides auto-cast + "
+        "any prior-volume reuse, but not a Narrator marked \"locked\": true in "
+        "this volume's 04_voice_assignments.json). An id not in the voicebank "
+        "exits 2 before anything is cast.",
     ),
     fresh: bool = typer.Option(
         False,
         "--fresh",
-        help="Ignore this volume's existing 04_voice_assignments.json (re-cast "
-        "characters with no prior-volume match instead of keeping their clip).",
+        help="Re-cast characters with no prior-volume match instead of keeping "
+        "their clip from this volume's existing 04_voice_assignments.json. "
+        "Entries marked \"locked\": true are still kept.",
     ),
 ):
     """LLM-match each character to a voicebank clip; write 04_voice_assignments.json.
@@ -1525,6 +1689,12 @@ def voice_cast(
     — keep that clip (no LLM call), so voices stay stable even when s1 renames
     a character ("Kamijou Touma" → "Kamijou") or the character skips a volume.
     The Narrator is also reused unless --narrator-clip is provided.
+
+    This volume's existing 04_voice_assignments.json is read first. An entry
+    with "locked": true is a deliberate hand edit and is kept as-is — over
+    prior volumes, --narrator-clip and --fresh. Unlocked entries keep their
+    clip only for characters no prior volume knows. A kept entry keeps its
+    audit_note and voice_descriptor too.
     """
     vb_dir = _voicebank_dir()
     vb = voice_manifest.load(vb_dir)
@@ -1533,6 +1703,23 @@ def voice_cast(
             "[red]Voicebank is empty. Run `lnvox voice seed-cv` first.[/]"
         )
         raise typer.Exit(1)
+
+    # Check --narrator-clip NOW, not when the Narrator's turn comes: a
+    # synthesised Narrator is cast last, so a typo used to surface only after
+    # every other character's LLM calls, with nothing written. Exit 2 marks a
+    # deterministic error that retrying cannot fix.
+    clip_ids = {c.id for c in vb.clips}
+    if narrator_clip and narrator_clip not in clip_ids:
+        import difflib
+
+        close = difflib.get_close_matches(narrator_clip, sorted(clip_ids), n=3)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        console.print(
+            f"[red]--narrator-clip {narrator_clip!r} is not in the voicebank at "
+            f"{vb_dir}/ ({len(vb.clips)} clip(s)).{hint} Check the id, or "
+            f"LNVOX_VOICEBANK if the clip lives in another bank.[/]"
+        )
+        raise typer.Exit(2)
 
     out_dir = _book_dir(book_id)
     cast_file = out_dir / "01_characters.json"
@@ -1548,6 +1735,61 @@ def voice_cast(
         else None
     )
 
+    # This volume's own existing assignments (if any), handed to the matcher
+    # apart from prior volumes. A LOCKED entry is a deliberate hand edit
+    # (ComfyUI Set Voice, or "locked": true in the JSON) and beats every
+    # automatic rule, prior volumes and --narrator-clip included — which is
+    # what makes the launcher's "lock it at --stop-after-audit, then resume"
+    # advice hold. An unlocked entry is the weakest layer: continuity chains
+    # win, but a first-appearance character keeps its already-cast clip
+    # instead of being re-rolled by the LLM, so re-casting is idempotent and
+    # already-generated audio stays stable. `--fresh` drops the unlocked
+    # entries only: a lock means "never change this automatically", and
+    # --fresh is an automatic re-roll. To discard a lock, unset it (or delete
+    # the file).
+    own_assign = out_dir / "04_voice_assignments.json"
+    existing: BookCasting | None = None
+    narrator_flag_ignored = False
+    if own_assign.exists():
+        existing = BookCasting.model_validate_json(
+            own_assign.read_text(encoding="utf-8")
+        )
+        n_locked = sum(1 for c in existing.castings if c.locked)
+        if fresh:
+            existing.castings = [c for c in existing.castings if c.locked]
+            console.print(
+                f"[dim]--fresh: re-casting this volume; {n_locked} locked "
+                f"entr{'y' if n_locked == 1 else 'ies'} kept[/]"
+            )
+        elif existing.castings:
+            console.print(
+                f"[dim]Existing casting: {len(existing.castings)} entries "
+                f"({n_locked} locked). Locked entries are kept; the rest keep "
+                f"their clip unless a prior volume knows the character.[/]"
+            )
+        locked_narrator = next(
+            (
+                c
+                for c in existing.castings
+                if c.character_name == "Narrator"
+                and c.locked
+                and c.assigned_clip_id in clip_ids
+            ),
+            None,
+        )
+        if (
+            narrator_clip
+            and locked_narrator is not None
+            and locked_narrator.assigned_clip_id != narrator_clip
+        ):
+            narrator_flag_ignored = True
+            console.print(
+                f"[yellow]! The Narrator is locked to "
+                f"{locked_narrator.assigned_clip_id} in {own_assign.name}; "
+                f"--narrator-clip {narrator_clip} is ignored. Set "
+                f"\"locked\": false on it to apply the flag.[/]"
+            )
+
     # Cross-volume reuse: fold EVERY prior volume's assignments into an
     # identity index (names + aliases, newest volume wins). A single-volume
     # lookback loses characters that skip a volume; exact-name matching loses
@@ -1556,21 +1798,6 @@ def voice_cast(
     artifacts_dir = Settings().artifacts_dir
     prior_index = None
     prior_vols: list[str] = []
-
-    # Weakest layer: this volume's own existing assignments (if any). Prior
-    # volumes fold in AFTER and therefore override it, so continuity chains
-    # win — but a first-appearance character keeps its already-cast clip
-    # instead of being re-rolled by the LLM. Makes re-casting idempotent and
-    # keeps already-generated audio stable. `--fresh` opts out.
-    own_assign = out_dir / "04_voice_assignments.json"
-    if not fresh and own_assign.exists():
-        prior_index = voice_matcher.PriorCastIndex()
-        prior_index.add_volume(
-            BookCasting.model_validate_json(own_assign.read_text(encoding="utf-8")),
-            cast.characters,
-        )
-        prior_vols.append(f"{book_id.rsplit('/', 1)[-1]} (existing)")
-
     for prior_dir in find_prior_volumes(artifacts_dir, book_id):
         prior_assign = prior_dir / "04_voice_assignments.json"
         if not prior_assign.exists():
@@ -1600,10 +1827,16 @@ def voice_cast(
     console.print(
         f"[dim]endpoint={client.settings.llm.endpoint} model={client.settings.llm.model}[/]"
     )
-    if narrator_clip:
+    if narrator_clip and not narrator_flag_ignored:
         console.print(f"[dim]Narrator override: {narrator_clip}[/]")
     console.print(
         f"Casting {len(cast.characters)} character(s) against {len(vb.clips)} clip(s)…"
+    )
+
+    own_clip = (
+        {c.character_name: c.assigned_clip_id for c in existing.castings}
+        if existing is not None
+        else {}
     )
 
     def _progress(character, casting):
@@ -1613,15 +1846,25 @@ def voice_cast(
                 f"({casting.candidates_considered} candidate(s))"
             )
             return
-        # Highlight reused vs freshly cast.
+        # Highlight locked / reused / kept vs freshly cast.
         marker = "[green]✓[/]"
         suffix = ""
-        if prior_index is not None:
-            prior = prior_index.lookup(
-                character.name, character.aliases, character.gender
-            )
-            if prior and prior.assigned_clip_id == casting.assigned_clip_id:
-                suffix = " [dim](reused from prior volume)[/]"
+        prior = (
+            prior_index.lookup(character.name, character.aliases, character.gender)
+            if prior_index is not None
+            else None
+        )
+        if casting.locked:
+            suffix = " [dim](locked, kept)[/]"
+        elif prior and prior.assigned_clip_id == casting.assigned_clip_id:
+            suffix = " [dim](reused from prior volume)[/]"
+        elif own_clip.get(character.name) == casting.assigned_clip_id:
+            suffix = " [dim](kept from existing casting)[/]"
+        if casting.audit_note.startswith("voice cast:"):
+            # Matcher fallback (ranking returned no offered id, or a locked
+            # clip vanished from the bank) — worth a look before s3.
+            marker = "[yellow]✓[/]"
+            suffix += f" [yellow]{casting.audit_note}[/]"
         console.print(
             f"  {marker} {character.name} → {casting.assigned_clip_id} "
             f"({casting.candidates_considered} cand.){suffix}"
@@ -1635,6 +1878,7 @@ def voice_cast(
         profiles=profiles,
         top_n=top_n,
         prior_index=prior_index,
+        existing=existing,
         narrator_clip_override=narrator_clip,
         on_character_done=_progress,
     )

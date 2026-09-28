@@ -6,8 +6,9 @@ Outputs:
         every matched beat. Multi-paragraph beats emit multiple spans sharing
         the same data-beat-id.
     artifacts/<book>/07_sync/sync_manifest.json — per-beat audio timing aligned
-        to the final m4b (silences from Stage 5 are accounted for) + the
-        ``data-beat-id`` to look up in the EPUB.
+        to the final m4b (replaying the layout Stage 5 recorded in
+        ``06_final/<title>.timings.json``) + the ``data-beat-id`` to look up
+        in the EPUB.
     artifacts/<book>/07_sync/unmatched.json    — beats the anchor matcher
         couldn't place. Should be small / empty when normalization is sound.
 
@@ -213,7 +214,17 @@ class _Match:
 # bounded when many beats fall through to the fuzzy fallback.
 _FUZZY_WINDOW_BASE = 3000
 _FUZZY_MIN_RATIO = 0.20  # match must cover at least 20% of the normalized beat
-_BACKTRACK_WINDOW = 1500  # chars before cursor we'll look for a head anchor
+
+# There used to be a lenient "backtrack" rung here: look up to 1500 chars
+# BEFORE the cursor for a beat the previous match over-consumed. It could
+# never fire — Pass 1 is strict (returns before the lenient rungs) and Pass 2
+# calls `_find_beat` on the gap slice with cursor 0, so the window before the
+# cursor was always empty. Pass 2's own backward slack (2000 chars before the
+# previous match's end, searched forward from its start) already covers that
+# window and more, so the rung was removed rather than revived: reviving it
+# would mean searching 2000-3500 chars behind the previous match, inside text
+# earlier beats already claimed. The `"backtrack"` histogram key stays (always
+# 0) so existing manifest readers keep working.
 
 
 # Max chars a single Pass-1 match may sit ahead of the cursor. Beats are
@@ -242,10 +253,13 @@ def _find_beat(
                             verified head anchor (no over-claim)
       - ``"tail-only"``     tail matched, head paraphrased — span is just the
                             verified tail anchor
-      - ``"backtrack"``     head found BEFORE cursor (previous beat
-                            over-consumed); same conservative claim
       - ``"fuzzy"``         `difflib.SequenceMatcher` longest-common substring
                             fallback. Most lenient.
+
+    Lenient order: long beats ``anchored`` → ``head-only`` → ``tail-only`` →
+    ``fuzzy``; short beats ``exact`` → ``fuzzy``. Nothing looks before
+    `cursor` — Pass 2 starts its gap slice early instead (see
+    `_PASS2_BACKWARD_SLACK` in `run`).
 
     When ``strict=True``, ONLY ``"exact"`` and ``"anchored"`` matches are
     returned; the other fallbacks become None. Used in Pass 1 so a lenient
@@ -272,11 +286,7 @@ def _find_beat(
             return idx, idx + len(norm), "exact"
         if strict:
             return None
-        # Lenient mode for short beats: try backtrack + fuzzy.
-        back_start = max(0, cursor - _BACKTRACK_WINDOW)
-        idx_back = shadow.rfind(norm, back_start, cursor)
-        if idx_back != -1:
-            return idx_back, idx_back + len(norm), "backtrack"
+        # Lenient mode for short beats: fuzzy.
         return _fuzzy_match(shadow, norm, cursor)
 
     head = norm[:HEAD_ANCHOR_LEN]
@@ -300,23 +310,12 @@ def _find_beat(
     if h != -1:
         return h, h + HEAD_ANCHOR_LEN, "head-only"
 
-    # 4. Backtrack: head not found forward — try the window BEFORE cursor.
-    back_start = max(0, cursor - _BACKTRACK_WINDOW)
-    h_back = shadow.rfind(head, back_start, cursor)
-    if h_back != -1:
-        min_tail_start = h_back + HEAD_ANCHOR_LEN
-        max_tail_end = h_back + max(len(norm) * 2 + 300, 1000)
-        t = shadow.find(tail, min_tail_start, max_tail_end)
-        if t != -1:
-            return h_back, t + TAIL_ANCHOR_LEN, "backtrack"
-        return h_back, h_back + HEAD_ANCHOR_LEN, "backtrack"
-
-    # 5. Tail-only forward. Claim ONLY the verified tail anchor.
+    # 4. Tail-only forward. Claim ONLY the verified tail anchor.
     t = shadow.find(tail, cursor)
     if t != -1:
         return t, t + TAIL_ANCHOR_LEN, "tail-only"
 
-    # 6. Last resort: fuzzy longest-common substring.
+    # 5. Last resort: fuzzy longest-common substring.
     return _fuzzy_match(shadow, norm, cursor)
 
 
@@ -630,8 +629,9 @@ def align_images_to_embeds(image_marks: list[dict], embedded: list[Path]) -> lis
     lined up: 0 of 148 Oz markers showed the right picture, 0 of 45 in Alice.
 
     Each picture takes its first occurrence that has a playback time. A picture
-    no beat ever reaches (typically the cover and front matter) still gets an
-    entry, with `trigger_seconds` None — dropping it would shift every later
+    no beat follows (end matter, or one no page references — often the cover
+    image itself; a front-matter page's picture triggers at the first beat)
+    still gets an entry, with `trigger_seconds` None — dropping it would shift every later
     picture by one, which is the bug this fixes. The per-occurrence list lives
     on in `visual_elements`.
     """
@@ -757,26 +757,61 @@ def place_visual_element(
 # ---- timing accumulation ----------------------------------------------------
 
 
+# A chapter whose replayed length differs from the length s5 measured by more
+# than this has had its renders changed since the mix. Rounding noise (manifest
+# durations are kept to the millisecond) stays in the low milliseconds.
+_MIX_DRIFT_TOLERANCE = 0.5
+
+
 def _compute_beat_timings(
     audio_dir: Path,
     *,
     intra_silence: float,
     inter_scene_silence: float,
     inter_chapter_silence: float,
+    lead_in_silence: float = 0.0,
+    chapter_ids: list[str] | None = None,
+    chapter_bounds: dict[str, tuple[float, float]] | None = None,
+    warn: Callable[[str], None] | None = None,
 ) -> dict[str, tuple[float, float]]:
     """beat_id → (start_seconds, end_seconds) in the final m4b time space.
 
-    Mirrors Stage 5's silence layout: intra-scene between consecutive beats of
-    one scene, inter-scene at scene boundaries, inter-chapter between chapters.
+    Mirrors Stage 5's layout: intra-scene between consecutive beats of one
+    scene, inter-scene at scene boundaries, inter-chapter between chapters,
+    and `lead_in_silence` before EVERY beat. A beat's start is where its
+    lead-in starts, as in scenario-sync (§17.4) — the reader's ~0.3 s poll
+    then lands before speech — and its end is where its speech ends.
+
+    `chapter_ids` is the chapter list s5 actually mixed, in mix order (from
+    its timings sidecar). None = every `<audio_dir>/<id>/manifest.json`,
+    sorted — what `lnvox s5` mixes without `--chapters`.
+
+    `chapter_bounds` (also from the sidecar) re-anchors each chapter at the
+    start s5 measured, so a chapter re-rendered after the mix cannot shift
+    every later chapter; `warn` is told about each such chapter.
     """
+    say = warn or (lambda _m: None)
+    if chapter_ids is None:
+        chapter_ids = [
+            p.name for p in sorted(audio_dir.iterdir())
+            if p.is_dir() and (p / "manifest.json").exists()
+        ]
     timings: dict[str, tuple[float, float]] = {}
     cursor = 0.0
-    chapter_dirs = sorted(p for p in audio_dir.iterdir() if p.is_dir())
-    for ci, chap_dir in enumerate(chapter_dirs):
-        mani_path = chap_dir / "manifest.json"
+    for ci, chapter_id in enumerate(chapter_ids):
+        mani_path = audio_dir / chapter_id / "manifest.json"
         if not mani_path.exists():
-            continue
+            # Skipping it would silently shift every later chapter by its
+            # length — the drift this layout replay exists to prevent.
+            raise FileNotFoundError(
+                f"{mani_path} is missing, but chapter {chapter_id} is part of "
+                f"the mix. Re-render it (`lnvox s4`) and re-mix (`lnvox s5`)."
+            )
         data = json.loads(mani_path.read_text(encoding="utf-8"))
+        bounds = (chapter_bounds or {}).get(chapter_id)
+        if bounds is not None:
+            cursor = bounds[0]
+        chapter_start = cursor
         prev_scene: str | None = None
         for i, beat in enumerate(data["beats"]):
             if i > 0:
@@ -786,15 +821,28 @@ def _compute_beat_timings(
                     else intra_silence
                 )
             start = cursor
-            cursor += float(beat["duration_seconds"])
+            cursor += lead_in_silence + float(beat["duration_seconds"])
             timings[beat["beat_id"]] = (round(start, 3), round(cursor, 3))
             prev_scene = beat["scene_id"]
-        if ci < len(chapter_dirs) - 1:
+        if bounds is not None:
+            drift = (cursor - chapter_start) - (bounds[1] - bounds[0])
+            if abs(drift) > _MIX_DRIFT_TOLERANCE:
+                say(
+                    f"  [WARN] chapter {chapter_id}: its renders are {drift:+.1f} s "
+                    f"off the mixed chapter — {audio_dir.name}/{chapter_id} changed "
+                    f"after `lnvox s5`. Its beat times won't match the m4b; re-mix."
+                )
+        if ci < len(chapter_ids) - 1:
             cursor += inter_chapter_silence
     return timings
 
 
 # ---- entry point ------------------------------------------------------------
+
+
+# Pads used when neither the caller nor a timings sidecar supplies one — the
+# `lnvox s5` defaults.
+_DEFAULT_PADS = {"intra": 0.25, "inter_scene": 1.0, "inter_chapter": 2.0, "lead_in": 0.0}
 
 
 def run(
@@ -804,12 +852,69 @@ def run(
     novel_dir: Path,
     output_dir: Path,
     *,
-    intra_silence: float = 0.25,
-    inter_scene_silence: float = 1.0,
-    inter_chapter_silence: float = 2.0,
+    intra_silence: float | None = None,
+    inter_scene_silence: float | None = None,
+    inter_chapter_silence: float | None = None,
+    lead_in_silence: float | None = None,
+    mix_title: str | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict:
+    """Run Stage 6. Returns the sync manifest (also written to disk).
+
+    The timeline follows the Stage-5 mix recorded in
+    `06_final/<mix_title>.timings.json` (default: the newest sidecar): its
+    pads, lead-in, chapter list and embedded-picture order. A pad argument
+    left None takes the recorded value; an explicit one overrides it (with a
+    warning if they differ). With no sidecar at all, the `lnvox s5` defaults
+    and every chapter in 05_audio/ are assumed — the pre-sidecar behaviour.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    from lnvox.stages.s5_mix import (
+        embedded_image_order,
+        load_mix_layout,
+        resolve_book_images,
+    )
+
+    layout = load_mix_layout(book_dir / "06_final", mix_title)
+    if layout is not None and layout.audio_dir not in (None, "05_audio"):
+        # `lnvox s5 --v2`: VibeVoice session manifests have one entry per
+        # multi-line session, so no beat could be timed against that m4b.
+        raise ValueError(
+            f"{layout.m4b.name} was mixed from {layout.audio_dir}/ (VibeVoice "
+            f"sessions), which has no per-beat timing (DESIGN.md §16.10). "
+            f"Pass --title of a mix made from 05_audio/."
+        )
+    recorded = dict(_DEFAULT_PADS) if layout is None else {
+        "intra": layout.intra_silence,
+        "inter_scene": layout.inter_scene_silence,
+        "inter_chapter": layout.inter_chapter_silence,
+        "lead_in": layout.lead_in_silence,
+    }
+    explicit = {
+        "intra": intra_silence,
+        "inter_scene": inter_scene_silence,
+        "inter_chapter": inter_chapter_silence,
+        "lead_in": lead_in_silence,
+    }
+    pads = {k: recorded[k] if v is None else float(v) for k, v in explicit.items()}
+    if layout is None:
+        progress(
+            "No 06_final/*.timings.json — assuming the s5 defaults (or the "
+            "given pads) and every chapter in 05_audio/."
+        )
+    else:
+        progress(
+            f"Following the mix in {layout.sidecar.name}: pads "
+            f"{pads['intra']}/{pads['inter_scene']}/{pads['inter_chapter']} s, "
+            f"lead-in {pads['lead_in']} s, {len(layout.chapter_ids)} chapter(s)."
+        )
+        for k in pads:
+            if pads[k] != recorded[k]:
+                progress(
+                    f"  [WARN] {k} = {pads[k]} s overrides the {recorded[k]} s "
+                    f"{layout.m4b.name} was mixed with — timings won't match it."
+                )
+    mixed_chapters = set(layout.chapter_ids) if layout and layout.chapter_ids else None
 
     epub_meta_path = novel_dir / ".epub_meta.json"
     if not epub_meta_path.exists():
@@ -856,24 +961,42 @@ def run(
     audio_dir = book_dir / "05_audio"
     timings = _compute_beat_timings(
         audio_dir,
-        intra_silence=intra_silence,
-        inter_scene_silence=inter_scene_silence,
-        inter_chapter_silence=inter_chapter_silence,
+        intra_silence=pads["intra"],
+        inter_scene_silence=pads["inter_scene"],
+        inter_chapter_silence=pads["inter_chapter"],
+        lead_in_silence=pads["lead_in"],
+        chapter_ids=(layout.chapter_ids or None) if layout else None,
+        # s5's measured chapter starts only describe a layout with THESE pads.
+        chapter_bounds=(
+            layout.chapter_bounds if layout and pads == recorded else None
+        ),
+        warn=progress,
     )
     progress(f"Computed timing for {len(timings)} beat(s) from {audio_dir}")
 
     # Directed beats with per-chapter ordering.
     directed_dir = book_dir / "03_directed"
     chapter_beats: dict[str, list[tuple[str, dict]]] = {}
+    not_mixed: list[str] = []
     for path in sorted(directed_dir.glob("*.json")):
         directed = json.loads(path.read_text(encoding="utf-8"))
         cid = directed["chapter_id"]
+        if mixed_chapters is not None and cid not in mixed_chapters:
+            # Not in this m4b (`lnvox s5 --chapters`): its beats have no
+            # place on the timeline, and entries at 0:00 would mislead.
+            not_mixed.append(cid)
+            continue
         ordered: list[tuple[str, dict]] = []
         for scene in directed["scenes"]:
             for i, beat in enumerate(scene["beats"]):
                 beat_id = f"{scene['scene_id']}_b{i:04d}"
                 ordered.append((beat_id, beat))
         chapter_beats[cid] = ordered
+    if not_mixed:
+        progress(
+            f"Skipping {len(not_mixed)} directed chapter(s) not in "
+            f"{layout.m4b.name}: {', '.join(not_mixed)}"
+        )
 
     modifications: dict[str, bytes] = {}
     matched_beats: list[dict] = []
@@ -888,7 +1011,7 @@ def run(
         "anchored": 0,
         "head-only": 0,
         "tail-only": 0,
-        "backtrack": 0,
+        "backtrack": 0,  # retired rung, kept for manifest compatibility
         "fuzzy": 0,
     }
 
@@ -1271,11 +1394,15 @@ def run(
     visual_elements += ingest_visual_elements
 
     # Manifest images must mirror the m4b's embedded pictures one-for-one, in
-    # the order Stage 5 embeds them (see align_images_to_embeds).
-    from lnvox.stages.s5_mix import embedded_image_order, resolve_book_images
-
-    _cover, _extra = resolve_book_images(book_dir, novel_dir)
-    embedded = embedded_image_order(_cover, _extra)
+    # the order Stage 5 embedded them (see align_images_to_embeds). The
+    # sidecar lists exactly that, `--cover` / `--images-dir` overrides
+    # included; re-resolving (without them) is only the fallback for a
+    # sidecar that predates the list, or no mix at all.
+    if layout is not None and layout.embedded_images is not None:
+        embedded = layout.embedded_images
+    else:
+        _cover, _extra = resolve_book_images(book_dir, novel_dir)
+        embedded = embedded_image_order(_cover, _extra)
     aligned_images = align_images_to_embeds(image_marks, embedded)
     timed = sum(1 for im in aligned_images if im["trigger_seconds"] is not None)
     progress(
@@ -1314,6 +1441,9 @@ def run(
     manifest = {
         "book_id": book_id,
         "epub": str(output_epub),
+        # The 06_final/ m4b these timings describe (None: no sidecar found).
+        # `lnvox sample` slices this file.
+        "m4b": layout.m4b.name if layout is not None else None,
         "span_class": SPAN_CLASS,
         "data_attr": SPAN_ATTR,
         "total_beats": len(matched_beats) + len(unmatched),
@@ -1321,9 +1451,10 @@ def run(
         "unmatched": len(unmatched),
         "match_confidence": confidence_counts,
         "silences": {
-            "intra_seconds": intra_silence,
-            "inter_scene_seconds": inter_scene_silence,
-            "inter_chapter_seconds": inter_chapter_silence,
+            "intra_seconds": pads["intra"],
+            "inter_scene_seconds": pads["inter_scene"],
+            "inter_chapter_seconds": pads["inter_chapter"],
+            "lead_in_seconds": pads["lead_in"],
         },
         "images": aligned_images,
         "visual_elements": visual_elements,

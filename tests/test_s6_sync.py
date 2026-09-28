@@ -107,6 +107,87 @@ def test_wrap_multiple_beats_in_one_node():
     assert soup.get_text() == "First sentence. Second sentence."
 
 
+# ---- matching ladder -----------------------------------------------------------
+
+
+def _one_page_book(root: Path, page_text: str, beats: list[str]):
+    """Minimal EPUB + ingest + directed/rendered artifacts: one chapter, one page."""
+    import json
+    import zipfile
+
+    epub = root / "b.epub"
+    with zipfile.ZipFile(epub, "w") as z:
+        z.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip",
+                   compress_type=zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml",
+                   '<?xml version="1.0"?><container version="1.0" '
+                   'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+                   '<rootfile full-path="content.opf" '
+                   'media-type="application/oebps-package+xml"/></rootfiles></container>')
+        z.writestr("content.opf",
+                   '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" '
+                   'version="3.0"><manifest><item id="p" href="c.xhtml" '
+                   'media-type="application/xhtml+xml"/></manifest>'
+                   '<spine><itemref idref="p"/></spine></package>')
+        z.writestr("c.xhtml", '<?xml version="1.0" encoding="utf-8"?><html '
+                   'xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>'
+                   f"<body><p>{page_text}</p></body></html>")
+    novel = root / "novel"
+    novel.mkdir()
+    (novel / ".epub_meta.json").write_text(json.dumps({
+        "images": [], "visual_elements": [],
+        "chapters": [{"file": "01-x.txt", "title": "x", "source_parts": ["c"]}],
+    }))
+    book = root / "book"
+    (book / "03_directed").mkdir(parents=True)
+    (book / "05_audio" / "01").mkdir(parents=True)
+    (book / "03_directed" / "01.json").write_text(json.dumps({
+        "chapter_id": "01", "scenes": [{"scene_id": "01_s1", "beats": [
+            {"type": "narration", "text": t, "speaker": "Narrator",
+             "direction": "d", "prompt": "p"} for t in beats
+        ]}],
+    }))
+    (book / "05_audio" / "01" / "manifest.json").write_text(json.dumps({"beats": [
+        {"beat_id": f"01_s1_b{i:04d}", "scene_id": "01_s1", "duration_seconds": 1.0}
+        for i in range(len(beats))
+    ]}))
+    return book, novel, epub
+
+
+def test_pass2_slack_places_a_beat_stage2_moved_after_its_neighbour():
+    """Stage 2 sometimes emits a line of dialogue BEFORE the attribution that
+    precedes it in the source. The attribution then sits behind Pass 1's
+    cursor. Pass 2 searches from 2000 chars before the previous match, which
+    is what finds it — the retired `backtrack` rung (1500 chars before the
+    cursor) never could, so its histogram slot stays 0."""
+    import tempfile
+
+    from lnvox.stages import s6_sync
+
+    assert not hasattr(s6_sync, "_BACKTRACK_WINDOW")
+    page = ("Patrick admitted, “I lost the map somewhere past the old bridge.” "
+            "Nobody spoke for a while after that.")
+    beats = [
+        "I lost the map somewhere past the old bridge.",   # dialogue first …
+        "Patrick admitted,",                               # … attribution second
+        "Nobody spoke for a while after that.",
+    ]
+    import re
+    import zipfile
+
+    with tempfile.TemporaryDirectory() as d:
+        book, novel, epub = _one_page_book(Path(d), page, beats)
+        m = s6_sync.run("x", book, epub, novel, book / "07_sync", progress=lambda _m: None)
+        with zipfile.ZipFile(m["epub"]) as z:
+            order = re.findall(r'data-beat-id="([^"]+)"', z.read("c.xhtml").decode())
+    by_id = {b["beat_id"]: b for b in m["beats"]}
+    assert m["matched"] == 3, m["beats"]
+    assert by_id["01_s1_b0001"]["match_confidence"] == "exact+pass2"
+    # Wrapped where the source has it: attribution, then the dialogue.
+    assert order == ["01_s1_b0001", "01_s1_b0000", "01_s1_b0002"], order
+    assert m["match_confidence"]["backtrack"] == 0
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

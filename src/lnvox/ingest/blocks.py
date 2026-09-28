@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from bs4 import BeautifulSoup
-from bs4.element import Tag
+from bs4.element import PreformattedString, Tag
 
 
 # Top-most flow elements we treat as one block each. Structural wrapper
@@ -56,9 +56,11 @@ _DROP_STEM_RE = re.compile(
 )
 
 # Heading text (lowercased) that flags a whole page as a contents/index page.
+# Whole-title matches only: "Index Funds and You" or "Glossary of Terms Used
+# in Chapter 3" are chapters, not back matter.
 _DROP_HEADING_TEXT = {
     "contents", "table of contents", "toc", "index", "bibliography",
-    "list of illustrations", "list of figures",
+    "glossary", "list of illustrations", "list of figures",
 }
 
 # Project Gutenberg wraps its header/footer license boilerplate in these.
@@ -68,7 +70,19 @@ _PG_BOILERPLATE_IDS = {"pg-header", "pg-footer"}
 # epub:type appears under the OPS namespace; bs4's html.parser surfaces it as a
 # flat "epub:type" attribute. Some files use a plain "type"/"role" too.
 _EPUB_TYPE_ATTRS = ("epub:type", "epubtype", "data-epub-type")
+# On an <aside>, any of these makes it a footnote (the historical rule; "note"
+# stays aside-only because a <div epub:type="note"> is as often a narrated
+# callout box as a footnote).
 _FOOTNOTE_TYPES = {"footnote", "endnote", "rearnote", "note", "footnotes"}
+# On ANY element (§13.2a `<*[epub:type=footnote|endnote]>`): the element is one
+# footnote block — a `<div>`/`<li>`/`<p>` note, not just an <aside>.
+_NOTE_TYPES = {"footnote", "endnote", "rearnote"}
+# Containers of notes (Standard Ebooks' `<section epub:type="endnotes">`):
+# every block inside one is a footnote.
+_NOTE_CONTAINER_TYPES = {"footnotes", "endnotes", "rearnotes"}
+# Elements whose epub:type landmark is page-level when they are not nested in
+# another one (see page_drop_reason).
+_LANDMARK_TAGS = ("section", "nav", "article")
 
 
 @dataclass
@@ -93,6 +107,53 @@ def _class_tokens(el: Tag) -> str:
     if isinstance(cls, str):
         cls = [cls]
     return " ".join(cls)
+
+
+def _has_type(el, types) -> bool:
+    return isinstance(el, Tag) and any(
+        t in types for t in _epub_type(el).lower().split()
+    )
+
+
+def _drop_type(el: Tag, drop_types: frozenset[str]) -> Optional[str]:
+    """The first drop-set ``epub:type`` token on `el` itself, else None."""
+    for token in _epub_type(el).lower().split():
+        if token in drop_types:
+            return token
+    return None
+
+
+def _in_dropped_landmark(el: Tag, drop_types: frozenset[str]) -> bool:
+    """True if `el` or any ancestor carries a drop-set ``epub:type``.
+
+    Blocks under such a landmark are boilerplate even when the page around
+    them is kept (a chapter-end bibliography section, a mini-TOC nav).
+    """
+    node = el
+    while isinstance(node, Tag):
+        if _drop_type(node, drop_types):
+            return True
+        node = node.parent
+    return False
+
+
+def _has_text_outside(body: Tag, containers: list[Tag]) -> bool:
+    """True if `body` has any lettered text not inside one of `containers`.
+
+    Digit/punctuation-only strings (page numbers, ornaments) don't count, so a
+    stray page-break marker next to an index section doesn't save the page.
+    """
+    inside = {id(c) for c in containers}
+    for s in body.find_all(string=True):
+        if isinstance(s, PreformattedString):  # comment / doctype / CDATA
+            continue
+        if not any(ch.isalpha() for ch in s):
+            continue
+        if s.parent is not None and s.parent.name in ("script", "style", "title"):
+            continue
+        if not any(id(p) in inside for p in s.parents):
+            return True
+    return False
 
 
 _WS_RE = re.compile(r"\s+")
@@ -121,8 +182,10 @@ def page_drop_reason(
 ) -> Optional[str]:
     """Return a short reason if this whole spine page should be dropped, else None.
 
-    Deterministic only: an ``epub:type`` landmark on <body>/<section>/<nav>, an
-    EPUB3 ``<nav epub:type="toc">``, or a boilerplate filename stem.
+    Deterministic only: a boilerplate filename ``stem`` (the XHTML file's own
+    stem — never heading text), a page-level ``epub:type`` landmark, a Project
+    Gutenberg header/footer wrapper, a nav document, a leading heading whose
+    WHOLE text names a contents/index page, or a link-dense page with no prose.
     """
     stem_l = stem.lower()
     if _DROP_STEM_RE.match(stem_l):
@@ -132,16 +195,30 @@ def page_drop_reason(
     if not isinstance(body, Tag):
         return None
 
-    # 1. EPUB3 epub:type landmark on body / section / nav.
-    candidates = [body] + body.find_all(["section", "nav"], recursive=True)
-    for el in candidates:
-        if not isinstance(el, Tag):
-            continue
-        for token in _epub_type(el).lower().split():
-            if token in drop_types:
-                return f"epub:type '{token}'"
+    # 1. EPUB3 epub:type landmark — page-level markup only: on <body>, or on
+    # top-level <section>/<nav>/<article>s that hold ALL the page's text. A
+    # landmark nested inside a chapter (a chapter-end bibliography section, a
+    # mini-TOC nav), or sitting beside real prose, drops only its own blocks
+    # (classify_page) — it used to drop the whole chapter page.
+    token = _drop_type(body, drop_types)
+    if token:
+        return f"epub:type '{token}'"
+    top_level = [
+        el
+        for el in body.find_all(_LANDMARK_TAGS)
+        if not any(
+            isinstance(p, Tag) and p.name in _LANDMARK_TAGS
+            for p in el.parents
+            if p is not body
+        )
+    ]
+    dropped = [el for el in top_level if _drop_type(el, drop_types)]
+    if dropped and not _has_text_outside(body, dropped):
+        return f"epub:type '{_drop_type(dropped[0], drop_types)}'"
 
     # 2. Project Gutenberg (and similar) boilerplate header/footer wrappers.
+    # Page-wide on purpose: PG puts its header in the same file as the title
+    # page and the linked contents table, all of which should go.
     for el in body.find_all(True):
         if (set(_class_tokens(el).lower().split()) & _PG_BOILERPLATE_CLASSES) or (
             (el.get("id") or "").lower() in _PG_BOILERPLATE_IDS
@@ -152,8 +229,17 @@ def page_drop_reason(
     if body.find("nav") is not None and not body.find("p"):
         return "nav document (no prose)"
 
-    # 4. Content-based contents/index page: a leading heading that names it.
-    heading = body.find(["h1", "h2", "h3"])
+    # 4. Content-based contents/index page: a leading heading that names it
+    # (whole title only — see _DROP_HEADING_TEXT). A heading inside a nested
+    # drop landmark (a mini-TOC's "Contents") is that landmark's, not the page's.
+    heading = next(
+        (
+            h
+            for h in body.find_all(["h1", "h2", "h3"])
+            if not _in_dropped_landmark(h, drop_types)
+        ),
+        None,
+    )
     if heading is not None:
         htext = _WS_RE.sub(" ", heading.get_text()).strip().lower().rstrip(".")
         if htext in _DROP_HEADING_TEXT:
@@ -178,6 +264,8 @@ def _classify_one(
     Returns ``(block, needs_llm)`` or ``None`` to skip the element (empty text /
     the title heading, which the caller emits separately).
     """
+    if el is title_el:
+        return None  # caller emits the chapter title separately
     name = (el.name or "").lower()
     has_text = bool(el.get_text(strip=True))
     has_img = el.find(["img", "image"]) is not None
@@ -210,13 +298,16 @@ def _classify_one(
     if name == "aside":
         if any(t in _FOOTNOTE_TYPES for t in _epub_type(el).lower().split()):
             return ClassifiedBlock(kind="footnote", html=str(el), tag=name), False
-        # A non-note aside is sidebar prose — narrate it.
+        # A non-note aside is sidebar prose — narrate it (unless it sits in a
+        # notes container, below).
+    if _is_note_block(el):
+        if not (has_text or has_img):
+            return None
+        return ClassifiedBlock(kind="footnote", html=str(el), tag=name), False
 
     text = _text_of(el)
     if not text:
         return None
-    if el is title_el:
-        return None  # caller emits the chapter title separately
 
     if name in ("p", "blockquote") or name in ("ul", "ol") or name == "aside" or name.startswith("h"):
         # Code-as-styled-paragraph: hint-detect, defer the judgment to the LLM.
@@ -255,14 +346,44 @@ _KNOWN_LANGS = {
 }
 
 
+def _is_note_block(el: Tag) -> bool:
+    """True if a block is a footnote/endnote by its ``epub:type`` markup.
+
+    Three shapes (§13.2a — any element, not just <aside>): the block carries
+    a note type itself (`<div epub:type="footnote">`); it sits inside a notes
+    container (`<section epub:type="endnotes">`); or every lettered string in
+    it belongs to a note inside it (an `<ol>` of `<li epub:type="endnote">`).
+    """
+    if _has_type(el, _NOTE_TYPES):
+        return True
+    if any(_has_type(p, _NOTE_TYPES | _NOTE_CONTAINER_TYPES) for p in el.parents):
+        return True
+    if el.find(lambda t: _has_type(t, _NOTE_TYPES)) is None:
+        return False
+    found = False
+    for s in el.find_all(string=True):
+        if isinstance(s, PreformattedString) or not any(ch.isalpha() for ch in s):
+            continue
+        owner = s.parent
+        while owner is not None and owner is not el and not _has_type(owner, _NOTE_TYPES):
+            owner = owner.parent
+        if owner is None or owner is el:
+            return False  # prose outside any note
+        found = True
+    return found
+
+
+def _is_block_el(el: Tag) -> bool:
+    # A note-typed element is one block whatever its tag (a <div>/<li> note
+    # holding several <p>s is ONE footnote, not several).
+    return (el.name or "").lower() in _BLOCK_TAG_SET or _has_type(el, _NOTE_TYPES)
+
+
 def _top_level_blocks(body: Tag) -> list[Tag]:
     """Top-most block elements in document order (skip blocks nested in blocks)."""
     out: list[Tag] = []
-    for el in body.find_all(_BLOCK_TAGS):
-        if any(
-            isinstance(p, Tag) and (p.name or "").lower() in _BLOCK_TAG_SET
-            for p in el.parents
-        ):
+    for el in body.find_all(_is_block_el):
+        if any(isinstance(p, Tag) and _is_block_el(p) for p in el.parents):
             continue
         out.append(el)
     return out
@@ -274,22 +395,35 @@ def classify_page(
     classifier: str = "fallback",
     llm=None,
     render_template=None,
+    drop_types: frozenset[str] = DEFAULT_DROP_TYPES,
 ) -> tuple[str, list[ClassifiedBlock]]:
     """Classify one XHTML page into a title + ordered blocks.
 
     ``classifier``: ``"fallback"`` runs the LLM only on ambiguous blocks (needs
     ``llm`` + ``render_template``); ``"none"`` resolves ambiguous blocks to
     prose deterministically.
+
+    Blocks under a ``drop_types`` landmark that did not drop the whole page
+    (see `page_drop_reason`) are excised here: not narrated, not surfaced.
     """
     body = soup.find("body") or soup
     if not isinstance(body, Tag):
         return "", []
 
-    h = body.find(["h1", "h2"])
+    h = next(
+        (
+            x
+            for x in body.find_all(["h1", "h2"])
+            if not _in_dropped_landmark(x, drop_types)
+        ),
+        None,
+    )
     title = _text_of(h) if h else ""
 
     blocks: list[ClassifiedBlock] = []
     for el in _top_level_blocks(body):
+        if _in_dropped_landmark(el, drop_types):
+            continue
         res = _classify_one(el, title_el=h)
         if res is None:
             continue
@@ -310,7 +444,11 @@ def _resolve_ambiguous(
     llm,
     render_template,
 ) -> ClassifiedBlock:
-    """Decide an ambiguous block's kind. LLM if available, else fall to prose."""
+    """Decide an ambiguous block's kind. LLM if available, else fall to prose.
+
+    Transport errors (server down / 5xx) propagate; a bad answer falls to prose.
+    """
+    from lnvox.llm.client import is_transport_error
     from lnvox.llm.schemas import BlockClass
 
     if classifier == "none" or llm is None or render_template is None:
@@ -322,7 +460,12 @@ def _resolve_ambiguous(
         result: BlockClass = llm.structured(
             system=_CLASSIFY_SYSTEM, user=user, schema=BlockClass, max_tokens=256
         )
-    except Exception:
+    except Exception as exc:
+        # A bad or unparseable answer degrades to prose (narrate it). An
+        # unreachable server must NOT: it would silently turn every ambiguous
+        # block of the book into prose, and the step would still succeed.
+        if is_transport_error(exc):
+            raise
         return ClassifiedBlock(kind="prose", text=block.text, tag=block.tag)
     kind = result.kind
     if kind == "prose":
