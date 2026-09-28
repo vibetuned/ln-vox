@@ -451,21 +451,32 @@ def _load_studio():
             def __call__(self, *_a, **_k):
                 return _Stub()
 
-        def _stub_attr(attr):
-            # Dunders stay missing: inspect (and numba, under librosa) walk
-            # sys.modules probing __file__ & co., and a class there breaks
-            # them in every later test.
-            if attr.startswith("__"):
+        def _module_getattr(attr):
+            # Dunders must stay honest: torch, librosa and inspect walk
+            # sys.modules reading `__file__` / `__path__`, and a stub that
+            # answers those with a class made every later `import torch` die on
+            # `type object '__file__' has no attribute 'endswith'`.
+            if attr.startswith("__") and attr.endswith("__"):
                 raise AttributeError(attr)
             return type(attr, (_Stub,), {})
 
-        for name in ("PySide6", "PySide6.QtCore", "PySide6.QtMultimedia", "PySide6.QtWidgets"):
+        stubbed = ("PySide6", "PySide6.QtCore", "PySide6.QtMultimedia", "PySide6.QtWidgets")
+        for name in stubbed:
             mod = types.ModuleType(name)
-            mod.__getattr__ = _stub_attr
+            mod.__getattr__ = _module_getattr
             sys.modules[name] = mod
-    spec = importlib.util.spec_from_file_location("voicebank_studio", SCRIPTS / "voicebank_studio.py")
-    studio = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(studio)
+    else:
+        stubbed = ()
+    try:
+        spec = importlib.util.spec_from_file_location("voicebank_studio", SCRIPTS / "voicebank_studio.py")
+        studio = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(studio)
+    finally:
+        # The Studio binds every Qt name at import (all its PySide6 imports are
+        # module-level), so the fakes can go now instead of leaking into every
+        # later test that imports or inspects PySide6.
+        for name in stubbed:
+            sys.modules.pop(name, None)
     _STUDIO = studio
     return studio
 

@@ -485,6 +485,10 @@ def _wrap_matches(
 # ---- EPUB inspection + repack -----------------------------------------------
 
 
+# Media types that can be an EPUB content document (a page in the spine).
+_CONTENT_MEDIA_TYPES = frozenset({"application/xhtml+xml", "text/html", "image/svg+xml"})
+
+
 def _parse_opf(
     epub_path: Path,
 ) -> tuple[str, dict[str, str], list[str]]:
@@ -506,28 +510,40 @@ def _parse_opf(
             opf_dir = ""
         opf = ET.fromstring(zf.read(opf_path))
 
+        # Only EPUB content documents can be pages. The old test — any
+        # media-type containing "xml" — also admitted the NCX
+        # (`application/x-dtbncx+xml`), and because items are keyed by bare
+        # stem, `toc.ncx` overwrote `toc.xhtml`: the spine's TOC page was then
+        # read as the NCX, which is what bs4's XMLParsedAsHTMLWarning was
+        # pointing at (Index v15-v17). SVG stays: EPUB 3 allows an SVG content
+        # document as a spine item (full-page art).
+        items: list[tuple[str, str]] = []           # (id, href)
+        for item in opf.findall(".//opf:item", _OPF_NS):
+            mt = (item.get("media-type") or "").strip().lower()
+            if mt not in _CONTENT_MEDIA_TYPES:
+                continue
+            items.append((item.get("id") or "", item.get("href") or ""))
+
+        spine_ids: list[str] = []
+        spine = opf.find(".//opf:spine", _OPF_NS)
+        if spine is not None:
+            spine_ids = [
+                r.get("idref") or "" for r in spine.findall("opf:itemref", _OPF_NS)
+            ]
+        in_spine = set(spine_ids)
+
+        # Two content documents can still share a stem (`cover.svg` art beside
+        # `cover.xhtml`). Map the spine's own item last so it wins: the spine
+        # is what the reader walks, and what Stage 0 recorded source_parts from.
         stem_to_href: dict[str, str] = {}
         id_to_stem: dict[str, str] = {}
-        for item in opf.findall(".//opf:item", _OPF_NS):
-            href = item.get("href") or ""
-            mt = item.get("media-type") or ""
-            if "html" not in mt and "xml" not in mt:
-                continue
+        for iid, href in sorted(items, key=lambda it: it[0] in in_spine):
             stem = Path(href).stem.lower()
             stem_to_href[stem] = href
-            iid = item.get("id") or ""
             if iid:
                 id_to_stem[iid] = stem
 
-        spine_stems: list[str] = []
-        spine = opf.find(".//opf:spine", _OPF_NS)
-        if spine is not None:
-            for itemref in spine.findall("opf:itemref", _OPF_NS):
-                idref = itemref.get("idref") or ""
-                stem = id_to_stem.get(idref)
-                if stem:
-                    spine_stems.append(stem)
-
+        spine_stems = [id_to_stem[i] for i in spine_ids if i in id_to_stem]
         return opf_dir, stem_to_href, spine_stems
 
 
