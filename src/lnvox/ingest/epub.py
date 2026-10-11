@@ -377,14 +377,15 @@ def _xhtml_to_blocks(
     return title, paragraphs, blocks
 
 
-def _remove_previous_chapter_files(output_dir: Path) -> int:
-    """Delete the chapter .txt files an earlier `extract_epub` wrote here.
+def _remove_previous_chapter_files(output_dir: Path, sidecar: str = ".epub_meta.json") -> int:
+    """Delete the chapter .txt files an earlier extraction wrote here.
 
-    The list comes from that run's `.epub_meta.json` (`chapters[].file`); a
-    name that isn't a bare `*.txt` in `output_dir` is ignored, so a hand-edited
-    sidecar can't point the delete anywhere else. Returns the count removed.
+    The list comes from that run's sidecar (`chapters[].file`; `extract_epub`
+    writes `.epub_meta.json`, `extract_pdf` `.pdf_meta.json`); a name that
+    isn't a bare `*.txt` in `output_dir` is ignored, so a hand-edited sidecar
+    can't point the delete anywhere else. Returns the count removed.
     """
-    meta_path = output_dir / ".epub_meta.json"
+    meta_path = output_dir / sidecar
     try:
         chapters = json.loads(meta_path.read_text(encoding="utf-8")).get("chapters") or []
     except (OSError, ValueError, AttributeError):

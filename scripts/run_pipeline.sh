@@ -94,6 +94,17 @@
 set -uo pipefail
 
 OS="$(uname -s)"
+# Windows runs this launcher under Git Bash (MINGW64), MSYS2 or Cygwin. The
+# python stages are native Windows processes; PYTHONUTF8 makes their pipes
+# and default file encoding UTF-8 instead of the ANSI code page (Dramabox
+# and the HF libraries open files without an explicit encoding).
+IS_WINDOWS=0
+case "$OS" in
+    MINGW*|MSYS*|CYGWIN*)
+        IS_WINDOWS=1
+        export PYTHONUTF8=1
+        ;;
+esac
 
 # macOS power management throttles / sleeps long renders (s4 is hours of
 # sustained GPU work). Re-exec the whole pipeline under caffeinate so the
@@ -389,6 +400,14 @@ run_step() {
 # overhead is minimal when the state is already correct.
 
 prepare_llm_env() {
+    # vLLM ships Linux wheels only and mlx is Apple-only: their extras install
+    # nothing on Windows, and the import checks below would then rebuild the
+    # venv for nothing. (An external --vllm-url server never gets here.)
+    if [ "$IS_WINDOWS" -eq 1 ] && [ "$LLM_BACKEND" != "llama" ]; then
+        echo "ERROR: --llm-backend $LLM_BACKEND can't be served on Windows; use llama (the default)," >&2
+        echo "  or point --vllm-url at a server running elsewhere." >&2
+        exit 2
+    fi
     case "$LLM_BACKEND" in
         mlx)
             banner "Preparing venv for LLM phase (mlx-lm on Apple Silicon)"
@@ -410,7 +429,8 @@ prepare_llm_env() {
             if ! command -v llama-server >/dev/null 2>&1; then
                 echo "" >&2
                 echo "ERROR: --llm-backend=llama but 'llama-server' is not on PATH." >&2
-                echo "  Install via:  brew install llama.cpp   (macOS)" >&2
+                echo "  Install via:  brew install llama.cpp          (macOS)" >&2
+                echo "                winget install ggml.llamacpp    (Windows; reopen the shell after)" >&2
                 echo "                or build from https://github.com/ggerganov/llama.cpp" >&2
                 exit 1
             fi
@@ -498,6 +518,26 @@ install_dramabox_reqs() {
         return 0
     fi
 
+    # Windows: PyPI's torch wheels are CPU-only there, so Dramabox's own
+    # torch/torchaudio pins come from the CUDA 12.8 index (cu128 covers
+    # Blackwell), installed first so the rest of its requirements keep them.
+    # The RE-USE kernels (mamba-ssm / causal-conv1d) have no Windows build:
+    # s4 renders without voice-ref denoising, logged once per run
+    # (staged._denoise_ref). Mirrors setup_dramabox.sh's Windows branch.
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        local torch_reqs filtered
+        torch_reqs="$(mktemp)"
+        filtered="$(mktemp)"
+        grep -i -E '^[[:space:]]*(torch|torchaudio)([[:space:]]|=|<|>|~|!|$)' \
+            "$req_file" > "$torch_reqs"
+        grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision|mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' \
+            "$req_file" > "$filtered"
+        uv pip install --index-url https://download.pytorch.org/whl/cu128 -r "$torch_reqs"
+        uv pip install -r "$filtered"
+        rm -f "$torch_reqs" "$filtered"
+        return 0
+    fi
+
     case "$arch" in
         x86_64)
             # Strip the mamba kernel packages so uv never builds their sdists
@@ -569,7 +609,9 @@ if not torch.cuda.is_available():
     sys.exit(1)
 # A failed kernel-wheel fetch is invisible to a torch.cuda probe: the venv
 # looks healthy, s4 starts, and every attempt dies on a missing module.
-import causal_conv1d_cuda, selective_scan_cuda  # noqa: F401
+# (Windows installs no kernels — see install_dramabox_reqs.)
+if sys.platform != "win32":
+    import causal_conv1d_cuda, selective_scan_cuda  # noqa: F401
 sys.exit(0)
 PY
     then
@@ -976,6 +1018,10 @@ banner "Pipeline complete."
 # '<series>/<volume>').
 M4B_NAME="${BOOK_TITLE//\//_}"
 M4B_NAME="${M4B_NAME//\\/_}"
+if [ "$IS_WINDOWS" -eq 1 ]; then
+    # ...and on Windows the NTFS-forbidden characters + trailing dots/spaces.
+    M4B_NAME="$(printf '%s' "$M4B_NAME" | tr '<>:"|?*' '_______' | sed 's/[. ]*$//')"
+fi
 echo "Final output should be at: $BOOK_ART/06_final/$M4B_NAME.m4b"
 ls -la "$BOOK_ART/06_final/" 2>/dev/null || true
 if [ -f "$BOOK_ART/07_sync/sync_manifest.json" ]; then

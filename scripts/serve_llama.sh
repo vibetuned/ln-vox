@@ -5,8 +5,10 @@
 # (Apple Silicon). See DESIGN.md §14.
 #
 # llama-server is NOT a Python package; install it out-of-band:
-#   macOS:  brew install llama.cpp
-#   Linux:  build from https://github.com/ggerganov/llama.cpp
+#   macOS:    brew install llama.cpp
+#   Windows:  winget install ggml.llamacpp  (the Vulkan build; the CUDA
+#             zips on the release page work too, unpacked onto PATH)
+#   Linux:    build from https://github.com/ggerganov/llama.cpp
 #           (cmake -B build -DGGML_CUDA=on && cmake --build build --target llama-server)
 #
 # Defaults:
@@ -32,8 +34,9 @@ set -euo pipefail
 if ! command -v llama-server >/dev/null 2>&1; then
     echo "ERROR: 'llama-server' not on PATH." >&2
     echo "  Install via:" >&2
-    echo "    macOS:  brew install llama.cpp" >&2
-    echo "    Linux:  build from https://github.com/ggerganov/llama.cpp" >&2
+    echo "    macOS:    brew install llama.cpp" >&2
+    echo "    Windows:  winget install ggml.llamacpp   (reopen the shell after)" >&2
+    echo "    Linux:    build from https://github.com/ggerganov/llama.cpp" >&2
     echo "  See DESIGN.md §14.2." >&2
     exit 127
 fi

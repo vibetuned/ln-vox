@@ -65,7 +65,7 @@ def _fake_repo(tmp: Path) -> Path:
     scripts.mkdir()
     (scripts / "run_pipeline.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
     serve = scripts / "serve_llama.sh"
-    serve.write_text(f"#!/usr/bin/env bash\nexec {sys.executable} {scripts / 'fake_server.py'}\n")
+    serve.write_text(f"#!/usr/bin/env bash\nexec {Path(sys.executable).as_posix()} {(scripts / 'fake_server.py').as_posix()}\n")
     (scripts / "fake_server.py").write_text(FAKE_SERVER)
     for p in (scripts / "run_pipeline.sh", serve):
         p.chmod(0o755)
@@ -96,11 +96,11 @@ def test_run_step_retries_until_success():
         repo = _fake_repo(Path(d))
         counter = repo / "count"
         # Fails twice, then succeeds — a resumable stage hitting a flaky server.
-        cmd = ["bash", "-c", f'n=$(cat {counter} 2>/dev/null || echo 0); echo $((n+1)) > {counter}; [ "$n" -ge 2 ]']
+        cmd = ["bash", "-c", f'n=$(cat {counter.as_posix()} 2>/dev/null || echo 0); echo $((n+1)) > {counter.as_posix()}; [ "$n" -ge 2 ]']
         hooks = []
         rt.run_step(cmd, book=_book(repo), desc="flaky", retries=3, retry_delay=0,
                     before_retry=lambda: hooks.append(1))
-        assert counter.read_text().strip() == "3"
+        assert counter.read_text(encoding="utf-8").strip() == "3"
         assert len(hooks) == 2  # the pre-retry hook ran before each retry
 
 
@@ -120,28 +120,28 @@ def test_run_step_does_not_retry_a_signal_death():
     with tempfile.TemporaryDirectory() as d:
         repo = _fake_repo(Path(d))
         counter = repo / "count"
-        cmd = ["bash", "-c", f"echo x >> {counter}; kill -TERM $$"]
+        cmd = ["bash", "-c", f"echo x >> {counter.as_posix()}; kill -TERM $$"]
         try:
             rt.run_step(cmd, book=_book(repo), desc="killed", retries=5, retry_delay=0)
         except rt.LnVoxError as e:
             assert "signal" in str(e)
         else:
             raise AssertionError("expected LnVoxError")
-        assert len(counter.read_text().splitlines()) == 1
+        assert len(counter.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_run_step_does_not_retry_a_deterministic_refusal():
     with tempfile.TemporaryDirectory() as d:
         repo = _fake_repo(Path(d))
         counter = repo / "count"
-        cmd = ["bash", "-c", f"echo x >> {counter}; echo 'bad knob' >&2; exit 2"]
+        cmd = ["bash", "-c", f"echo x >> {counter.as_posix()}; echo 'bad knob' >&2; exit 2"]
         try:
             rt.run_step(cmd, book=_book(repo), desc="refused", retries=5, retry_delay=0)
         except rt.LnVoxError as e:
             assert "refused (exit 2)" in str(e) and "bad knob" in str(e)
         else:
             raise AssertionError("expected LnVoxError")
-        assert len(counter.read_text().splitlines()) == 1
+        assert len(counter.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_book_env_exports_what_the_launcher_exports():
@@ -205,7 +205,7 @@ def test_set_voice_edits_casting_and_clears_stale_descriptor():
             {"character_name": "Old Man", "assigned_clip_id": "", "locked": False},
         ]}))
         out = nodes.LnVoxSetVoice().run(book, "narrator = cv_b\nOld Man=cv_a  # comment", lock=True, note="n")
-        data = json.loads(casting.read_text())
+        data = json.loads(casting.read_text(encoding="utf-8"))
         narrator, old = data["castings"]
         assert narrator["assigned_clip_id"] == "cv_b" and narrator["locked"] and narrator["voice_descriptor"] == ""
         assert old["assigned_clip_id"] == "cv_a" and old["audit_note"] == "n"

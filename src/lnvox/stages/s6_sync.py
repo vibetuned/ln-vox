@@ -919,7 +919,8 @@ def run(
     epub_meta_path = novel_dir / ".epub_meta.json"
     if not epub_meta_path.exists():
         raise FileNotFoundError(
-            f"Missing {epub_meta_path}; was this book imported via lnvox ingest-epub?"
+            f"Missing {epub_meta_path}; was this book imported via lnvox ingest-epub "
+            "(or ingest-pdf, which also writes the EPUB to sync)?"
         )
     epub_meta = json.loads(epub_meta_path.read_text(encoding="utf-8"))
 

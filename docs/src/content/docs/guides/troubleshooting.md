@@ -17,7 +17,7 @@ Start with the stage that failed: every stage page has its own **Failure modes**
 | `Torch not compiled with CUDA enabled` on DGX Spark / Jetson | aarch64 has no CUDA wheel for Dramabox's pinned torch 2.8 | `./scripts/setup_dramabox.sh` detects aarch64 and pulls torch 2.10 from cu130 |
 | Gemma `has no attribute 'model'` in Dramabox | A VibeVoice install pinned `transformers==4.51.3` | `uv pip install -U 'transformers>=4.52'` (`prepare_tts_env` does this) |
 | `Python.h not found` during a JIT compile | System Python without headers | Use the uv-managed Python 3.13 |
-| `llama-server` not on PATH | llama.cpp not installed | `brew install llama.cpp`, or build it with CUDA on Linux |
+| `llama-server` not on PATH | llama.cpp not installed | `brew install llama.cpp`, `winget install ggml.llamacpp` on Windows (then open a new shell), or build it with CUDA on Linux |
 
 ## LLM server
 
@@ -58,6 +58,12 @@ Start with the stage that failed: every stage page has its own **Failure modes**
 | Highlighting drifts through the book | s6 followed a different mix (pass `--title` for the m4b you ship), explicit s6 pad flags overrode the sidecar, or beats were re-rendered after the mix (s6 warns `off the mixed chapter`) — re-run s5, then s6 |
 | Stage 6 skipped | No EPUB at `epubs/<book_id>.epub` (pass `--epub`), no `05_audio/`, or VibeVoice audio |
 | Low match rate | Stage 2 paraphrased the text; check `07_sync/unmatched.json` and the `match_confidence` histogram ([Stage 6](/stages/s6-sync/)) |
+
+## Sharing the book
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| An `.m4b` sent from Windows shows up as `bin`, an unknown file or a video on the phone / other computer, while Linux and Mac mixes open as audio | Windows registers no MIME type for `.m4b`, so the app that sends it labels it `application/octet-stream`; the file itself is fine | `reg add "HKCU\Software\Classes\.m4b" /v "Content Type" /d "audio/mp4" /f` (prefix `MSYS_NO_PATHCONV=1` in Git Bash), restart the sending app, re-send — [details](/guides/windows/#sharing-the-m4b) |
 
 ## Disk
 

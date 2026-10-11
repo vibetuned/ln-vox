@@ -625,7 +625,7 @@ class ManualAddDialog(QDialog):
             clip = VoiceClip(
                 id=clip_id,
                 source="manual",
-                clip_path=str(rel),
+                clip_path=rel.as_posix(),  # portable manifest, even when written on Windows
                 duration_seconds=round(len(audio) / OUTPUT_SR, 2),
                 gender=self.gender.currentText(),
                 age_band=self.age.currentText(),

@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -38,7 +39,7 @@ WATCHED_ENV = (
     "LNVOX_TTS_BACKEND",
 )
 
-FAKE_UV = f"""#!{sys.executable}
+FAKE_UV = f"""#!{Path(sys.executable).as_posix()}
 import json, os, sys
 args = sys.argv[1:]
 watched = {list(WATCHED_ENV)!r}
@@ -62,7 +63,10 @@ class Sandbox:
 
     def __init__(self, tmp: str):
         self.root = Path(tmp)
-        (self.root / "scripts").symlink_to(SCRIPTS)
+        try:
+            (self.root / "scripts").symlink_to(SCRIPTS)
+        except OSError:  # Windows without Developer Mode can't symlink
+            shutil.copytree(SCRIPTS, self.root / "scripts")
         bindir = self.root / "bin"
         bindir.mkdir()
         uv = bindir / "uv"
@@ -96,7 +100,7 @@ class Sandbox:
     def calls(self) -> list[dict]:
         if not self.log.exists():
             return []
-        return [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
     def lnvox(self, stage: str) -> list[dict]:
         return [c for c in self.calls() if c["args"][:3] == ["run", "lnvox", stage]]
@@ -115,7 +119,7 @@ def _after(args: list[str], flag: str) -> str:
 
 
 def test_help_and_serve_scripts_name_the_real_model_defaults():
-    launcher = (SCRIPTS / "run_pipeline.sh").read_text()
+    launcher = (SCRIPTS / "run_pipeline.sh").read_text(encoding="utf-8")
     defaults = dict(re.findall(r'^\s+(llama|vllm|mlx)\)\s+LLM_MODEL="([^"]+)"', launcher, re.M))
     assert set(defaults) == {"llama", "vllm", "mlx"}, defaults
 
@@ -126,7 +130,7 @@ def test_help_and_serve_scripts_name_the_real_model_defaults():
     assert "LNVOX_LLM_MODEL" in help_text and "LNVOX_ARTIFACTS_DIR" in help_text
 
     for backend, model in defaults.items():
-        serve = (SCRIPTS / f"serve_{backend}.sh").read_text()
+        serve = (SCRIPTS / f"serve_{backend}.sh").read_text(encoding="utf-8")
         code_default = re.search(r'MODEL="\$\{LNVOX_LLM_MODEL:-([^}]+)\}"', serve).group(1)
         assert code_default == model, (backend, code_default, model)
         header = "".join(
@@ -134,10 +138,10 @@ def test_help_and_serve_scripts_name_the_real_model_defaults():
         ).split("set -")[0]
         assert model in header, f"serve_{backend}.sh header doesn't name its default {model}"
     # The stale-header bug: serve_llama.sh documented E4B as its default.
-    assert "LNVOX_LLM_MODEL=google/gemma-4-12B-it-qat-q4_0-gguf" in (SCRIPTS / "serve_llama.sh").read_text()
+    assert "LNVOX_LLM_MODEL=google/gemma-4-12B-it-qat-q4_0-gguf" in (SCRIPTS / "serve_llama.sh").read_text(encoding="utf-8")
 
     # The ComfyUI pack mirrors these defaults ("keep in sync").
-    runtime = (REPO / "comfyui" / "runtime.py").read_text()
+    runtime = (REPO / "comfyui" / "runtime.py").read_text(encoding="utf-8")
     for backend, model in defaults.items():
         assert f'"{backend}": "{model}"' in runtime, backend
 
@@ -160,8 +164,13 @@ def test_mix_and_sync_share_novels_root_and_artifacts_dir():
         # $LNVOX_ARTIFACTS_DIR — the same root the CLI writes to.
         (s6,) = sb.lnvox("s6")
         assert _after(s6["args"], "--novels-root") == "myroot", s6["args"]
-        # The name s5_mix.mix really writes ('/' and '\' → '_').
-        assert f"Final output should be at: arts/{BOOK}/06_final/Vol_1: A_B.m4b" in r.stdout, r.stdout
+        # The name s5_mix.mix really writes ('/' and '\' → '_'; on Windows
+        # also ':' and the other NTFS-forbidden characters).
+        from lnvox.stages.s5_mix import safe_filename
+
+        expected = "Vol_1_ A_B" if sys.platform == "win32" else "Vol_1: A_B"
+        assert safe_filename("Vol/1: A\\B") == expected
+        assert f"Final output should be at: arts/{BOOK}/06_final/{expected}.m4b" in r.stdout, r.stdout
 
 
 def test_default_title_prints_the_sanitised_m4b_path():
@@ -227,7 +236,7 @@ def test_llm_model_and_context_length_env():
 
 def test_vllm_big_model_default_window_reaches_the_client():
     # serve_vllm.sh's own default for 31B/27B names — the launcher mirrors it.
-    serve = (SCRIPTS / "serve_vllm.sh").read_text()
+    serve = (SCRIPTS / "serve_vllm.sh").read_text(encoding="utf-8")
     assert re.search(r'\*31B\* \|\| "\$MODEL" == \*27B\* \]\]; then\n(?:\s*#.*\n)*\s*DEFAULT_MAX_LEN=20480', serve)
 
     big = ("--llm-backend", "vllm", "--llm-model", "nvidia/Gemma-4-31B-IT-NVFP4")
@@ -387,7 +396,7 @@ def test_s4_retry_reports_real_exit_codes_and_honours_artifacts_dir():
         sb = Sandbox(tmp)
         r = sb.run("s4_retry.sh", BOOK, FAKE_UV_S4_CODES="1,0", LNVOX_ARTIFACTS_DIR="arts")
         assert r.returncode == 0, r.stdout
-        log = (sb.root / "arts" / BOOK / "_s4_full.log").read_text()
+        log = (sb.root / "arts" / BOOK / "_s4_full.log").read_text(encoding="utf-8")
         # This branch was unreachable under pipefail before.
         assert "Exit 1 on attempt 1; retrying in 0s" in log, log
         assert "Completed on attempt 2" in log
@@ -401,7 +410,7 @@ def test_s4_retry_does_not_retry_deterministic_refusals():
         r = sb.run("s4_retry.sh", BOOK, FAKE_UV_S4_CODES="2", MAX_ATTEMPTS="5")
         assert r.returncode == 2, r.stdout
         assert len(sb.lnvox("s4")) == 1
-        assert "deterministic refusal, not retrying" in (sb.root / "artifacts" / BOOK / "_s4_full.log").read_text()
+        assert "deterministic refusal, not retrying" in (sb.root / "artifacts" / BOOK / "_s4_full.log").read_text(encoding="utf-8")
 
 
 def test_s4_retry_retries_crashes_until_the_budget():
@@ -410,7 +419,7 @@ def test_s4_retry_retries_crashes_until_the_budget():
         r = sb.run("s4_retry.sh", BOOK, FAKE_UV_S4_CODES="137,139,1", MAX_ATTEMPTS="3")
         assert r.returncode == 1, r.stdout
         assert len(sb.lnvox("s4")) == 3
-        log = (sb.root / "artifacts" / BOOK / "_s4_full.log").read_text()
+        log = (sb.root / "artifacts" / BOOK / "_s4_full.log").read_text(encoding="utf-8")
         for line in ("Crashed on attempt 1;", "Crashed on attempt 2;", "Exit 1 on attempt 3;",
                      "Gave up after 3 attempts"):
             assert line in log, (line, log)
@@ -442,9 +451,17 @@ def _load_studio():
             def __call__(self, *_a, **_k):
                 return _Stub()
 
+        def _stub_attr(attr):
+            # Dunders stay missing: inspect (and numba, under librosa) walk
+            # sys.modules probing __file__ & co., and a class there breaks
+            # them in every later test.
+            if attr.startswith("__"):
+                raise AttributeError(attr)
+            return type(attr, (_Stub,), {})
+
         for name in ("PySide6", "PySide6.QtCore", "PySide6.QtMultimedia", "PySide6.QtWidgets"):
             mod = types.ModuleType(name)
-            mod.__getattr__ = lambda attr: type(attr, (_Stub,), {})
+            mod.__getattr__ = _stub_attr
             sys.modules[name] = mod
     spec = importlib.util.spec_from_file_location("voicebank_studio", SCRIPTS / "voicebank_studio.py")
     studio = importlib.util.module_from_spec(spec)

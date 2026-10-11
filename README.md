@@ -171,6 +171,74 @@ resumable.
 
 ---
 
+## Windows setup
+
+The full pipeline runs on Windows 11 with an NVIDIA GPU — validated
+end-to-end on an RTX 5090, where staged s4 denoised ~3.3× faster than real
+time (docs site: *Guides → Windows*). The launcher and helper scripts are
+bash: run them from **Git Bash** (it ships with Git for Windows, which the
+setup scripts need anyway), exactly as on Linux.
+
+```bash
+# 1. Tooling (from any shell), then open a NEW Git Bash so PATH picks it up
+winget install Git.Git
+winget install astral-sh.uv
+winget install Gyan.FFmpeg
+winget install ggml.llamacpp     # llama-server, the default LLM backend
+
+# 2. Python deps
+uv sync --extra voice --extra tts
+
+# 3. Dramabox — the Windows branch takes its torch pin from the CUDA 12.8 index
+./scripts/setup_dramabox.sh
+
+# 4. Voicebank: copy voicebank/ from your main machine, or seed it as on Linux
+
+# 5. Register .m4b as audio (see "Sharing the .m4b" below). In PowerShell /
+#    cmd drop the MSYS_NO_PATHCONV=1 prefix — Git Bash needs it, or it mangles /v.
+MSYS_NO_PATHCONV=1 reg add "HKCU\Software\Classes\.m4b" /v "Content Type" /d "audio/mp4" /f
+```
+
+Then `./scripts/run_pipeline.sh …` as usual. From PowerShell, call bash
+explicitly: `& "C:\Program Files\Git\bin\bash.exe" scripts/run_pipeline.sh …`.
+
+What differs on Windows:
+
+- **LLM backend: llama.cpp only.** vLLM has no Windows wheels and mlx is
+  Apple-only (`--vllm-url` to a server on another machine still works).
+  winget installs the Vulkan build; with an integrated GPU present too,
+  llama.cpp uses only the discrete one.
+- **No RE-USE voice-reference denoising.** Its mamba kernels have no Windows
+  build, so s4 logs `Voice-ref denoise disabled` once and clones from the
+  reference clip as-is.
+- **No `torch.compile` of the DiT** unless Triton is installed
+  (`uv pip install triton-windows`; the TTS env prep doesn't do it for you).
+- **`lnvox s4` keeps Windows awake** while it renders — the counterpart of
+  the macOS `caffeinate` re-exec.
+- **Tip:** `export LNVOX_LLM_ENDPOINT=http://127.0.0.1:8000/v1`. Windows
+  tries `localhost` as IPv6 first, and every new connection to the
+  IPv4-only server then waits ~2 s before falling back.
+- **Output file names:** `:` and the other characters NTFS forbids in
+  `--book-title` become `_` in the `.m4b` / `.timings.json` names; the
+  embedded title keeps them.
+- **Line endings:** `.gitattributes` keeps `*.sh` at LF. If bash ever fails
+  with `$'\r': command not found`, the scripts were checked out with CRLF
+  before that file existed — re-checkout them:
+  `rm scripts/*.sh && git checkout -- scripts`.
+- **Sharing the .m4b:** Windows registers no MIME type for `.m4b` (it does
+  for `.m4a`, `.mp3`, `.epub`), so browsers, sync clients and transfer apps
+  send the audiobook as `application/octet-stream`. On the phone or the other
+  computer it then shows up as "bin" / an unknown file, or — in apps that
+  sniff the content and see a plain MP4 header — as a *video*. The file
+  itself is fine (byte-for-byte the same layout as a Linux or Mac mix); step 5
+  above fixes the label for your Windows user, no admin needed. Linux and
+  macOS give `.m4b` an audiobook type of their own (Linux: `audio/x-m4b`, a
+  subtype of `audio/mp4`); `audio/mp4` — what Windows uses for `.m4a` — was
+  read as audio by every app and OS tested (Android, iOS/macOS, Linux). Undo
+  (PowerShell / cmd): `reg delete "HKCU\Software\Classes\.m4b" /v "Content Type" /f`.
+
+---
+
 ## Importing books from EPUB
 
 If your source is a publisher-issued EPUB rather
@@ -210,6 +278,36 @@ for v in epubs/<series>/volume-*.epub; do
     uv run lnvox ingest-epub "$v" "novels/<series>/$name"
 done
 ```
+
+---
+
+## Importing books from PDF
+
+`lnvox ingest-pdf` does the same from a PDF's **text layer** (a scan needs
+OCR first — `ocrmypdf` — unless the scanner already embedded one), and also
+keeps the **cover** and writes an **EPUB** of the cleaned chapters, so the
+book ends up exactly like an EPUB import: cover in the m4b, and Stage 6 syncs
+the EPUB with the audio. Name the chapters by page range; pages outside every
+range (front matter, contents, jacket) are skipped:
+
+```bash
+uv run --with "pypdf[image]" lnvox ingest-pdf book.pdf novels/open-mind/volume-01 \
+    --chapter "5-12:Atomic Explosives" \
+    --chapter "13-20:Atomic Weapons and American Policy" \
+    --title "The Open Mind" --author "J. Robert Oppenheimer"
+# → novels/open-mind/volume-01/*.txt + images/cover.jpg, epubs/open-mind/volume-01.epub
+
+./scripts/run_pipeline.sh open-mind/volume-01 --mode lecture --book-title "The Open Mind"
+```
+
+Without `--chapter` the PDF's bookmarks become chapters, else the whole
+document (or `--pages 5-20`) is one. Running heads, page numbers and line
+hyphenation are stripped and lines re-joined into paragraphs; a jump in the
+printed page numbers keeps a paragraph break. The cover is the largest image
+on `--cover-page` (default 1). The EPUB goes where the launcher looks for it
+(`--epub` / `--no-epub` to change that), and an EPUB ln-vox didn't generate
+is never overwritten. pypdf and Pillow run as an overlay (`--with`) because
+they aren't in the lock. Docs site: *Stages → 0a · ingest-pdf*.
 
 ---
 

@@ -176,7 +176,7 @@ def render_chapter(
                     scene_id=scene.scene_id,
                     type=beat.type,
                     speaker=beat.speaker,
-                    wav_path=str(wav_path.relative_to(output_dir.parent)),
+                    wav_path=wav_path.relative_to(output_dir.parent).as_posix(),
                     duration_seconds=round(dur, 3),
                     cache_key=cache_key,
                     cached=cached,

@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings on every platform: Git for Windows
+# defaults to core.autocrlf=true, and a CRLF checkout breaks bash on the
+# first line ($'\r': command not found).
+*.sh text eol=lf

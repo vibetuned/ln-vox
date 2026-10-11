@@ -9,7 +9,7 @@ This page documents the internals of [`scripts/run_pipeline.sh`](/launcher/run-p
 
 ## Shell functions
 
-The script defines 14 functions. They share a handful of globals set during option parsing: `OS` (`uname -s`), `LLM_BACKEND`, `VLLM_URL`, `LNVOX_VLLM_BASE` (the server URL: `--vllm-url`, else `$LNVOX_LLM__ENDPOINT`, else `$LNVOX_LLM_ENDPOINT`, else `http://localhost:${LNVOX_LLM_PORT:-8000}/v1` — also exported to the stages as `LNVOX_LLM__ENDPOINT`), `BOOK_ART` (`${LNVOX_ARTIFACTS_DIR:-artifacts}/<book_id>`), `VLLM_PID` / `VLLM_LOG` (the managed server), `STEP_RETRIES` and `RETRY_DELAY`.
+The script defines 14 functions. They share a handful of globals set during option parsing: `OS` (`uname -s`), `IS_WINDOWS` (1 under Git Bash / MSYS2 / Cygwin, which also exports `PYTHONUTF8=1`), `LLM_BACKEND`, `VLLM_URL`, `LNVOX_VLLM_BASE` (the server URL: `--vllm-url`, else `$LNVOX_LLM__ENDPOINT`, else `$LNVOX_LLM_ENDPOINT`, else `http://localhost:${LNVOX_LLM_PORT:-8000}/v1` — also exported to the stages as `LNVOX_LLM__ENDPOINT`), `BOOK_ART` (`${LNVOX_ARTIFACTS_DIR:-artifacts}/<book_id>`), `VLLM_PID` / `VLLM_LOG` (the managed server), `STEP_RETRIES` and `RETRY_DELAY`.
 
 ### `usage`
 
@@ -53,7 +53,7 @@ Makes the venv right for the LLM phase, per `LLM_BACKEND`:
 | `llama` | `uv sync --extra voice --extra tts` (llama-server is a native binary, no Python LLM deps), then checks `llama-server` is on `PATH` and exits 1 with install hints if not. |
 | `vllm` | If `.venv` exists but `import torch, vllm` fails (a CUDA/NCCL ABI mismatch left by a botched install), deletes `.venv`. Then `uv sync --extra serve --extra voice --extra tts`. |
 
-Skipped when `--vllm-url` points at an external server or when no LLM is needed. Note that `uv sync` is exact: it **removes** the Dramabox overlay installed by `prepare_tts_env`, which is why the TTS phase re-installs it every run.
+On Windows only `llama` is accepted (exit 2 for `vllm` / `mlx`, which have no Windows wheels). Skipped when `--vllm-url` points at an external server or when no LLM is needed. Note that `uv sync` is exact: it **removes** the Dramabox overlay installed by `prepare_tts_env`, which is why the TTS phase re-installs it every run.
 
 ### `install_mamba_kernel_wheels`
 
@@ -72,6 +72,7 @@ Installs `external/DramaBox/requirements.txt` with platform-aware torch handling
 | Platform | Handling |
 | --- | --- |
 | Darwin (checked first — Apple Silicon also reports `arm64`) | Strip `torch`, `torchaudio`, `torchvision`, `bitsandbytes` (no macOS wheel; DramaboxClient disables 4-bit on MPS), install the rest, then `torch>=2.10,<2.12` + `torchaudio>=2.10,<2.12` (MPS-capable PyPI wheels). |
+| Windows (`IS_WINDOWS`, checked next — Git Bash reports `x86_64`) | Install Dramabox's own `torch` / `torchaudio` pins from the cu128 index first (PyPI's Windows wheels are CPU-only), then the requirements minus torch* and the mamba packages. No kernel wheels exist for Windows: s4 renders without RE-USE denoising. |
 | `x86_64` | Strip `mamba-ssm` and `causal-conv1d`, install the rest (keeping Dramabox's `torch==2.8.0` pin), then `install_mamba_kernel_wheels cu12torch2.8 x86_64`. |
 | `aarch64` / `arm64` (e.g. DGX Spark) | Strip torch* and the mamba packages (Dramabox's torch 2.8 has no aarch64 CUDA wheel), install the rest, then `torch==2.10.*` / `torchaudio==2.10.*` from the cu130 index, then `install_mamba_kernel_wheels cu13torch2.10 aarch64`. Pinned to 2.10 because that's the newest torch the upstream kernel wheels cover. |
 | anything else | Warn and install the requirements verbatim. |
@@ -82,7 +83,7 @@ Makes the venv right for Dramabox:
 
 1. `uv sync --extra voice --extra tts`, then `install_dramabox_reqs`.
 2. `uv pip install "transformers>=4.52"` — a prior VibeVoice prep pins `transformers==4.51.3`, which breaks Dramabox's Gemma encoder, and Dramabox's own `>=4.45` spec won't force the upgrade back.
-3. Sanity check in the venv: MPS available on Darwin; elsewhere CUDA available **and** `causal_conv1d_cuda` / `selective_scan_cuda` importable (a failed kernel-wheel fetch is invisible to a plain CUDA probe). On failure it prints the torch version and device flags and exits 1, pointing at `scripts/setup_dramabox.sh`.
+3. Sanity check in the venv: MPS available on Darwin; elsewhere CUDA available **and**, except on Windows, `causal_conv1d_cuda` / `selective_scan_cuda` importable (a failed kernel-wheel fetch is invisible to a plain CUDA probe). On failure it prints the torch version and device flags and exits 1, pointing at `scripts/setup_dramabox.sh`.
 
 ### `prepare_vibevoice_env`
 

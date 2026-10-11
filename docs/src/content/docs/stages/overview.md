@@ -13,6 +13,7 @@ Each stage is one `lnvox` command that reads the previous stages' files from `ar
 | # | Stage | Command | Reads | Writes | Phase |
 | --- | --- | --- | --- | --- | --- |
 | 0a | [EPUB extraction](/stages/ingest-epub/) | `lnvox ingest-epub <epub> novels/<book>` | `epubs/<book>.epub` | `novels/<book>/*.txt`, `images/`, `.epub_meta.json` | CPU, run by you |
+| 0a | [PDF extraction](/stages/ingest-pdf/) | `uv run --with "pypdf[image]" lnvox ingest-pdf <pdf> novels/<book>` | a PDF with a text layer | `novels/<book>/*.txt`, `images/cover.jpg`, `.epub_meta.json`, `epubs/<book>.epub` | CPU, run by you |
 | 0 | [Ingest](/stages/ingest/) | `lnvox ingest novels/<book> --book-id <book>` | chapter `.txt` | `00_text.jsonl`, `00_book_meta.json` | CPU |
 | 1 | [Characters](/stages/s1-characters/) | `lnvox s1 <book>` | `00_text.jsonl` | `01_characters.json` (+ per-chapter cache, merge log) | LLM |
 | 2 | [Scenes](/stages/s2-scenes/) | `lnvox s2 <book>` | text + cast | `02_scenes/<ch>.json` | LLM |

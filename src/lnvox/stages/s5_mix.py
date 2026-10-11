@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +56,12 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     to include stderr inline so the traceback is actually informative.
     """
     try:
-        return subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # Explicit UTF-8: ffmpeg writes UTF-8 (file names, tags), and the
+        # locale default on Windows (cp1252) can't decode it.
+        return subprocess.run(
+            cmd, check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
     except subprocess.CalledProcessError as e:
         stderr_tail = (e.stderr or "").strip()
         # Trim noise — keep the last ~40 lines which usually contain the
@@ -347,9 +353,22 @@ def _encode_m4b(
 TIMINGS_SUFFIX = ".timings.json"
 
 
+_WINDOWS_FORBIDDEN = str.maketrans({c: "_" for c in '<>:"|?*'})
+
+
 def safe_filename(book_title: str) -> str:
-    """The m4b / sidecar file stem for `book_title` (`/` and `\\` → `_`)."""
-    return book_title.replace("/", "_").replace("\\", "_")
+    """The m4b / sidecar file stem for `book_title` (`/` and `\\` → `_`).
+
+    On Windows, also the characters NTFS forbids (`<>:"|?*` → `_`) and
+    trailing dots/spaces, which Windows strips silently. A `:` matters most:
+    "Title: Subtitle.m4b" would land in an alternate data stream of a file
+    named "Title". Windows-only so names (and the sidecar lookups keyed on
+    them) don't change for books already mixed elsewhere.
+    """
+    stem = book_title.replace("/", "_").replace("\\", "_")
+    if sys.platform == "win32":
+        stem = stem.translate(_WINDOWS_FORBIDDEN).rstrip(". ") or "_"
+    return stem
 
 
 @dataclass

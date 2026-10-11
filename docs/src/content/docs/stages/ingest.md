@@ -6,7 +6,7 @@ sidebar:
   label: 0 · ingest
 ---
 
-`lnvox ingest` is the entry point for narration and lecture books. It reads a folder of `NN-<slug>.txt` chapter files (usually produced by [`ingest-epub`](/stages/ingest-epub/)) and writes `artifacts/<book_id>/00_text.jsonl`, one record per chapter. Every later stage reads its chapters from that file. Two side jobs:
+`lnvox ingest` is the entry point for narration and lecture books. It reads a folder of `NN-<slug>.txt` chapter files (usually produced by [`ingest-epub`](/stages/ingest-epub/) or [`ingest-pdf`](/stages/ingest-pdf/)) and writes `artifacts/<book_id>/00_text.jsonl`, one record per chapter. Every later stage reads its chapters from that file. Two side jobs:
 - it copies the EPUB metadata sidecar to `00_book_meta.json` so Stage 5 can find the cover;
 - in lecture mode, it writes a Narrator-only cast stub so `voice cast` runs without Stage 1.
 

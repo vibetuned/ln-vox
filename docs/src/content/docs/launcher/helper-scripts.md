@@ -119,11 +119,12 @@ Neither engine can be installed with plain `pip`. Both are cloned into `external
 
 1. Clones `https://github.com/resemble-ai/DramaBox.git` (`--depth 1`) into `external/DramaBox`, unless it already exists. To update, run `git -C external/DramaBox pull`.
 2. Uses the first of `requirements.txt`, `requirements/requirements.txt` or `requirements_inference.txt` that exists. If none does, it lists the repo and exits 1.
-3. Installs by platform. Darwin is checked **before** the arch, because Apple Silicon also reports `arm64`:
+3. Installs by platform. Darwin and Windows are checked **before** the arch, because Apple Silicon also reports `arm64` and Git Bash reports `x86_64`:
 
 | Platform | Filtered out of Dramabox's requirements | Then installs |
 |---|---|---|
 | Darwin (Apple Silicon) | `torch`, `torchaudio`, `torchvision`, `bitsandbytes` (CUDA-only, no macOS wheel) | `torch>=2.10,<2.12` and `torchaudio>=2.10,<2.12` from PyPI (MPS-capable) |
+| Windows (Git Bash / MSYS2 / Cygwin) | `torch`, `torchaudio`, `torchvision`, `mamba-ssm`, `causal-conv1d` | First Dramabox's own `torch` / `torchaudio` pins from `https://download.pytorch.org/whl/cu128` (PyPI's Windows wheels are CPU-only), then the filtered rest. No mamba kernels exist for Windows, so s4 renders without RE-USE denoising |
 | Linux `x86_64` | `mamba-ssm`, `causal-conv1d` (Dramabox's `torch==2.8.0+cu128` pin is kept) | Prebuilt wheels `causal_conv1d 1.6.2.post1` + `mamba_ssm 2.3.1`, ABI `cu12torch2.8cxx11abiTRUE`, `linux_x86_64`, from the upstream GitHub releases |
 | Linux `aarch64` / `arm64` (DGX Spark, Grace Hopper, Jetson) | `torch`, `torchaudio`, `torchvision`, `mamba-ssm`, `causal-conv1d` | `torch==2.10.*` and `torchaudio==2.10.*` from `https://download.pytorch.org/whl/cu130`, then the same kernel wheels with ABI `cu13torch2.10cxx11abiTRUE`, `linux_aarch64` |
 | anything else | nothing | the requirements file verbatim |

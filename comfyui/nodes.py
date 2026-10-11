@@ -862,12 +862,12 @@ class LnVoxRunPipeline(_Node):
     def run(self, book, llm_backend, tts_backend, llm_model="", vllm_url="", max_model_len=0, narrator_clip="",
             audit_cast="report", stop_after_audit=False, no_normalize=False, staged_tts=True, skip_llm=False,
             skip_tts=False, skip_mix=False, skip_sync=False, max_retries=30, step_retries=3, rerun=0, unique_id=None):
-        cmd = [
+        cmd = rt.script_cmd(
             "./scripts/run_pipeline.sh", book["book_id"],
             "--mode", book["mode"], "--book-title", book["title"], "--novels-root", book["novels_root"],
             "--llm-backend", llm_backend, "--tts-backend", tts_backend, "--audit-cast", audit_cast,
             "--max-retries", str(int(max_retries)), "--step-retries", str(int(step_retries)),
-        ]
+        )
         for flag, value in (("--llm-model", llm_model), ("--vllm-url", vllm_url), ("--narrator-clip", narrator_clip),
                             ("--epub", book.get("epub", "")), ("--scenario-file", book.get("scenario_file", ""))):
             if value and value.strip():

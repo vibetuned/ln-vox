@@ -41,6 +41,7 @@ from lnvox.tts.dramabox_client import (
     _DRAMABOX_ROOT,
     DramaboxClient,
     _ensure_path,
+    s4_compile_supported,
     s4_effective_chunk_cap,
     s4_effective_decode_dtype,
     s4_effective_encoder_precision,
@@ -609,12 +610,13 @@ def first_pending(phase: str, plan: StagedPlan, root: Path, cache_dir: Path) -> 
 
 def _knobs(device: str):
     """(torch_dtype, bnb_4bit, compile_model) — mirrors the MPS defaults
-    DramaboxClient applies (DESIGN.md §11.3); CUDA keeps TTSServer defaults."""
+    DramaboxClient applies (DESIGN.md §11.3); CUDA keeps TTSServer defaults
+    (minus torch.compile on a Windows without Triton)."""
     import torch
 
     is_mps = device.startswith("mps")
     dtype = torch.float16 if is_mps else torch.bfloat16
-    return dtype, (not is_mps), (not is_mps)
+    return dtype, (not is_mps), s4_compile_supported(device)
 
 
 # ----- phase: refs ---------------------------------------------------------------
@@ -1133,7 +1135,7 @@ def _finalize(plan: StagedPlan, root: Path, cache_dir: Path) -> None:
                     scene_id=b.scene_id,
                     type=b.type,
                     speaker=b.speaker,
-                    wav_path=str(wav_path.relative_to(audio_dir.parent)),
+                    wav_path=wav_path.relative_to(audio_dir.parent).as_posix(),
                     duration_seconds=round(dur, 3),
                     cache_key=b.cache_key,
                     cached=render_by_key[b.cache_key].cached,

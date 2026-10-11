@@ -14,6 +14,14 @@ ln -s /path/to/ln-vox/comfyui /path/to/ComfyUI/custom_nodes/comfyui-lnvox
 # restart ComfyUI
 ```
 
+On Windows, use a directory junction instead: unlike a symlink it needs no Developer Mode, and the checkout is still found through it (from `cmd`):
+
+```bat
+mklink /J C:\path\to\ComfyUI\custom_nodes\comfyui-lnvox C:\path\to\ln-vox\comfyui
+```
+
+The pack runs the launcher and serve scripts with Git for Windows' `bash.exe`, located next to `git` or under `Program Files\Git` — never a bare `bash`, which on Windows can be WSL's. Set `LNVOX_BASH` to a `bash.exe` to override (MSYS2, Cygwin, a git reached through a shim).
+
 The pack has no Python dependencies of its own. It only needs, on the ComfyUI machine:
 
 - the ln-vox checkout, installed as in [Installation](/start/installation/) (uv, ffmpeg, llama-server, Dramabox, a voicebank);

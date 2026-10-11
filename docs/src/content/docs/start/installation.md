@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Install ln-vox on Linux + CUDA or Apple Silicon — uv, ffmpeg, llama.cpp, Dramabox (and optionally VibeVoice), the render extra, and a voicebank.
+description: Install ln-vox on Linux + CUDA, Apple Silicon or Windows — uv, ffmpeg, llama.cpp, Dramabox (and optionally VibeVoice), the render extra, and a voicebank.
 sidebar:
   order: 2
 ---
@@ -13,7 +13,7 @@ ln-vox is a uv project (Python 3.13, pinned in `.python-version`) plus three thi
 | --- | --- | --- |
 | [uv](https://docs.astral.sh/uv/) | Every command runs as `uv run …`; uv also fetches Python 3.13 | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | ffmpeg (+ ffprobe) | Stage 5 mixing and encoding; voicebank seeding | `apt install ffmpeg` / `brew install ffmpeg` |
-| llama.cpp's `llama-server` | The default LLM backend | `brew install llama.cpp` on macOS; on Linux build it with CUDA (`cmake -B build -DGGML_CUDA=on && cmake --build build --target llama-server`) and put it on `PATH` |
+| llama.cpp's `llama-server` | The default LLM backend | `brew install llama.cpp` on macOS; `winget install ggml.llamacpp` on Windows; on Linux build it with CUDA (`cmake -B build -DGGML_CUDA=on && cmake --build build --target llama-server`) and put it on `PATH` |
 | git, curl | Setup scripts clone repos; the launcher probes the LLM server | usually present |
 
 ## 2. Python dependencies
@@ -80,6 +80,23 @@ uv sync --extra mlx --extra voice --extra tts
 ```
 
 Everything MPS-specific (dtype map, chunk caps, memory sizing, caffeinate) is on the [Apple Silicon guide](/guides/apple-silicon/).
+
+## Windows
+
+Same steps on Windows 11 + NVIDIA, with winget for the tools. The scripts are bash, so run them from **Git Bash** (part of Git for Windows); open a new one after installing so `PATH` picks up the tools:
+
+```bash
+winget install Git.Git
+winget install astral-sh.uv
+winget install Gyan.FFmpeg
+winget install ggml.llamacpp
+uv sync --extra voice --extra tts
+./scripts/setup_dramabox.sh       # Dramabox's torch pin from the cu128 index
+# Register .m4b as audio, or books shared from Windows arrive as "bin" files
+MSYS_NO_PATHCONV=1 reg add "HKCU\Software\Classes\.m4b" /v "Content Type" /d "audio/mp4" /f
+```
+
+What differs (llama.cpp-only LLM backend, no RE-USE denoising, `torch.compile` only with Triton, sleep prevention, file names, [the `.m4b` MIME type](/guides/windows/#sharing-the-m4b)) is on the [Windows guide](/guides/windows/).
 
 ## Optional tools
 

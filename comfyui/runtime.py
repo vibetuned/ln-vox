@@ -43,6 +43,7 @@ from typing import Callable, Iterable, Optional
 from urllib.parse import urlparse
 
 PACK_DIR = Path(__file__).resolve().parent
+_WINDOWS = platform.system() == "Windows"
 
 # Per-backend model defaults — keep in sync with scripts/run_pipeline.sh.
 DEFAULT_LLM_MODELS = {
@@ -132,7 +133,48 @@ def tool_env(base: Optional[dict] = None) -> dict:
         if os.path.isdir(d) and d not in parts:
             parts.append(d)
     env["PATH"] = os.pathsep.join(p for p in parts if p)
+    if _WINDOWS:
+        # Same as the launcher: UTF-8 pipes (run_logged decodes UTF-8) and
+        # file I/O for the python stages instead of the ANSI code page.
+        env["PYTHONUTF8"] = "1"
     return env
+
+
+def _git_bash() -> str:
+    """bash.exe from Git for Windows, which runs the launcher scripts there.
+
+    Not a PATH lookup: System32\\bash.exe is WSL's, which would run the
+    scripts inside a Linux VM against a different filesystem and venv.
+    `$LNVOX_BASH` overrides (MSYS2, Cygwin, a git found through a shim).
+    """
+    override = os.environ.get("LNVOX_BASH", "").strip()
+    if override:
+        return override
+    candidates = []
+    git = _which("git")
+    if git:
+        # <Git>/cmd/git.exe, <Git>/bin/git.exe or <Git>/mingw64/bin/git.exe
+        root = Path(git).resolve().parent.parent
+        candidates += [root / "bin" / "bash.exe", root.parent / "bin" / "bash.exe"]
+    for var in ("ProgramFiles", "ProgramW6432", "LOCALAPPDATA"):
+        base = os.environ.get(var)
+        if base:
+            candidates += [Path(base) / "Git" / "bin" / "bash.exe",
+                           Path(base) / "Programs" / "Git" / "bin" / "bash.exe"]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    raise LnVoxError(
+        "The ln-vox launcher scripts need Git Bash on Windows, and it wasn't found. "
+        "Install Git for Windows (winget install Git.Git), or set $LNVOX_BASH to a bash.exe."
+    )
+
+
+def script_cmd(script: str, *args: str) -> list[str]:
+    """Command line for one of the repo's bash scripts (run from the repo root)."""
+    if _WINDOWS:
+        return [_git_bash(), script, *args]
+    return [script, *args]
 
 
 def require_mode(book: dict, allowed: Iterable[str], node: str) -> None:
@@ -232,6 +274,16 @@ def _which(name: str) -> Optional[str]:
 
 def _kill_group(proc: subprocess.Popen, grace: float = 10.0) -> None:
     if proc.poll() is not None:
+        return
+    if _WINDOWS:
+        # No process groups (start_new_session is ignored there): taskkill /T
+        # takes the whole tree — bash → uv → python, or bash → llama-server.
+        # /F because console programs ignore taskkill's polite WM_CLOSE.
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
         return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -416,7 +468,7 @@ def prepare_env(book: dict, phase: str, node_id: Optional[str] = None) -> str:
     """Run `scripts/run_pipeline.sh --prepare-env <phase>` (llm|tts|vibevoice)."""
     repo = Path(book["repo"])
     llm = book.get("llm") or {}
-    cmd = ["./scripts/run_pipeline.sh", "--prepare-env", phase]
+    cmd = script_cmd("./scripts/run_pipeline.sh", "--prepare-env", phase)
     if llm.get("backend"):
         cmd += ["--llm-backend", llm["backend"]]
     env = book_env(book)
@@ -524,7 +576,7 @@ def ensure_server(book: dict, node_id: Optional[str] = None) -> None:
         push_log(node_id, f"Starting {backend} server ({script.name}) — log: {log_path}")
         print(f"[ln-vox] starting {backend} server: {script} (log: {log_path})", flush=True)
         proc = subprocess.Popen(
-            [str(script)],
+            script_cmd(str(script)),
             cwd=str(repo),
             env=env,
             stdout=log_fh,

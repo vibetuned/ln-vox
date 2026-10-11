@@ -348,7 +348,9 @@ def build_speaker_clip(
     return VoiceClip(
         id=clip_id,
         source="common_voice",
-        clip_path=str(rel_clip),
+        # POSIX form: the manifest travels between machines (a bank seeded
+        # on Windows is copied to Linux / macOS and vice versa).
+        clip_path=rel_clip.as_posix(),
         duration_seconds=round(len(merged) / output_sr, 2),
         gender=_GENDER_MAP[(first_row.get("gender") or "").strip()],
         age_band=_AGE_MAP[(first_row.get("age") or "").strip()],

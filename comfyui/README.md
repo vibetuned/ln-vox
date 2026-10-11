@@ -9,6 +9,9 @@ ln -s "$PWD/comfyui" /path/to/ComfyUI/custom_nodes/comfyui-lnvox   # from the ln
 # restart ComfyUI → nodes under "ln-vox/", workflows under Templates → comfyui-lnvox
 ```
 
+On Windows, a junction works without Developer Mode (from `cmd`):
+`mklink /J C:\path\to\ComfyUI\custom_nodes\comfyui-lnvox C:\path\to\ln-vox\comfyui`.
+
 The full guide — how nodes chain and cache, every node's inputs, the example
 workflows, troubleshooting — is in the docs site: `docs/src/content/docs/guides/comfyui.md`
 (`cd docs && npm run dev`, then *Guides → ComfyUI nodes*).

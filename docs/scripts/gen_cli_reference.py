@@ -11,7 +11,8 @@ import click, typer
 from lnvox.cli import app
 
 LINKS = {
-    "ingest": "/stages/ingest/", "ingest-epub": "/stages/ingest-epub/", "ingest-scenario": "/stages/ingest-scenario/",
+    "ingest": "/stages/ingest/", "ingest-epub": "/stages/ingest-epub/", "ingest-pdf": "/stages/ingest-pdf/",
+    "ingest-scenario": "/stages/ingest-scenario/",
     "s1": "/stages/s1-characters/", "s2": "/stages/s2-scenes/", "s3": "/stages/s3-director/",
     "lecture": "/stages/lecture/", "scenario": "/stages/scenario/", "scenario-sync": "/stages/scenario-sync/",
     "s4": "/stages/s4-tts/", "s4-phase": "/library/tts/staged/", "s5": "/stages/s5-mix/", "s6": "/stages/s6-sync/",
@@ -19,7 +20,7 @@ LINKS = {
     "voice seed-cv": "/stages/voicebank/", "voice list": "/stages/voicebank/",
     "voice cast": "/stages/voice-cast/", "voice audit": "/stages/voice-audit/",
 }
-ORDER = ["ingest-epub", "ingest", "ingest-scenario", "s1", "s2", "voice", "s3", "lecture", "scenario",
+ORDER = ["ingest-epub", "ingest-pdf", "ingest", "ingest-scenario", "s1", "s2", "voice", "s3", "lecture", "scenario",
          "s4", "s4-phase", "s5", "s6", "scenario-sync", "sample", "audio"]
 
 root = typer.main.get_command(app)
@@ -34,6 +35,7 @@ def default_of(p):
         return "off" if not d else "on"
     if d is None or d == (): return "—"
     if isinstance(d, (list, tuple)): d = ", ".join(map(str, d))
+    if isinstance(d, Path): d = d.as_posix()  # same page whichever OS generates it
     return f"`{d}`"
 
 def emit(name, cmd):

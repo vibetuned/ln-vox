@@ -22,6 +22,12 @@
 #                        of torch.cuda. Without bnb the Gemma encoder loads
 #                        unquantized (dramabox_client.resolve_gemma_root —
 #                        an extra ~23 GB download on the first s4).
+#   - Windows (Git Bash / MSYS2 / Cygwin)
+#                      → install Dramabox's torch/torchaudio pins from the
+#                        cu128 index (PyPI's Windows wheels are CPU-only),
+#                        then the rest of its requirements. No mamba kernels
+#                        (no Windows build): s4 skips RE-USE voice-ref
+#                        denoising and says so once per run.
 #
 # The DramaboxClient wrapper monkey-patches torchaudio.save so version drift
 # between Dramabox's expected 2.8 and the 2.10+ we install on aarch64 doesn't
@@ -32,6 +38,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXTERNAL="$ROOT/external/DramaBox"
 ARCH="$(uname -m)"
 OS="$(uname -s)"
+IS_WINDOWS=0
+case "$OS" in
+    MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+esac
 
 if [ ! -d "$EXTERNAL" ]; then
     echo "==> Cloning Dramabox into $EXTERNAL"
@@ -73,6 +83,20 @@ if [ "$OS" = "Darwin" ]; then
     uv pip install -r "$FILTERED"
     echo "    Installing torch + torchaudio from default PyPI (MPS-capable)…"
     uv pip install "torch>=2.10,<2.12" "torchaudio>=2.10,<2.12"
+elif [ "$IS_WINDOWS" -eq 1 ]; then
+    echo "==> Windows detected"
+    echo "    Installing Dramabox's torch pins from the cu128 index (PyPI's are CPU-only),"
+    echo "    then the rest of its requirements. No mamba kernels: s4 runs without"
+    echo "    RE-USE voice-ref denoising."
+    TORCH_REQS="$(mktemp)"
+    FILTERED="$(mktemp)"
+    trap 'rm -f "$TORCH_REQS" "$FILTERED"' EXIT
+    grep -i -E '^[[:space:]]*(torch|torchaudio)([[:space:]]|=|<|>|~|!|$)' \
+        "$REQ_FILE" > "$TORCH_REQS"
+    grep -v -i -E '^[[:space:]]*(torch|torchaudio|torchvision|mamba-ssm|causal-conv1d)([[:space:]]|=|<|>|~|!|$)' \
+        "$REQ_FILE" > "$FILTERED"
+    uv pip install --index-url https://download.pytorch.org/whl/cu128 -r "$TORCH_REQS"
+    uv pip install -r "$FILTERED"
 else
     case "$ARCH" in
         x86_64)

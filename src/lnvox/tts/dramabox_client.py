@@ -193,6 +193,24 @@ def _is_mps(device: str) -> bool:
     return device.startswith("mps")
 
 
+def s4_compile_supported(device: str) -> bool:
+    """Whether the DiT can go through torch.compile on `device`.
+
+    Never on MPS (DESIGN.md §11.3). On Windows only with Triton installed
+    (the `triton-windows` package): inductor needs it, torch ships without
+    it there, and without it the first denoise call raises — every staged
+    phase restart would then crash on the same item. Compilation only
+    affects speed, so it isn't part of the cache key.
+    """
+    if _is_mps(device):
+        return False
+    if sys.platform == "win32":
+        import importlib.util
+
+        return importlib.util.find_spec("triton") is not None
+    return True
+
+
 def s4_effective_encoder_precision(device: str, staged: bool = True) -> str:
     """Encoder the render on `device` actually uses. Staged on MPS it is
     always the unquantized bf16 encoder: bitsandbytes is CUDA-only (F8) and
@@ -280,6 +298,9 @@ class DramaboxClient:
         # explicit LNVOX_S4_ENCODER_PRECISION=bf16 is still honored.
         if s4_encoder_precision(staged=False) == "bf16":
             kwargs.setdefault("bnb_4bit", False)
+        # TTSServer compiles by default; see s4_compile_supported.
+        if not s4_compile_supported(device):
+            kwargs.setdefault("compile_model", False)
 
         paths = get_all_paths()
         self.device = device

@@ -206,7 +206,7 @@ def render_chapter(
                     else "narration"
                 ),
                 speaker=" + ".join(session.speakers),
-                wav_path=str(wav_path.relative_to(output_dir.parent)),
+                wav_path=wav_path.relative_to(output_dir.parent).as_posix(),
                 duration_seconds=round(dur, 3),
                 cache_key=cache_key,
                 cached=cached,
