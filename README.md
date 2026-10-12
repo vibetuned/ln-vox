@@ -211,8 +211,14 @@ What differs on Windows:
 - **No RE-USE voice-reference denoising.** Its mamba kernels have no Windows
   build, so s4 logs `Voice-ref denoise disabled` once and clones from the
   reference clip as-is.
-- **No `torch.compile` of the DiT** unless Triton is installed
-  (`uv pip install triton-windows`; the TTS env prep doesn't do it for you).
+- **`torch.compile` of the DiT needs Visual Studio's C++ tools** (the
+  "Desktop development with C++" workload; Community is fine). With them
+  installed, the launcher's TTS env prep turns it on by itself: it loads the
+  VS developer environment (for `cl.exe`), installs the `triton-windows`
+  release matching torch, smoke-tests a compile and prints
+  `torch.compile: on`. Without them — or if the smoke test fails — s4
+  renders uncompiled instead of crashing. Measured on a 5090: ~17% faster
+  per denoise chunk, after a one-off compile of 1–3 min per denoise launch.
 - **`lnvox s4` keeps Windows awake** while it renders — the counterpart of
   the macOS `caffeinate` re-exec.
 - **Tip:** `export LNVOX_LLM_ENDPOINT=http://127.0.0.1:8000/v1`. Windows

@@ -578,6 +578,94 @@ install_dramabox_reqs() {
     esac
 }
 
+# Windows: import Visual Studio's x64 developer environment — what
+# vcvars64.bat sets: cl.exe on PATH, INCLUDE, LIB, … — into this shell, so the
+# stages started after it (s4) can compile. vcvars64.bat only runs under cmd,
+# so cmd runs it and every variable it changed is copied back (PATH converted
+# to POSIX form). The .cmd files sidestep MSYS→cmd quote mangling. Returns 1
+# when Visual Studio with the C++ tools isn't installed; a no-op inside a
+# developer prompt already.
+activate_msvc_env() {
+    command -v cl >/dev/null 2>&1 && return 0
+    local vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+    [ -f "$vswhere" ] || return 1
+    local vs
+    vs="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+        -property installationPath 2>/dev/null | tr -d '\r')"
+    [ -n "$vs" ] || return 1
+    local vcvars="$vs\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    [ -f "$(cygpath -u "$vcvars")" ] || return 1
+    local dir
+    dir="$(mktemp -d)"
+    printf '@set\r\n' > "$dir/before.cmd"
+    printf '@call "%s" >nul\r\n@set\r\n' "$vcvars" > "$dir/after.cmd"
+    cmd //c "$(cygpath -w "$dir/before.cmd")" > "$dir/before.txt" 2>/dev/null
+    cmd //c "$(cygpath -w "$dir/after.cmd")" > "$dir/after.txt" 2>/dev/null
+    local -A before=()
+    local line name
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        before["${line%%=*}"]="${line#*=}"
+    done < "$dir/before.txt"
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        name="${line%%=*}"
+        case "$name" in ''|*[!A-Za-z0-9_]*) continue ;; esac   # e.g. ProgramFiles(x86)
+        [ "${before[$name]-}" = "${line#*=}" ] && continue
+        case "$name" in
+            PATH|Path|path) PATH="$(cygpath -u -p "${line#*=}")" ;;
+            *) export "$name=${line#*=}" ;;
+        esac
+    done < "$dir/after.txt"
+    rm -rf "$dir"
+    command -v cl >/dev/null 2>&1
+}
+
+# Windows: torch.compile of the Dramabox DiT — on by default on Linux — needs
+# Triton (torch ships without it there) AND MSVC's cl.exe (for the graph's
+# CPU-side C++ code). With Visual Studio's C++ tools installed: import their
+# environment (it stays exported for s4), install the triton-windows release
+# that matches torch, and smoke-test a compile that exercises both
+# toolchains. On any failure Triton is removed again, so s4 renders
+# uncompiled instead of crash-looping (s4_compile_supported needs both).
+# Measured on an RTX 5090: ~17% faster per denoise chunk, after a one-off
+# compile of a few minutes per denoise launch.
+enable_windows_compile() {
+    if ! activate_msvc_env; then
+        echo "torch.compile: off — no Visual Studio C++ tools found (install the \"Desktop development with C++\" workload to enable it)"
+        return 0
+    fi
+    local minor
+    minor="$(uv run python -c 'import torch; print(torch.__version__.split(".")[1])' 2>/dev/null | tr -d '\r')"
+    case "$minor" in
+        ''|*[!0-9]*) echo "torch.compile: off — couldn't read the torch version" >&2; return 0 ;;
+    esac
+    # torch 2.N pairs with Triton 3.(N-4): 2.8 → 3.4, 2.9 → 3.5, …
+    if ! uv pip install "triton-windows>=3.$((minor - 4)),<3.$((minor - 3))"; then
+        echo "WARN: torch.compile: off — triton-windows for torch 2.$minor didn't install" >&2
+        return 0
+    fi
+    if uv run python - <<'PY' >/dev/null 2>&1
+import torch
+
+@torch.compile(dynamic=True)
+def f(x, y):
+    # GPU kernels (Triton) + a CPU-side op (C++ via cl.exe), like the DiT.
+    return torch.nn.functional.gelu(x @ x) + y.cpu().sum().to(x.device)
+
+with torch.no_grad():
+    for n in (8, 24):
+        f(torch.randn(n, n, device="cuda"), torch.randn(n))
+torch.cuda.synchronize()
+PY
+    then
+        echo "torch.compile: on (Triton + MSVC $(basename "$(dirname "$(dirname "$(dirname "$(dirname "$(command -v cl)")")")")"))"
+    else
+        echo "WARN: torch.compile: off — the compile smoke test failed; removing triton-windows so s4 renders uncompiled" >&2
+        uv pip uninstall triton-windows || true
+    fi
+}
+
 prepare_tts_env() {
     banner "Preparing venv for TTS phase (Dramabox runtime)"
     # uv sync first to keep tts/voice extras in place; then overlay
@@ -590,6 +678,10 @@ prepare_tts_env() {
     # §16.6), and Dramabox's own '>=4.45' spec won't force the upgrade back.
     # Restore it explicitly; no-op when already satisfied.
     uv pip install "transformers>=4.52"
+
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        enable_windows_compile
+    fi
 
     # Sanity: refuse to proceed to Dramabox unless the expected torch
     # backend is actually available. Same check setup_dramabox.sh runs

@@ -149,6 +149,28 @@ def test_empty_knob_is_unset_and_bad_values_raise():
                 raise AssertionError(f"{env} on {dev} should be rejected")
 
 
+def test_windows_compiles_only_with_triton_and_msvc():
+    """Inductor on Windows needs Triton AND cl.exe; with Triton alone the
+    first denoise raises "Compiler: cl is not found" and every staged restart
+    crashes on the same item until the stall limit."""
+    import importlib.util
+    import shutil
+    from unittest import mock
+
+    from lnvox.tts.dramabox_client import s4_compile_supported
+
+    def check(triton, cl):
+        with mock.patch.object(sys, "platform", "win32"), \
+             mock.patch.object(importlib.util, "find_spec", lambda name: object() if triton else None), \
+             mock.patch.object(shutil, "which", lambda name: "cl.exe" if cl else None):
+            return s4_compile_supported("cuda")
+
+    assert check(triton=True, cl=True)
+    assert not check(triton=True, cl=False)
+    assert not check(triton=False, cl=True)
+    assert not s4_compile_supported("mps")
+
+
 # ---- chunk policy (build_plan ≡ lab engine) -----------------------------------
 
 

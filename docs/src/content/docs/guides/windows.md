@@ -54,7 +54,19 @@ The `uv run lnvox …` stage commands work from any shell.
 
 **No RE-USE voice-reference denoising.** RE-USE needs the mamba-ssm / causal-conv1d kernels, which have no Windows build. s4 logs `Voice-ref denoise disabled (RE-USE unavailable: …)` once and clones from the reference clip as-is. A quality-ranked voicebank (`seed-cv --rank-by-quality`) matters a little more here.
 
-**No `torch.compile` without Triton.** Torch ships without Triton on Windows, and an uncompilable DiT would crash on its first denoise call, so both s4 paths skip compilation unless `triton` is importable (`s4_compile_supported`). Installing the community `triton-windows` package turns it back on; the TTS env prep doesn't do that for you. Compilation only affects speed, so it isn't part of the cache key.
+**`torch.compile` needs Triton *and* MSVC.** On Linux the DiT is compiled by default. On Windows inductor needs two toolchains: Triton for the GPU kernels — torch ships without it there; the community `triton-windows` package, `<3.5` to match torch 2.8 — and MSVC's `cl.exe` for its C++ glue, which is only on `PATH` inside a Visual Studio developer environment (`vcvars64.bat`, "x64 Native Tools Command Prompt"). With Triton alone, the first denoise call raises `Compiler: cl is not found` and every staged restart hits it again until the stall limit — so both s4 paths compile only when both are present (`s4_compile_supported`) and otherwise render uncompiled. Compilation only affects speed, so it isn't part of the cache key.
+
+**The launcher sets it up by itself** when Visual Studio's C++ tools are installed (the "Desktop development with C++" workload — Community or Build Tools). In the TTS env prep, `enable_windows_compile`:
+
+1. finds Visual Studio with `vswhere` and imports its x64 developer environment (`vcvars64.bat`) into the launcher's shell, so `cl.exe` stays on `PATH` for s4;
+2. installs the `triton-windows` release matching torch (torch 2.*N* ↔ Triton 3.*N−4*; `<3.5` for torch 2.8) — every TTS prep, since the LLM phase's `uv sync` removes it;
+3. smoke-tests a compile that needs both toolchains (GPU kernels plus a CPU-side op, like the DiT), then prints `torch.compile: on (Triton + MSVC <version>)`.
+
+Without Visual Studio it prints `torch.compile: off` and why. If the smoke test fails it uninstalls Triton again, so s4 renders uncompiled rather than crash-looping.
+
+Is it worth it? Measured on an RTX 5090, 80 beats of a light novel each way: a denoise chunk took **3.30 s compiled vs 4.00 s** (median, ~17% faster). Each launch of the denoise phase first compiles — up to ~5 min on a machine's first run (once at the first chunk, again when chunk shapes first change), 1–1.5 min once inductor's on-disk cache is warm. The audio is equivalent — different diffusion draws of the same lines, same loudness, no broken beats. A 9-hour book (3,105 chunks) rendered in ~3 h with zero restarts; roughly half an hour saved.
+
+Outside the launcher, compile happens only where both toolchains are reachable: a hand-run `lnvox s4` compiles when started from a developer prompt ("x64 Native Tools Command Prompt") with `triton-windows` installed, and renders uncompiled otherwise. ComfyUI's `--prepare-env tts` installs Triton, but its s4 nodes run in ComfyUI's environment — start ComfyUI from a developer prompt to compile there.
 
 **Sleep prevention.** `lnvox s4` asks Windows to stay awake (`SetThreadExecutionState`) until it exits — the counterpart of the launcher's macOS `caffeinate` re-exec, and it covers direct `lnvox s4` runs and ComfyUI too.
 

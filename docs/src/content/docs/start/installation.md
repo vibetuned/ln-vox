@@ -96,7 +96,7 @@ uv sync --extra voice --extra tts
 MSYS_NO_PATHCONV=1 reg add "HKCU\Software\Classes\.m4b" /v "Content Type" /d "audio/mp4" /f
 ```
 
-What differs (llama.cpp-only LLM backend, no RE-USE denoising, `torch.compile` only with Triton, sleep prevention, file names, [the `.m4b` MIME type](/guides/windows/#sharing-the-m4b)) is on the [Windows guide](/guides/windows/).
+What differs (llama.cpp-only LLM backend, no RE-USE denoising, `torch.compile` set up automatically when Visual Studio's C++ tools are installed, sleep prevention, file names, [the `.m4b` MIME type](/guides/windows/#sharing-the-m4b)) is on the [Windows guide](/guides/windows/).
 
 ## Optional tools
 

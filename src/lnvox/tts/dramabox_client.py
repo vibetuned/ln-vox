@@ -196,18 +196,21 @@ def _is_mps(device: str) -> bool:
 def s4_compile_supported(device: str) -> bool:
     """Whether the DiT can go through torch.compile on `device`.
 
-    Never on MPS (DESIGN.md §11.3). On Windows only with Triton installed
-    (the `triton-windows` package): inductor needs it, torch ships without
-    it there, and without it the first denoise call raises — every staged
-    phase restart would then crash on the same item. Compilation only
-    affects speed, so it isn't part of the cache key.
+    Never on MPS (DESIGN.md §11.3). On Windows only with both of inductor's
+    toolchains: Triton (the `triton-windows` package — torch ships without
+    it there) for the GPU kernels, and MSVC's `cl.exe` for its C++ glue,
+    which is on PATH only inside a Visual Studio developer environment
+    (vcvars64.bat). Missing either, the first denoise call raises, and every
+    staged phase restart would crash on the same item until the stall limit.
+    Compilation only affects speed, so it isn't part of the cache key.
     """
     if _is_mps(device):
         return False
     if sys.platform == "win32":
         import importlib.util
+        import shutil
 
-        return importlib.util.find_spec("triton") is not None
+        return importlib.util.find_spec("triton") is not None and shutil.which("cl") is not None
     return True
 
 

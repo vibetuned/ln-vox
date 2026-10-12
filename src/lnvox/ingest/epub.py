@@ -53,8 +53,11 @@ _SKIP_STEM_PATTERNS = (
 )
 
 # Recognise chapter base names so chapter1.xhtml + chapter1_1.xhtml are merged.
+# A chapter's continuation files: `chapter1_1`, or a letter suffix
+# (`chapter007b`, `chapter003d` — Yen Press splits a chapter at each
+# illustration, mid-scene).
 _CHAPTER_BASE_RE = re.compile(
-    r"^(chapter\d+|prologue|epilogue|afterword|interlude\d+|intro|preface)(?:_\d+)?$",
+    r"^(chapter\d+|prologue|epilogue|afterword|interlude\d+|intro|preface)(?:_\d+|[a-z])?$",
     re.IGNORECASE,
 )
 

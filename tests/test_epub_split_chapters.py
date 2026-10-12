@@ -244,6 +244,24 @@ def test_chapter_files_pad_to_the_count_and_sort_numerically(tmp_path):
     assert [c.title for c in chapters][:3] == ["Part 1", "Part 2", "Part 3"]
 
 
+def test_letter_suffixed_parts_merge_into_their_chapter(tmp_path):
+    """Yen Press splits a chapter at each illustration — chapter003,
+    chapter003b, chapter003d — mid-scene; they're one chapter, like the
+    `_1` parts."""
+    pages = [
+        ("chapter003", "<h1>3</h1><p>The duel began.</p>"),
+        ("chapter003b", "<p>He spoke in a low voice.</p>"),
+        ("chapter003d", "<p>The crowd scattered.</p>"),
+        ("chapter004", "<h1>4</h1><p>Morning came.</p>"),
+    ]
+    meta = extract_epub(_build_multi_epub(tmp_path, pages), tmp_path / "out", progress=lambda _m: None)
+    assert [c["source_parts"] for c in meta.chapters] == [
+        ["chapter003", "chapter003b", "chapter003d"], ["chapter004"],
+    ]
+    body = (tmp_path / "out" / meta.chapters[0]["file"]).read_text(encoding="utf-8")
+    assert body.index("duel began") < body.index("low voice") < body.index("crowd scattered")
+
+
 def test_small_books_keep_two_digit_ids(tmp_path):
     epub = _build_epub(tmp_path, _TWO_CHAPTER_PAGE)
     meta = extract_epub(epub, tmp_path / "out", split_chapters=True, progress=lambda _m: None)

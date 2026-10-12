@@ -9,7 +9,7 @@ This page documents the internals of [`scripts/run_pipeline.sh`](/launcher/run-p
 
 ## Shell functions
 
-The script defines 14 functions. They share a handful of globals set during option parsing: `OS` (`uname -s`), `IS_WINDOWS` (1 under Git Bash / MSYS2 / Cygwin, which also exports `PYTHONUTF8=1`), `LLM_BACKEND`, `VLLM_URL`, `LNVOX_VLLM_BASE` (the server URL: `--vllm-url`, else `$LNVOX_LLM__ENDPOINT`, else `$LNVOX_LLM_ENDPOINT`, else `http://localhost:${LNVOX_LLM_PORT:-8000}/v1` — also exported to the stages as `LNVOX_LLM__ENDPOINT`), `BOOK_ART` (`${LNVOX_ARTIFACTS_DIR:-artifacts}/<book_id>`), `VLLM_PID` / `VLLM_LOG` (the managed server), `STEP_RETRIES` and `RETRY_DELAY`.
+The script defines 15 functions. They share a handful of globals set during option parsing: `OS` (`uname -s`), `IS_WINDOWS` (1 under Git Bash / MSYS2 / Cygwin, which also exports `PYTHONUTF8=1`), `LLM_BACKEND`, `VLLM_URL`, `LNVOX_VLLM_BASE` (the server URL: `--vllm-url`, else `$LNVOX_LLM__ENDPOINT`, else `$LNVOX_LLM_ENDPOINT`, else `http://localhost:${LNVOX_LLM_PORT:-8000}/v1` — also exported to the stages as `LNVOX_LLM__ENDPOINT`), `BOOK_ART` (`${LNVOX_ARTIFACTS_DIR:-artifacts}/<book_id>`), `VLLM_PID` / `VLLM_LOG` (the managed server), `STEP_RETRIES` and `RETRY_DELAY`.
 
 ### `usage`
 
@@ -83,7 +83,16 @@ Makes the venv right for Dramabox:
 
 1. `uv sync --extra voice --extra tts`, then `install_dramabox_reqs`.
 2. `uv pip install "transformers>=4.52"` — a prior VibeVoice prep pins `transformers==4.51.3`, which breaks Dramabox's Gemma encoder, and Dramabox's own `>=4.45` spec won't force the upgrade back.
-3. Sanity check in the venv: MPS available on Darwin; elsewhere CUDA available **and**, except on Windows, `causal_conv1d_cuda` / `selective_scan_cuda` importable (a failed kernel-wheel fetch is invisible to a plain CUDA probe). On failure it prints the torch version and device flags and exits 1, pointing at `scripts/setup_dramabox.sh`.
+3. Windows only: `enable_windows_compile` (below).
+4. Sanity check in the venv: MPS available on Darwin; elsewhere CUDA available **and**, except on Windows, `causal_conv1d_cuda` / `selective_scan_cuda` importable (a failed kernel-wheel fetch is invisible to a plain CUDA probe). On failure it prints the torch version and device flags and exits 1, pointing at `scripts/setup_dramabox.sh`.
+
+### `activate_msvc_env`
+
+Windows only. Imports Visual Studio's x64 developer environment into the launcher's shell, so the stages started after it — s4 — find MSVC's `cl.exe`. It locates the newest Visual Studio with the C++ tools through `vswhere` (`Microsoft.VisualStudio.Component.VC.Tools.x86.x64`), runs `vcvars64.bat` under `cmd` (it only runs there), and exports every variable the batch file changed — `PATH` converted to POSIX form with `cygpath -u -p`, the rest (`INCLUDE`, `LIB`, …) as is. The `cmd` side goes through two small `.cmd` files, which sidesteps MSYS's quoting of arguments to `cmd`. Returns 1 when no such Visual Studio is installed; a no-op when `cl` is already on `PATH` (a developer prompt).
+
+### `enable_windows_compile`
+
+Windows only, called by `prepare_tts_env`. `torch.compile` of the Dramabox DiT — Linux's default — needs Triton (torch ships without it on Windows) **and** `cl.exe` (the graph has CPU-side ops that inductor compiles to C++). It runs `activate_msvc_env`, installs the `triton-windows` release matching the installed torch (2.*N* ↔ 3.*N−4*), then smoke-tests `torch.compile(dynamic=True)` on a function with both GPU kernels and a CPU op — the failure the DiT hits without `cl.exe` (`Compiler: cl is not found`). It prints `torch.compile: on (Triton + MSVC <version>)`, or `off` with the reason; a failed smoke test uninstalls Triton so s4 renders uncompiled instead of crash-looping until the stall limit (`s4_compile_supported` requires both toolchains). Never fatal. See the [Windows guide](/guides/windows/).
 
 ### `prepare_vibevoice_env`
 
