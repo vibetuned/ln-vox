@@ -174,10 +174,12 @@ def run(
 ) -> list[ChapterDirected]:
     """Direct every chapter → ``03_directed/<chapter_id>.json``. Idempotent.
 
-    A cached chapter is reused only while it matches this run: a different
-    normalize setting (``--no-normalize`` toggled, or no client) redoes it; a
+    A cached chapter is reused only while it matches this run: different
+    chapter text (a re-extraction, a proofread) or a different normalize
+    setting (``--no-normalize`` toggled, or no client) redoes it; a
     different narrator descriptor just re-voices its prompts. A chapter
-    written before those were recorded is treated as current and stamped.
+    written before the normalize setting and descriptors were recorded is
+    treated as current and stamped.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     directed_dir = output_dir / "03_directed"
@@ -198,6 +200,15 @@ def run(
                 )
             except Exception:
                 result = None  # malformed — re-direct
+        # Every beat keeps its verbatim `source_span`, so the cached spans
+        # are the text the chapter was directed from: compare them with a
+        # fresh split instead of storing a hash (also catches caches written
+        # before this check existed).
+        if result is not None and [
+            b.source_span for s in result.scenes for b in s.beats
+        ] != [b.source_span for b in split_chapter(chapter)]:
+            print(f"  [lecture] {chapter.chapter_id}: chapter text changed — rebuilding")
+            result = None
         if result is not None:
             if result.normalized is None:
                 result.normalized = normalized

@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 import statistics
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -151,21 +152,30 @@ def _trim_edges(lines: list[str], running: set[str]) -> tuple[list[str], int | N
     return lines, page_no
 
 
+# A bookmark title often carries a number or a date the page doesn't print:
+# "I. Atomic Explosives (May 1946)" over a page headed "Atomic Explosives".
+_TITLE_NUMBERING_RE = re.compile(r"^\s*(?:chapter\s+)?(?:[ivxlcdm]+|\d+)[.:)\-]?\s+", re.IGNORECASE)
+_TITLE_TRAILER_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
 def _drop_title_lines(lines: list[str], title: str) -> list[str]:
     """Drop the chapter title printed at the top of its first page.
 
     Fuzzy, so an OCR'd "Atomie Explosives" still matches the title, and the
-    title may wrap over several lines.
+    title may wrap over several lines. Matched with and without the title's
+    leading numbering and trailing parenthetical.
     """
-    target = _key(title)
-    if not target:
+    core = _TITLE_TRAILER_RE.sub("", _TITLE_NUMBERING_RE.sub("", title))
+    targets = {k for k in (_key(title), _key(core)) if k}
+    if not targets:
         return lines
+    longest = max(len(t) for t in targets)
     acc = ""
     for i, line in enumerate(lines[:4]):
         acc += _key(line)
-        if SequenceMatcher(None, acc, target).ratio() >= 0.85:
+        if any(SequenceMatcher(None, acc, t).ratio() >= 0.85 for t in targets):
             return lines[i + 1 :]
-        if len(acc) > len(target) + 5:
+        if len(acc) > longest + 5:
             break
     return lines
 
@@ -268,6 +278,31 @@ def _save_cover(reader, page_no: int, out: Path) -> bool:
     return True
 
 
+def _use_cover_file(src: Path, out: Path) -> None:
+    """An image file → `out` as the cover. A JPEG already within the size
+    cap is copied byte for byte (no re-encode); anything else is converted
+    like a page's image. A no-op when `src` is `out` — re-extracting while
+    keeping the folder's current cover."""
+    if out.exists() and src.resolve() == out.resolve():
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image
+    except ImportError:
+        if src.suffix.lower() in (".jpg", ".jpeg"):
+            shutil.copyfile(src, out)
+            return
+        raise ValueError(f"converting {src} to the cover needs Pillow: run with `--with \"pypdf[image]\"`")
+    with Image.open(src) as im:
+        fits = im.format == "JPEG" and max(im.size) <= COVER_MAX_PX
+        if not fits:
+            img = im.convert("RGB")
+            img.thumbnail((COVER_MAX_PX, COVER_MAX_PX))
+            img.save(out, "JPEG", quality=90)
+    if fits:
+        shutil.copyfile(src, out)
+
+
 def extract_pdf(
     pdf_path: Path,
     output_dir: Path,
@@ -278,13 +313,17 @@ def extract_pdf(
     authors: list[str] | None = None,
     language: str = "en",
     cover_page: int | None = 1,
+    cover_file: Path | None = None,
     epub_path: Path | None = None,
     progress: Callable[[str], None] = print,
 ) -> PdfMeta:
     """Chapters (+ cover, + sync EPUB) from a PDF. `title` / `authors`
-    override the PDF's metadata; `cover_page` None skips the cover;
-    `epub_path` None skips the EPUB. An existing EPUB is only overwritten
-    when an earlier run generated it."""
+    override the PDF's metadata; `cover_file` (an image) takes precedence
+    over `cover_page`, and both None skip the cover; `epub_path` None skips
+    the EPUB. An existing EPUB is only overwritten when an earlier run
+    generated it."""
+    if cover_file is not None and not cover_file.is_file():
+        raise ValueError(f"cover image not found: {cover_file}")
     reader = _open_reader(pdf_path)
     n_pages = len(reader.pages)
     info = reader.metadata or {}
@@ -346,7 +385,12 @@ def extract_pdf(
         progress(f"  removed {removed} chapter file(s) from the previous extraction")
 
     cover: Path | None = None
-    if cover_page is not None:
+    if cover_file is not None:
+        cover = output_dir / "images" / "cover.jpg"
+        _use_cover_file(cover_file, cover)
+        meta.cover_image = cover.relative_to(output_dir).as_posix()
+        progress(f"  cover: {cover_file.as_posix()} → {meta.cover_image}")
+    elif cover_page is not None:
         cover = output_dir / "images" / "cover.jpg"
         try:
             found = _save_cover(reader, cover_page, cover)

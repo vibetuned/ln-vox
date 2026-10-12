@@ -269,6 +269,15 @@ def ingest_pdf(
         "--cover-page",
         help="Page whose image is the cover (embedded in the m4b and the EPUB); 0 = no cover.",
     ),
+    cover: Optional[Path] = typer.Option(
+        None,
+        "--cover",
+        help=(
+            "Use this image as the cover instead of a page's (overrides "
+            "--cover-page) — e.g. the folder's current images/cover.jpg to keep it "
+            "when re-extracting."
+        ),
+    ),
     epub: Optional[Path] = typer.Option(
         None,
         "--epub",
@@ -322,6 +331,7 @@ def ingest_pdf(
             authors=author or None,
             language=language,
             cover_page=cover_page or None,
+            cover_file=cover,
             epub_path=epub_path,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )

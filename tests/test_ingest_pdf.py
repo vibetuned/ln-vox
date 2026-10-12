@@ -100,6 +100,14 @@ def test_ocr_title_scan_specks_and_rule_debris():
     assert clean_chapter(pages).startswith("Lanteru Keepers The gate")
 
 
+def test_bookmark_title_numbering_and_date_dont_block_the_match():
+    # Bookmark "IV. The Gate (May 1946)"; the page prints only an OCR'd heading.
+    pages = ["IV\nThe Gnte\nThe gate stood open all night long, and nobody came to close it."]
+    assert clean_chapter(pages, "IV. The Gate (May 1946)") == (
+        "The gate stood open all night long, and nobody came to close it."
+    )
+
+
 def test_hyphen_before_a_capital_is_part_of_the_word():
     pages = ["They spoke an old Anglo-\nSaxon dialect at the gate, with a well-\nknown accent."]
     assert clean_chapter(pages) == "They spoke an old Anglo-Saxon dialect at the gate, with a wellknown accent."
@@ -242,6 +250,35 @@ def test_cover_is_the_largest_image_capped_and_shared_with_the_epub():
         # --cover-page 0 → no cover anywhere.
         meta = _extract(_FakeReader(["Cover text.", "Body text."], images=images), out, cover_page=None)
         assert meta.cover_image is None
+
+
+def test_cover_file_keeps_the_current_cover_or_converts_a_new_one():
+    import pytest
+
+    Image = pytest.importorskip("PIL.Image")
+    texts = ["Cover text.", "Body text."]
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "novel"
+        current = out / "images" / "cover.jpg"
+        current.parent.mkdir(parents=True)
+        Image.new("RGB", (1050, 1600), (10, 20, 30)).save(current, "JPEG", quality=90)
+        before = current.read_bytes()
+        # The folder's own cover: kept byte for byte, despite page 1's image.
+        page_cover = {0: [Image.new("RGB", (400, 600), (200, 0, 0))]}
+        meta = _extract(_FakeReader(texts, images=page_cover), out, cover_file=current)
+        assert meta.cover_image == "images/cover.jpg" and current.read_bytes() == before
+        # A large PNG elsewhere: converted to JPEG with the long side capped.
+        png = Path(d) / "art.png"
+        Image.new("RGB", (2400, 3600), (0, 90, 0)).save(png)
+        _extract(_FakeReader(texts), out, cover_file=png)
+        with Image.open(current) as im:
+            assert (im.format, im.size) == ("JPEG", (1067, 1600))
+        try:
+            _extract(_FakeReader(texts), out, cover_file=Path(d) / "missing.jpg")
+        except ValueError as e:
+            assert "not found" in str(e)
+        else:
+            raise AssertionError("expected ValueError")
 
 
 def test_extract_refuses_a_pdf_without_a_text_layer():

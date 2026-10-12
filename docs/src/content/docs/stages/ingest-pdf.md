@@ -37,6 +37,7 @@ pypdf and Pillow (the `image` extra, for the cover) aren't locked dependencies �
 | `--title`, `--author` | the PDF's metadata | Book title / author(s) for the EPUB and the sidecar. Scans rarely carry metadata, so pass them. `--author` repeats. Fallback title: the PDF's file name. |
 | `--language` | `en` | The EPUB's language code. |
 | `--cover-page N` | `1` | The page whose largest image is the cover; `0` for none. |
+| `--cover IMAGE` | — | Use this image file as the cover instead (overrides `--cover-page`). A JPEG within the 1600 px cap is copied byte for byte; anything else is converted like a page's image. Pointing it at the folder's own `images/cover.jpg` keeps the current cover across a re-extraction. |
 | `--epub PATH` / `--no-epub` | `epubs/<book_id>.epub` | Where to write the sync EPUB, or don't. `<book_id>` is derived from the output folder as `lnvox ingest` derives it (`novels/a/b` → `a/b`). An existing EPUB is overwritten only if ln-vox generated it — your own EPUB at that path makes the command exit 2 untouched. |
 
 Without `--chapter`, the PDF's **top-level bookmarks** become chapters, each running to the page before the next one (nested bookmarks are ignored). Without bookmarks the whole document — or `--pages` — is one chapter, named after the title.
@@ -46,7 +47,7 @@ Without `--chapter`, the PDF's **top-level bookmarks** become chapters, each run
 Each chapter's pages are cleaned of what a narrator must not read, then re-flowed:
 
 1. **Page edges.** Lines that recur at the top or bottom two lines of a page — on at least 2 pages and 20% of the chapter's pages — are running heads or feet and are dropped. Matching ignores digits and case, so `12 THE OPEN MIND` and `The Open Mind 13` are one head; detection is per chapter, because a book's recto head is usually the chapter title. Page numbers, lone roman numerals and scan specks (no two letters in a row) are dropped from the edges too.
-2. **The chapter title** printed at the top of its first page is dropped — fuzzy-matched, so an OCR'd `Atomie Explosives` still matches `Atomic Explosives`, and it may wrap over several lines.
+2. **The chapter title** printed at the top of its first page is dropped — fuzzy-matched, so an OCR'd `Atomie Explosives` still matches `Atomic Explosives`, and it may wrap over several lines. A bookmark title's leading numbering and trailing parenthetical are optional in the match: `I. Atomic Explosives (May 1946)` matches a page headed just `Atomic Explosives`.
 3. **Line breaks → paragraphs.** Words split across lines are re-joined: a soft hyphen always, a plain `-` when the next line starts lowercase. A line that ends a sentence and is shorter than 85% of the median line ends a paragraph. Ligatures (`ﬁ`, `ﬂ`, …) become letters; rule-line debris glued to a line start (`------ - ---there`) is removed.
 4. **Missing pages.** When the printed page numbers jump (63 → 66), a paragraph break keeps the sentence fragments on either side apart instead of gluing them into one.
 
@@ -64,7 +65,9 @@ Validated on a scanned 21-page excerpt: two chapters, the cover embedded in the 
 
 A re-extraction into the same folder first removes the chapter files the previous run listed in `.epub_meta.json` — so changing the split never leaves stale chapters for Stage 0 to ingest twice — and regenerates the EPUB. Files the extractor didn't write are left alone.
 
-Note that the [lecture stage](/stages/lecture/) keeps its directed chapters while their narrator matches, even if the text changed: after re-extracting a lecture book with *different text*, delete `artifacts/<book>/03_directed/` to have it re-read.
+The [lecture stage](/stages/lecture/) notices a chapter whose text changed and directs it again, so re-extracting into an existing book needs no cleanup. Previously rendered audio is reused for every beat whose final prompt comes out identical (the TTS cache is content-keyed); text from a different scan or edition rarely does.
+
+To keep the book's current cover when re-extracting — say from a better-OCR'd PDF whose first page is a poorer cover — pass it back with `--cover novels/<book>/images/cover.jpg`.
 
 ## Limits
 

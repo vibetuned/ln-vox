@@ -76,6 +76,7 @@ There is an example beat on the [library page](/library/stages/lecture/#output-a
 ## Re-running and caching
 
 - A chapter with a parseable `03_directed/<chapter_id>.json` is reused while it matches the run. Each file records whether the normalize pass ran (`normalized`) and the narrator descriptor (`voice_descriptors`).
+- A chapter whose text changed — a re-extraction (`ingest-pdf` / `ingest-epub` into the same folder), a proofread `.txt` — is rebuilt: the cached beats' verbatim `source_span`s are compared with a fresh split of the current chapter, so this needs no stored hash and also catches files written before the check existed. The log says `chapter text changed — rebuilding`.
 - Toggling `--no-normalize` rebuilds each chapter with the new setting (turning normalize back on costs the LLM calls again).
 - A re-cast Narrator re-voices each chapter: `direction` and `prompt` get the new descriptor, and the normalized text is kept, with no LLM call.
 - A chapter file written before these records existed is treated as current and stamped with the current settings. If you changed either since, delete `03_directed/` once.

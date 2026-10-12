@@ -400,6 +400,22 @@ def test_cache_revoices_a_new_narrator_without_renormalizing():
         assert r[0].voice_descriptors == {"Narrator": "elder, male"}
 
 
+def test_cache_rebuilds_a_chapter_whose_text_changed():
+    """A re-extraction (a fuller PDF, a proofread .txt) must not reuse the old
+    chapter's beats — they'd re-render the old text under the new chapter."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        llm = _Normalizer()
+        lecture.run(_CH, out, casting=_casting("adult, female"), client=llm)
+        longer = [Chapter(chapter_id="01", title="T", text="It was 1973.\n\nThen 1974.\n\nThe end.")]
+        r = lecture.run(longer, out, casting=_casting("adult, female"), client=llm)
+        assert _texts(r) == ["IT WAS 1973.", "THEN 1974.", "THE END."] and llm.calls == 2
+        lecture.run(longer, out, casting=_casting("adult, female"), client=llm)
+        assert llm.calls == 2  # unchanged text: the cache holds again
+
+
 def test_cache_treats_an_unrecorded_chapter_as_current():
     import json
     import tempfile
