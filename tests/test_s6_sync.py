@@ -30,6 +30,8 @@ from lnvox.stages.s6_sync import (
     _Match,
     _normalize_with_map,
     _wrap_matches,
+    place_at_anchor,
+    place_visual_element,
 )
 
 
@@ -65,6 +67,39 @@ def test_shadow_excludes_comments_and_processing_instructions():
     assert "real text" in shadow and "more text" in shadow
     # Only the two visible text nodes became segments.
     assert len(segments) == 2
+
+
+def test_shadow_keeps_single_spaces_around_inline_elements():
+    # An empty noteref (ingest-pdf) or an italic word splits a sentence into
+    # text nodes; the gap between nodes must not double the space after it,
+    # or the beat's verbatim span never matches exactly.
+    soup = BeautifulSoup(
+        '<html><body><p>It was universal.<a epub:type="noteref" href="#n1"></a> Ronald '
+        "knew it as <i>declination</i> too.</p></body></html>",
+        "html.parser",
+    )
+    shadow, segments, _ = _build_shadow(soup)
+    assert "it was universal. ronald knew it as declination too." in shadow, shadow
+    # The dropped space is simply not mapped: offsets still point into the node.
+    seg = segments[1]
+    assert str(seg.node)[seg.norm_to_orig[0]] == "R"
+
+
+def test_place_at_anchor_follows_the_beat_that_reads_the_marker():
+    seq = [("b0", 3, 0.0, 4.0), ("b1", 3, 4.5, 9.0), ("b2", 4, 10.0, 12.0)]
+    spans = {
+        "b0": "Surprising people for fun appears to be a cross-cultural universal.",
+        "b1": "Ronald Simons has documented many instances of “recreational” surprise.",
+        "b2": "Most cultures have games of surprise.",
+    }
+    anchor = {"paragraph": 3, "text": "appears to be a cross-cultural universal."}
+    assert place_at_anchor(anchor, seq, spans) == ("b0", "b1", 4.5)
+    # The paragraph's last beat: shown as it ends — no later beat in the paragraph.
+    anchor = {"paragraph": 3, "text": "many instances of “recreational” surprise."}
+    assert place_at_anchor(anchor, seq, spans) == ("b1", "b2", 10.0)
+    # Not in that paragraph's beats → None, so the caller places by paragraph.
+    assert place_at_anchor({"paragraph": 4, "text": "cross-cultural universal."}, seq, spans) is None
+    assert place_visual_element(3, seq) == ("b1", "b2", 10.0)
 
 
 # ---- DOM wrapping --------------------------------------------------------------

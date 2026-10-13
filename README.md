@@ -315,6 +315,19 @@ on `--cover-page` (default 1). The EPUB goes where the launcher looks for it
 is never overwritten. pypdf and Pillow run as an overlay (`--with`) because
 they aren't in the lock. Docs site: *Stages → 0a · ingest-pdf*.
 
+For a **born-digital** PDF (a publisher's digital edition, not a scan) add
+`--font-filter`: it finds the body font and keeps only the running text;
+section headings become their own paragraphs and paragraph breaks follow the
+first-line indents. Figures and tables are rendered from the page and placed
+before their first mention, and the endnotes are tied to their markers, so
+the reader app shows each at its moment in the audio (they also land in the
+EPUB and the m4b). Rendering needs one more overlay:
+
+```bash
+uv run --with "pypdf[image]" --with pypdfium2 lnvox ingest-pdf book.pdf \
+    novels/sweet-anticipation/volume-01 --pages 8-395 --font-filter
+```
+
 ---
 
 ## Project layout for novels

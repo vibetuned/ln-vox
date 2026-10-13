@@ -1,6 +1,6 @@
 ---
 title: Stage 0a — PDF extraction
-description: lnvox ingest-pdf converts a PDF into the novels/<book_id>/ folder Stage 0 reads — chapters by page range or bookmarks, page furniture stripped, paragraphs rebuilt — plus the cover for the m4b and an EPUB that Stage 6 syncs with it.
+description: lnvox ingest-pdf converts a PDF into the novels/<book_id>/ folder Stage 0 reads — chapters by page range or bookmarks, page furniture stripped, paragraphs rebuilt — plus the cover for the m4b and an EPUB that Stage 6 syncs with it; from a born-digital PDF also its figures, tables and endnotes, for the reader app.
 sidebar:
   order: 1
   label: 0a · ingest-pdf
@@ -9,7 +9,8 @@ sidebar:
 `lnvox ingest-pdf` turns a PDF into the same layout [`ingest-epub`](/stages/ingest-epub/) produces, so every later stage treats the book like an EPUB import:
 
 - one `NN-<slug>.txt` per chapter, the title on the first line;
-- `images/cover.jpg`, the cover page's image — Stage 5 embeds it in the m4b;
+- `images/cover.jpg`, the cover page — Stage 5 embeds it in the m4b;
+- with `--font-filter`, `images/figure-2-1.png`, `images/table-9-3.png`, … and `images/note-04-12.png`: the book's figures, tables and endnotes, rendered from the page (see [Figures, tables and notes](#figures-tables-and-notes));
 - `.epub_meta.json`, the same sidecar `ingest-epub` writes (title, authors, cover, chapter → page and EPUB-spine map);
 - **an EPUB built from the cleaned chapters**, `epubs/<book_id>.epub` by default — the sync target for [Stage 6](/stages/s6-sync/). Its text *is* the chapters' text, so the beats align onto it almost exactly.
 
@@ -26,7 +27,7 @@ uv run --with "pypdf[image]" lnvox ingest-pdf book.pdf novels/open-mind/volume-0
 
 The launcher finds `epubs/open-mind/volume-01.epub` on its own, so the run ends with the m4b (cover embedded) **and** `07_sync/` — the synced EPUB plus `sync_manifest.json` for the reader.
 
-pypdf and Pillow (the `image` extra, for the cover) aren't locked dependencies — adding one re-resolves the whole lock, including the vLLM nightly — so the command runs them as an overlay with `uv run --with`. Without pypdf it exits 2 with that hint; without Pillow it skips the cover and says so.
+pypdf and Pillow (the `image` extra, for the cover) aren't locked dependencies — adding one re-resolves the whole lock, including the vLLM nightly — so the command runs them as an overlay with `uv run --with`. Without pypdf it exits 2 with that hint; without Pillow it skips the cover and says so. Rendering — the whole cover page, figures, notes — also needs **pypdfium2**, another overlay: `uv run --with "pypdf[image]" --with pypdfium2 lnvox ingest-pdf …`. Without it the cover falls back to the page's largest image, and figures and note images are skipped with a message.
 
 ## Options
 
@@ -36,9 +37,12 @@ pypdf and Pillow (the `image` extra, for the cover) aren't locked dependencies �
 | `--pages FIRST-LAST` | all pages | Without `--chapter`: read only these pages. Bookmarked chapters are clipped to the range. |
 | `--title`, `--author` | the PDF's metadata | Book title / author(s) for the EPUB and the sidecar. Scans rarely carry metadata, so pass them. `--author` repeats. Fallback title: the PDF's file name. |
 | `--language` | `en` | The EPUB's language code. |
-| `--cover-page N` | `1` | The page whose largest image is the cover; `0` for none. |
+| `--cover-page N` | `1` | The cover page, rendered whole (with pypdfium2; else its largest image); `0` for none. |
 | `--cover IMAGE` | — | Use this image file as the cover instead (overrides `--cover-page`). A JPEG within the 1600 px cap is copied byte for byte; anything else is converted like a page's image. Pointing it at the folder's own `images/cover.jpg` keeps the current cover across a re-extraction. |
 | `--epub PATH` / `--no-epub` | `epubs/<book_id>.epub` | Where to write the sync EPUB, or don't. `<book_id>` is derived from the output folder as `lnvox ingest` derives it (`novels/a/b` → `a/b`). An existing EPUB is overwritten only if ln-vox generated it — your own EPUB at that path makes the command exit 2 untouched. |
+| `--font-filter` | off | For a born-digital PDF: keep only the running text, told apart by its font, and take out its figures, tables and endnotes for the reader app. See [Born-digital PDFs](#born-digital-pdfs---font-filter). |
+| `--notes FIRST-LAST` | the `Notes` bookmark | With `--font-filter`: the pages of the endnotes section. They are never narrated. |
+| `--no-notes` / `--no-figures` | — | With `--font-filter`: leave the endnotes out (markers are still removed) / drop figures and tables without rendering them. |
 
 Without `--chapter`, the PDF's **top-level bookmarks** become chapters, each running to the page before the next one (nested bookmarks are ignored). Without bookmarks the whole document — or `--pages` — is one chapter, named after the title.
 
@@ -53,17 +57,49 @@ Each chapter's pages are cleaned of what a narrator must not read, then re-flowe
 
 Pages with no text are listed in the output. A PDF with no text at all is refused (exit 2) before anything is written.
 
+## Born-digital PDFs (`--font-filter`)
+
+A publisher's digital edition has a real font on every glyph, which tells the running text apart from everything a narrator must skip. `--font-filter` reads each text run's font, size and position (pypdf's `visitor_text`) instead of the page's plain text:
+
+- **The body font** is the family and size carrying the most characters across the extracted pages. The output names it — `font filter: body text is StoneSerif 9 pt (94% of the characters)` — and warns when no font reaches half the text, which usually means a scan's OCR layer: don't use the filter there.
+- **Taken out of the text:** figures and tables — from the text before a `Figure 2.1` / `Table 3` / `Example 4` label (axis labels, cells set ahead of it) through its caption until the running text resumes — and running heads, folios, figure lettering, and any other text in another family at another size. Figures and tables come back as pictures; see below.
+- **Note markers** are taken out: a superscript number set smaller, and the more common kind set at body size and only raised, which pypdf can't see — digits right after a sentence ends (`universal. 4 Ronald`, `areas.4 Most`, `“…”13 Even`). The sentence must end with a lowercase word, a closing quote or a bracket, so `Op. 27 No. 2`, `p. 12` and pitch names like `C4` are left alone. Once the notes section is read, every marker must be claimed by a note — see below.
+- **Kept:** the body font in any style (italic, bold); text inline on a body line (a `#` from a symbol font, a term set in the sans); the body family at a smaller size — block quotes, epigraphs.
+- **Section headings** — a line in another family at body size or larger, on a page with running text — become a paragraph of their own; a heading set in two styles or wrapped over two lines is rejoined. Display lines on a page with no running text (a half-title) are dropped.
+- **Paragraphs** start where a line is indented from its page's margin, where the text switches between body and block-quote size, and at a numbered item (`3. `) after a sentence end — on top of the line-length rule above, which misses a paragraph whose last line runs nearly full.
+
+The other cleanup steps (running heads by repetition, the chapter title, hyphenation) run as usual on the filtered text.
+
+## Figures, tables and notes
+
+With `--font-filter`, what the text loses comes back for the reader — in the EPUB, in the m4b and, after Stage 6, in `sync_manifest.json` at its playback time. The progress log sums it up:
+
+```text
+  notes: 406 in 18 group(s), pages 396-423
+  figures: 127 rendered — 123 placed before their first mention, 4 where printed
+  notes: 405 of 405 tied to their markers; 1 marker-like number(s) left in the text
+```
+
+**Figures and tables** are rendered from the page at 216 dpi and trimmed to their ink, as `images/figure-2-1.png`, `images/table-14-3a.png`, … The crop follows the caption. A figure's caption sits under its drawing, so the picture runs from the nearest text above — running text, another figure, the running head — down to the caption's last line; a table's caption heads it, so the picture runs from the label down to the next text. On a page with several figures, lettering and cells go to the caption on their drawing's side, whatever order the PDF lists them in, and a table continued over a page break becomes one picture. Each is placed **before the paragraph that first mentions it** (`Figure 2.1 provides…`, `figures 4.1 and 4.2`, `Tables 14.3a–14.3b`), so the reader shows it as the narrator gets to it — else after the paragraph it interrupted in print. In the EPUB it is a `<figure>` with the picture and its label and caption as `alt` text. The sidecar's `images` lists it after the cover, so Stage 5 embeds it in the m4b and Stage 6 times it like any illustration (`images[]` and `visual_elements[]` of kind `image`, with `alt`).
+
+**Endnotes** are read from the notes section — the `Notes` bookmark, or `--notes` — whose group headers (`Preface`, `Chapter 4`) pair with the chapters (`4 Auditory Learning`). A note runs from its `N.` at the margin over indented paragraphs and page breaks; a misnumbered note set off by the space between notes stays a note of its own. Each marker in the text must be claimed by its chapter's note of that number; a marker no note claims was a number after all and goes back into the text (`Haydn's string quartet opus 33, no. 2`). A note still unclaimed is looked for between its neighbours' markers, in the forms the first pass skips — after a capital (`middle C.1 Engineers`), a number (`table 9.1. 5 In`), a comma (`research,13 sensory`). Every note becomes:
+
+- a `footnote` visual element in the sidecar: its rendered image (`src`), its text as `html` and plain `text`, its number (`label`) and an `anchor` — the words just before its marker. [Stage 6](/stages/s6-sync/) places it right after the beat that reads those words, so the reader app shows the note as that sentence ends;
+- in the EPUB, an empty `noteref` link where the marker stood — a stylesheet draws the number, so the paragraph's text runs on unbroken for the sync — and an endnote at the chapter's end that links back.
+
+Validated on a 477-page MIT Press edition (19 chapters): 127 figures and tables rendered, all 405 notes tied to their markers. Against an unfiltered extraction the text lost only figures, tables, markers and running heads — no prose. A simulated render (silent audio through the real Stage 5 and Stage 6) matched 3741/3741 beats `span-exact`, embedded the cover and the 127 figures in the m4b, and timed every picture and note in reading order.
+
 ## Cover and EPUB
 
-The cover is the **largest raster image** on `--cover-page` (masks and specks under 200 px don't count): a scan's page image, or a publisher PDF's cover art. It is saved as `images/cover.jpg` with its long side capped at 1600 px, recorded as `cover_image` in the sidecar — which `lnvox ingest` copies into `00_book_meta.json` for Stage 5 — and used as the EPUB's cover. A purely vector cover would need a PDF rasterizer and is skipped with a message.
+The cover is `--cover-page` **rendered whole** with pypdfium2, long side 1600 px: a publisher's cover is often layered — artwork in pieces, vector shapes, the title as text — and its largest image alone is a fragment. Without pypdfium2 it is the page's **largest raster image** (masks and specks under 200 px don't count), fine for a scan; a purely vector cover is then skipped with a message. It is saved as `images/cover.jpg`, recorded as `cover_image` in the sidecar — which `lnvox ingest` copies into `00_book_meta.json` for Stage 5 — and used as the EPUB's cover.
 
-The EPUB is EPUB 3 with an EPUB 2 NCX: a cover page (outside the reading order), then one XHTML per chapter, `chapterNN.xhtml`, holding an `<h1>` title and one `<p>` per paragraph — exactly what `ingest-epub` parses, so reading it back yields the same chapter files byte for byte. The sidecar's `source_parts` name those spine items, which is how Stage 6 finds each chapter's text.
+The EPUB is EPUB 3 with an EPUB 2 NCX: a cover page (outside the reading order), then one XHTML per chapter, `chapterNN.xhtml`, holding an `<h1>` title and one `<p>` per paragraph — exactly what `ingest-epub` parses, so reading it back yields the same chapter files byte for byte. Figures (`<figure>`) and endnotes (`<aside>` holding `<div>`s) add no `<p>`, so that holds with them too. The sidecar's `source_parts` name those spine items, which is how Stage 6 finds each chapter's text.
 
 Validated on a scanned 21-page excerpt: two chapters, the cover embedded in the m4b, and Stage 6 matched 91/91 beats with the timeline ending on the m4b's last sample.
 
 ## Re-running
 
-A re-extraction into the same folder first removes the chapter files the previous run listed in `.epub_meta.json` — so changing the split never leaves stale chapters for Stage 0 to ingest twice — and regenerates the EPUB. Files the extractor didn't write are left alone.
+A re-extraction into the same folder first removes the chapter files and the figure and note images (`rendered`) the previous run listed in `.epub_meta.json` — so changing the split never leaves stale chapters for Stage 0 to ingest twice — and regenerates the EPUB. Files the extractor didn't write are left alone.
 
 The [lecture stage](/stages/lecture/) notices a chapter whose text changed and directs it again, so re-extracting into an existing book needs no cleanup. Previously rendered audio is reused for every beat whose final prompt comes out identical (the TTS cache is content-keyed); text from a different scan or edition rarely does.
 
@@ -71,7 +107,8 @@ To keep the book's current cover when re-extracting — say from a better-OCR'd 
 
 ## Limits
 
-- Layout is not analysed: two-column pages, footnotes and tables come out in pypdf's reading order. Footnotes in particular end up inline; trim them by hand if they matter.
+- Layout is not analysed: two-column pages, footnotes and tables come out in pypdf's reading order. Footnotes in particular end up inline; trim them by hand if they matter. `--font-filter` handles the figures, tables and endnotes of a born-digital PDF, but keeps footnotes at a page's foot set in the body family (it can't tell them from a block quote), and a table without a `Table N` label passes through. A figure is cropped full width between the text around it, so a figure set beside the running text would take that text along.
+- A note whose marker sits inside a figure's caption has no place in the running text; it is not tied, and the log's `N of M tied` says so.
 - A line hyphen before an uppercase word (`Anglo-` / `Saxon`) is kept; one before a lowercase word is treated as a line-break hyphen, so a genuine compound split exactly there loses its hyphen (`well-` / `known` → `wellknown`).
 - OCR errors pass through, into the EPUB too. Lecture mode's speech-normalize pass smooths some for the audio; for a book you care about, proofread the `.txt` files before the first render. Stage 6's fuzzy and anchored matching tolerates small differences between them and the EPUB, but a re-extraction would overwrite your fixes.
-- The EPUB carries text and the cover only — no figures from inside the PDF.
+- Without `--font-filter` (a scan), the EPUB carries text and the cover only — no figures, no notes.

@@ -288,6 +288,26 @@ def ingest_pdf(
         ),
     ),
     no_epub: bool = typer.Option(False, "--no-epub", help="Don't write the EPUB."),
+    font_filter: bool = typer.Option(
+        False,
+        "--font-filter",
+        help=(
+            "For a born-digital PDF (not a scan): keep only the running text, "
+            "told apart by its font; section headings become their own paragraphs. "
+            "Figures and tables are rendered into the EPUB before their first "
+            "mention, and endnotes tied to their markers for the reader app "
+            "(rendering needs `--with pypdfium2`)."
+        ),
+    ),
+    notes_pages: Optional[str] = typer.Option(
+        None,
+        "--notes",
+        help="With --font-filter: the endnotes section's pages FIRST-LAST (default: the 'Notes' bookmark).",
+    ),
+    no_notes: bool = typer.Option(False, "--no-notes", help="With --font-filter: leave the endnotes out."),
+    no_figures: bool = typer.Option(
+        False, "--no-figures", help="With --font-filter: drop figures and tables without rendering them."
+    ),
 ):
     """Stage 0a: Extract a PDF into the novels/-folder layout, plus an EPUB.
 
@@ -306,8 +326,15 @@ def ingest_pdf(
     try:
         specs = [parse_chapter_spec(c) for c in chapter or []]
         page_range = parse_page_range(pages) if pages else None
+        notes_range = parse_page_range(notes_pages) if notes_pages else None
     except ValueError as e:
         console.print(f"[red]{e}[/]")
+        raise typer.Exit(2)
+    if (notes_range or no_notes or no_figures) and not font_filter:
+        console.print("[red]--notes, --no-notes and --no-figures only apply with --font-filter.[/]")
+        raise typer.Exit(2)
+    if notes_range and no_notes:
+        console.print("[red]--notes and --no-notes contradict each other.[/]")
         raise typer.Exit(2)
     if specs and page_range:
         console.print("[red]--pages only applies without --chapter (the chapters name their pages).[/]")
@@ -333,6 +360,10 @@ def ingest_pdf(
             cover_page=cover_page or None,
             cover_file=cover,
             epub_path=epub_path,
+            font_filter=font_filter,
+            notes_pages=notes_range,
+            notes=not no_notes,
+            figures=not no_figures,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )
     except ImportError:

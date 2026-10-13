@@ -171,6 +171,12 @@ def _build_shadow(
             if not raw.strip():
                 continue
             normalized, orig_map = _normalize_with_map(raw)
+            # The shadow already ends in a space (a node's own or the one put
+            # between nodes): a node starting with whitespace — the text after
+            # an inline element, `<i>x</i> y` or an empty noteref — would
+            # double it, and a beat's span then never matches exactly.
+            if cursor and normalized.startswith(" "):
+                normalized, orig_map = normalized[1:], orig_map[1:]
             if not normalized:
                 continue
             segments.append(
@@ -662,6 +668,7 @@ def align_images_to_embeds(image_marks: list[dict], embedded: list[Path]) -> lis
                 "trigger_seconds": chosen.get("trigger_seconds"),
                 "after_beat_id": chosen.get("after_beat_id"),
                 "before_beat_id": chosen.get("before_beat_id"),
+                **({"alt": chosen["alt"]} if chosen.get("alt") else {}),
             })
     return aligned
 
@@ -752,6 +759,44 @@ def place_visual_element(
             break
     trigger = before_start if before_start is not None else after_end
     return after_beat, before_beat, trigger
+
+
+def place_at_anchor(
+    anchor: dict,
+    seq: list[tuple[str, int, float, float]],
+    spans: dict[str, str],
+) -> tuple[str | None, str | None, float | None] | None:
+    """Place an element right after the beat that reads its anchor text.
+
+    `anchor` is ``{"paragraph": p, "text": …}``: the words just before the
+    element in paragraph p — a note's marker sat at their end. The beat of
+    that paragraph whose span holds the anchor's tail (the last 40, 24 or
+    12 characters, normalized) is the after-beat; the next beat in playback
+    is the before-beat, and its start the trigger, as `place_visual_element`
+    does for a whole paragraph. None when no beat holds the anchor, so the
+    caller falls back to the paragraph.
+    """
+    paragraph = anchor.get("paragraph", -1)
+    tail = _normalize_with_map(anchor.get("text", ""))[0].strip()
+    if not tail:
+        return None
+    candidates = [
+        (k, _normalize_with_map(spans.get(beat_id, ""))[0])
+        for k, (beat_id, sp, _s, _e) in enumerate(seq)
+        if sp == paragraph
+    ]
+    for length in (40, 24, 12):
+        piece = tail[-length:]
+        hit = next((k for k, span in candidates if piece in span), None)
+        if hit is not None:
+            after_beat, _sp, _s, after_end = seq[hit]
+            if hit + 1 < len(seq):
+                before_beat, _sp, before_start, _e = seq[hit + 1]
+                return after_beat, before_beat, before_start
+            return after_beat, None, after_end
+        if len(tail) <= length:
+            break
+    return None
 
 
 # ---- timing accumulation ----------------------------------------------------
@@ -1006,6 +1051,7 @@ def run(
     # chapter_id → [(beat_id, source_paragraph, start_s, end_s)] in playback
     # order, for placing lecture-mode visual elements (DESIGN.md §13.5).
     chapter_matched_seq: dict[str, list[tuple[str, int, float, float]]] = {}
+    beat_spans: dict[str, str] = {}  # beat_id → source_span, for anchored elements
     confidence_counts: dict[str, int] = {
         "span-exact": 0,
         "exact": 0,
@@ -1050,7 +1096,7 @@ def run(
             arc_for_segments: dict[int, str] = {}
             soup_for_arc: dict[str, BeautifulSoup] = {}
             chapter_segments: list[_NodeSegment] = []
-            chapter_images: list[tuple[int, str, str]] = []  # (master_pos, src, arc)
+            chapter_images: list[tuple[int, str, str, str]] = []  # (master_pos, src, arc, alt)
             master_parts: list[str] = []
             master_cursor = 0
             for stem in stems:
@@ -1079,8 +1125,9 @@ def run(
                 for im in local_images:
                     if owners and owners.get(id(im.node), chapter_id) != chapter_id:
                         continue  # another chapter's section of this page
+                    alt = im.node.get("alt", "") if im.node is not None else ""
                     chapter_images.append(
-                        (im.shadow_pos + master_cursor, im.src, arcname)
+                        (im.shadow_pos + master_cursor, im.src, arcname, alt)
                     )
                 master_parts.append(local_shadow)
                 master_cursor += len(local_shadow)
@@ -1216,6 +1263,7 @@ def run(
                 chapter_matched_seq.setdefault(chapter_id, []).append(
                     (beat_id, beat.get("source_paragraph", -1), timing[0], timing[1])
                 )
+                beat_spans[beat_id] = beat.get("source_span") or beat.get("text", "")
 
             # ---- Map INLINE images to neighbouring beats --------------------
             # Images embedded directly in the chapter text (rare for LN, but
@@ -1226,7 +1274,7 @@ def run(
             # before_beat_id's start_seconds.
             if chapter_images:
                 by_start = sorted(chapter_matches, key=lambda m: m.shadow_start)
-                for pos, src, arcname in chapter_images:
+                for pos, src, arcname, alt in chapter_images:
                     after_beat = None
                     for m in by_start:
                         if m.shadow_end <= pos:
@@ -1256,6 +1304,7 @@ def run(
                         "after_beat_id": after_beat,
                         "before_beat_id": before_beat,
                         "trigger_seconds": before_timing,
+                        **({"alt": alt} if alt else {}),
                     })
 
             # Wrap matches in their respective XHTMLs. _wrap_matches only acts
@@ -1376,7 +1425,9 @@ def run(
         cid = ve.get("chapter_id", "")
         after_p = ve.get("after_paragraph", -1)
         seq = chapter_matched_seq.get(cid, [])
-        after_beat, before_beat, trigger = place_visual_element(after_p, seq)
+        after_beat, before_beat, trigger = (
+            place_at_anchor(ve["anchor"], seq, beat_spans) if ve.get("anchor") else None
+        ) or place_visual_element(after_p, seq)
         ingest_visual_elements.append({
             "kind": ve.get("kind", ""),
             "src": ve.get("src", ""),
@@ -1387,6 +1438,8 @@ def run(
             "after_beat_id": after_beat,
             "before_beat_id": before_beat,
             "trigger_seconds": trigger,
+            # A note's plain text and number (`ingest-pdf`).
+            **{k: ve[k] for k in ("text", "label") if ve.get(k)},
         })
 
     # Unified visual-elements list (§13.5): illustrations discovered by walking

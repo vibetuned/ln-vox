@@ -6,19 +6,48 @@ One XHTML per chapter, `<h1>` title + one `<p>` per paragraph: exactly what
 text they were rendered from. An optional cover gets its own spine page and
 the EPUB 3 `cover-image` property. A nav document plus an NCX keeps EPUB 2
 readers happy. Standard library only.
+
+A chapter may also carry figures — a `<figure>` with the picture, between
+paragraphs, which Stage 6 places like any inline illustration — and notes:
+an empty `noteref` link where the marker stood (a stylesheet draws the
+number, so the paragraph's text runs on unbroken for the sync) pointing to
+the chapter's endnotes. Neither adds a `<p>`, so the read-back stays exact.
 """
 
 from __future__ import annotations
 
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape, quoteattr
 
 GENERATOR = "ln-vox"
 _MEDIA_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+_STYLESHEET = "styles/lnvox.css"
+_CSS = """\
+a.lnvox-noteref::after { content: attr(data-note); vertical-align: super; font-size: 0.7em; line-height: 0; }
+figure.lnvox-figure { margin: 1.2em 0; text-align: center; }
+figure.lnvox-figure img { max-width: 100%; height: auto; }
+section.lnvox-notes { margin-top: 2em; padding-top: 0.5em; border-top: 1px solid #999; font-size: 0.85em; }
+aside.lnvox-note { margin: 0.6em 0; }
+"""
+
+
+@dataclass
+class EpubFigure:
+    image: Path  # the picture to package
+    before: int  # the paragraph it goes before; len(paragraphs) = after the last
+    alt: str = ""  # its label and caption
+
+
+@dataclass
+class EpubNote:
+    paragraph: int  # the paragraph its marker stood in
+    offset: int  # where in that paragraph's text
+    label: str  # its number, as printed
+    paragraphs: list[str]
 
 
 @dataclass
@@ -26,17 +55,67 @@ class EpubChapter:
     stem: str  # XHTML file stem, e.g. "chapter01" — `.epub_meta.json` source_parts
     title: str
     paragraphs: list[str]
+    figures: list[EpubFigure] = field(default_factory=list)
+    notes: list[EpubNote] = field(default_factory=list)
 
 
-def _xhtml(title: str, body: str, lang: str) -> str:
+def _xhtml(title: str, body: str, lang: str, css: str | None = None) -> str:
+    link = f'<link rel="stylesheet" type="text/css" href="{css}"/>' if css else ""
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<!DOCTYPE html>\n'
         f'<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" '
         f'lang={quoteattr(lang)} xml:lang={quoteattr(lang)}>\n'
-        f"<head><meta charset=\"utf-8\"/><title>{escape(title)}</title></head>\n"
+        f"<head><meta charset=\"utf-8\"/><title>{escape(title)}</title>{link}</head>\n"
         f"<body>\n{body}\n</body>\n</html>\n"
     )
+
+
+def _with_noterefs(text: str, notes: list[tuple[int, EpubNote]], stem: str) -> str:
+    """A paragraph's text with an empty noteref link where each marker stood."""
+    parts, pos = [], 0
+    for k, note in sorted(notes, key=lambda kn: kn[1].offset):
+        at = min(max(note.offset, pos), len(text))
+        parts.append(escape(text[pos:at]))
+        parts.append(
+            f'<a epub:type="noteref" role="doc-noteref" class="lnvox-noteref" id="{stem}-ref{k}" '
+            f'href="#{stem}-note{k}" data-note={quoteattr(note.label)}></a>'
+        )
+        pos = at
+    parts.append(escape(text[pos:]))
+    return "".join(parts)
+
+
+def _chapter_body(ch: EpubChapter, href_of: dict[Path, str]) -> str:
+    def figure(f: EpubFigure) -> str:
+        return (
+            f'<figure class="lnvox-figure"><img src="../{href_of[f.image]}" '
+            f"alt={quoteattr(f.alt)}/></figure>"
+        )
+
+    out = [f"<h1>{escape(ch.title)}</h1>"]
+    figures = sorted(ch.figures, key=lambda f: f.before)
+    numbered = list(enumerate(ch.notes, start=1))
+    shown = 0
+    for i, text in enumerate(ch.paragraphs):
+        while shown < len(figures) and figures[shown].before <= i:
+            out.append(figure(figures[shown]))
+            shown += 1
+        out.append(f"<p>{_with_noterefs(text, [kn for kn in numbered if kn[1].paragraph == i], ch.stem)}</p>")
+    out += [figure(f) for f in figures[shown:]]
+    if numbered:
+        out.append('<section epub:type="endnotes" role="doc-endnotes" class="lnvox-notes">')
+        for k, note in numbered:
+            back = f'<a href="#{ch.stem}-ref{k}" role="doc-backlink">{escape(note.label)}.</a> '
+            body = "".join(
+                f"<div>{back if j == 0 else ''}{escape(p)}</div>" for j, p in enumerate(note.paragraphs or [""])
+            )
+            out.append(
+                f'<aside epub:type="endnote" role="doc-endnote" class="lnvox-note" id="{ch.stem}-note{k}">'
+                f"{body}</aside>"
+            )
+        out.append("</section>")
+    return "\n".join(out)
 
 
 def is_generated(epub_path: Path) -> bool:
@@ -57,7 +136,10 @@ def write_epub(
     chapters: list[EpubChapter],
     cover: Path | None = None,
     language: str = "en",
+    extra_images: list[Path] = (),
 ) -> None:
+    """`extra_images` are packaged without being shown in the text — a
+    note's rendering, which the reader app takes from the sync manifest."""
     lang = language or "en"
     book_id = f"urn:uuid:{uuid.uuid4()}"
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -83,11 +165,25 @@ def write_epub(
             lang,
         )
 
+    # Figures and note renderings: packaged under images/ by file name.
+    href_of: dict[Path, str] = {}
+    pictures = [f.image for ch in chapters for f in ch.figures] + list(extra_images)
+    for n, image in enumerate(dict.fromkeys(pictures), start=1):
+        href = f"images/{image.name}"
+        href_of[image] = href
+        files[f"OEBPS/{href}"] = image.read_bytes()
+        manifest.append(f'<item id="img{n}" href="{href}" media-type="{_MEDIA_TYPES[image.suffix.lower()]}"/>')
+    styled = any(ch.figures or ch.notes for ch in chapters)
+    if styled:
+        files[f"OEBPS/{_STYLESHEET}"] = _CSS
+        manifest.append(f'<item id="css" href="{_STYLESHEET}" media-type="text/css"/>')
+
     nav_items, ncx_points = [], []
     for i, ch in enumerate(chapters, start=1):
         href = f"text/{ch.stem}.xhtml"
-        body = f"<h1>{escape(ch.title)}</h1>\n" + "\n".join(f"<p>{escape(p)}</p>" for p in ch.paragraphs)
-        files[f"OEBPS/{href}"] = _xhtml(ch.title, body, lang)
+        files[f"OEBPS/{href}"] = _xhtml(
+            ch.title, _chapter_body(ch, href_of), lang, f"../{_STYLESHEET}" if styled else None
+        )
         manifest.append(f'<item id="{ch.stem}" href="{href}" media-type="application/xhtml+xml"/>')
         spine.append(f'<itemref idref="{ch.stem}"/>')
         nav_items.append(f'<li><a href="{href}">{escape(ch.title)}</a></li>')
