@@ -4,7 +4,9 @@ All character names below are invented — no real book content.
 """
 
 from lnvox.llm.schemas import Character
-from lnvox.voices.matcher import PriorCastIndex, cast_book
+import json
+
+from lnvox.voices.matcher import PriorCastIndex, _vary, cast_book
 from lnvox.voices.schema import (
     BookCasting,
     CharacterCasting,
@@ -366,9 +368,97 @@ def test_no_offered_id_falls_back_to_first_candidate_and_records_it():
     client = StubClient(VoiceTarget(gender="male", age_band="teen"), ["cv_nope"])
     result = cast_book(client, "b", [_char("Aldric")], _series_bank())
     aldric = {c.character_name: c for c in result.castings}["Aldric"]
-    assert aldric.assigned_clip_id == "m1"          # first in filter order
-    assert aldric.ranked[0].clip_id == "m1" and aldric.ranked[0].score == 0.0
+    first = _vary([c for c in _series_bank().clips if c.gender == "male"], "|b|Aldric", set())[0].id
+    assert aldric.assigned_clip_id == first         # first in this character's order
+    assert aldric.ranked[0].clip_id == first and aldric.ranked[0].score == 0.0
     assert "fell back" in aldric.audit_note
+
+
+# --- Variety: a fresh cast spreads over the bank -------------------------------
+
+
+class FirstOfferedClient(StubClient):
+    """An LLM with pure position bias: ranks the candidates as offered."""
+
+    def __init__(self, target: VoiceTarget):
+        super().__init__(target, [])
+        self.offered: list[list[str]] = []
+
+    def render(self, template, **kwargs):
+        if "candidates_json" in kwargs:
+            self.offered.append([c["id"] for c in json.loads(kwargs["candidates_json"])])
+        return super().render(template, **kwargs)
+
+    def structured(self, *, system, user, schema, max_tokens):
+        if schema is VoiceTarget:
+            return self.target
+        return MatchResult(
+            ranked_choices=[_RankedChoice(clip_id=i, score=0.9, reason="first") for i in self.offered[-1][:3]]
+        )
+
+
+def _boys(n):
+    return [_char(f"Squire {i}") for i in range(n)]
+
+
+def test_fresh_casts_take_free_clips_first():
+    bank = Voicebank(clips=[_clip(f"m{i}") for i in range(6)])
+    client = FirstOfferedClient(VoiceTarget(gender="male", age_band="teen"))
+    result = cast_book(client, "b", _boys(6), bank)
+    clips = [c.assigned_clip_id for c in result.castings if c.character_name != "Narrator"]
+    assert sorted(clips) == [f"m{i}" for i in range(6)]  # six characters, six voices
+    # Each character saw the bank in an order of its own.
+    assert len({tuple(o) for o in client.offered}) > 1
+
+
+def test_an_llm_favourite_voices_one_character_only():
+    # What casting a real book showed: three clips the ranker puts first
+    # whenever they're offered. Without taking them off the list once used,
+    # four characters ended up on one voice.
+    favourites = ["m0", "m1", "m2"]
+
+    class FavouriteClient(FirstOfferedClient):
+        def structured(self, *, system, user, schema, max_tokens):
+            if schema is VoiceTarget:
+                return self.target
+            offered = self.offered[-1]
+            ranked = [f for f in favourites if f in offered] + [i for i in offered if i not in favourites]
+            return MatchResult(ranked_choices=[_RankedChoice(clip_id=i, score=0.9, reason="fav") for i in ranked[:3]])
+
+    bank = Voicebank(clips=[_clip(f"m{i}") for i in range(10)])
+    result = cast_book(FavouriteClient(VoiceTarget(gender="male", age_band="teen")), "b", _boys(8), bank)
+    clips = [c.assigned_clip_id for c in result.castings if c.character_name != "Narrator"]
+    assert len(set(clips)) == 8
+
+
+def test_a_clip_is_shared_only_when_the_bank_runs_out():
+    bank = Voicebank(clips=[_clip("m1"), _clip("m2")])
+    result = cast_book(FirstOfferedClient(VoiceTarget(gender="male", age_band="teen")), "b", _boys(3), bank)
+    clips = [c.assigned_clip_id for c in result.castings if c.character_name != "Narrator"]
+    assert sorted(clips[:2]) == ["m1", "m2"] and clips[2] in ("m1", "m2")
+
+
+def test_clips_of_earlier_volumes_and_locks_are_kept_free():
+    bank = Voicebank(clips=[_clip("m1"), _clip("m2"), _clip("m3")])
+    prior = PriorCastIndex()
+    prior.add_volume(_volume("s/volume-01", [_casting("Old Knight", "m1")]))
+    existing = _volume("s/volume-02", [_casting("Hand Picked", "m2").model_copy(update={"locked": True})])
+    result = cast_book(
+        FirstOfferedClient(VoiceTarget(gender="male", age_band="teen")), "s/volume-02",
+        [_char("Newcomer")], bank, prior_index=prior, existing=existing,
+    )
+    assert {c.character_name: c.assigned_clip_id for c in result.castings}["Newcomer"] == "m3"
+
+
+def test_the_seed_changes_the_draw_and_repeats_it():
+    bank = Voicebank(clips=[_clip(f"m{i}") for i in range(8)])
+
+    def first_pick(seed):
+        client = FirstOfferedClient(VoiceTarget(gender="male", age_band="teen"))
+        return cast_book(client, "b", [_char("Aldric")], bank, seed=seed).castings[0].assigned_clip_id
+
+    assert first_pick("") == first_pick("")
+    assert len({first_pick(str(s)) for s in range(6)}) > 1
 
 
 # --- Narrator auto-cast relaxation ladder ------------------------------------

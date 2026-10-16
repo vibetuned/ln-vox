@@ -5,10 +5,10 @@ group per chapter:
 
     Notes                          ← the section's title (skipped)
     Chapter 1                      ← a group header, in another font
-    1. I believe that Leonard …    ← a note: "N." at the left margin
-       Experimental investigations …   ← an indented paragraph of the same note
+    1. The first note's text …     ← a note: "N." at the left margin
+       Its second paragraph …       ← an indented paragraph of the same note
     2. The pertinent research …
-    382 Notes                      ← a running head (skipped)
+    212 Notes                      ← a running head (skipped)
 
 `parse_notes` reads that into `Note`s, with the page band each note covers
 so it can be rendered; `group_key` / `chapter_key` pair a group with the
@@ -105,7 +105,7 @@ def parse_notes(pages: list[tuple[int, list[Fragment]]], title: str = "Notes") -
     above: _Line | None = None  # the previous line of note text
     for ln in lines:
         if family not in ln.families:
-            # The section's title, a running head ("382 Notes") or the header
+            # The section's title, a running head ("212 Notes") or the header
             # of the next chapter's notes — which only a note "1." confirms.
             if _key(ln.text) != _key(title):
                 header = " ".join(ln.text.split())

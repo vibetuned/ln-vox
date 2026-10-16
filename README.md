@@ -297,13 +297,13 @@ the EPUB with the audio. Name the chapters by page range; pages outside every
 range (front matter, contents, jacket) are skipped:
 
 ```bash
-uv run --with "pypdf[image]" lnvox ingest-pdf book.pdf novels/open-mind/volume-01 \
-    --chapter "5-12:Atomic Explosives" \
-    --chapter "13-20:Atomic Weapons and American Policy" \
-    --title "The Open Mind" --author "J. Robert Oppenheimer"
-# → novels/open-mind/volume-01/*.txt + images/cover.jpg, epubs/open-mind/volume-01.epub
+uv run --with "pypdf[image]" lnvox ingest-pdf book.pdf novels/my-essays/volume-01 \
+    --chapter "5-12:The First Lecture" \
+    --chapter "13-20:The Second Lecture" \
+    --title "Collected Lectures" --author "A. Author"
+# → novels/my-essays/volume-01/*.txt + images/cover.jpg, epubs/my-essays/volume-01.epub
 
-./scripts/run_pipeline.sh open-mind/volume-01 --mode lecture --book-title "The Open Mind"
+./scripts/run_pipeline.sh my-essays/volume-01 --mode lecture --book-title "Collected Lectures"
 ```
 
 Without `--chapter` the PDF's bookmarks become chapters, else the whole
@@ -325,7 +325,7 @@ EPUB and the m4b). Rendering needs one more overlay:
 
 ```bash
 uv run --with "pypdf[image]" --with pypdfium2 lnvox ingest-pdf book.pdf \
-    novels/sweet-anticipation/volume-01 --pages 8-395 --font-filter
+    novels/my-textbook/volume-01 --pages 9-320 --font-filter
 ```
 
 ---
@@ -502,6 +502,29 @@ without new direction calls. `--regen-profiles` forces *every* descriptor
 (and so a whole-book re-render in s4) — only for when you changed the
 descriptor prompt itself. Stage 4 without `--staged` is the monolithic path;
 run it under `./scripts/s4_retry.sh <book>` (see [s4 stability](#s4-stability)).
+
+### Rendering Stage 4 on another machine
+
+Stage 4 can run on a GPU box reached over SSH — a DGX Spark, a cloud
+instance — while this machine sleeps or shuts down. Add `--remote-tts
+<host>`: the launcher runs the LLM phase here, syncs the book's inputs and
+the voicebank to the box, starts the render there detached, and stops. Run
+the same command again with `--skip-llm` to see its progress — and once it's
+done, to fetch `05_audio/` and go on with the mix and sync here:
+
+```bash
+./scripts/run_pipeline.sh my-book/volume-01 --mode lecture --narrator-clip manual_narrator \
+    --remote-tts gpu-box                  # LLM phase here, Stage 4 there
+./scripts/run_pipeline.sh my-book/volume-01 --mode lecture --narrator-clip manual_narrator \
+    --remote-tts gpu-box --skip-llm       # progress … then fetch, mix, sync
+```
+
+`uv run lnvox remote-tts <book>` does the remote part on its own
+(`--status`, `--pull`, `--stop`, `--restart`, `--wait`). Books launched while
+another renders are **queued** on the box and start on their own, one after
+the other. The box needs key-based SSH, git, tar, python3 and uv; the first
+render installs the TTS environment and Dramabox there. Docs site: *Guides →
+Rendering on another machine*.
 
 ---
 

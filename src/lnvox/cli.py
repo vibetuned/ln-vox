@@ -242,7 +242,7 @@ def ingest_epub(
 @app.command(name="ingest-pdf")
 def ingest_pdf(
     pdf_path: Path = typer.Argument(..., exists=True, dir_okay=False, file_okay=True),
-    output_dir: Path = typer.Argument(..., help="Destination folder (e.g. novels/open-mind/volume-01)"),
+    output_dir: Path = typer.Argument(..., help="Destination folder (e.g. novels/my-book/volume-01)"),
     chapter: Optional[list[str]] = typer.Option(
         None,
         "--chapter",
@@ -1199,6 +1199,76 @@ def stage4_phase(
     )
 
 
+@app.command(name="remote-tts")
+def remote_tts(
+    book_id: str,
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        help=(
+            "SSH host of the render box: an ~/.ssh/config alias or user@host, with key "
+            "login. Remembered per book; default $LNVOX_REMOTE_HOST."
+        ),
+    ),
+    remote_dir: Optional[str] = typer.Option(
+        None,
+        "--remote-dir",
+        help="The ln-vox checkout on the box, relative to its home or absolute (default: ln-vox; cloned when missing).",
+    ),
+    branch: Optional[str] = typer.Option(
+        None, "--branch", help="Branch the box checks out (default: this checkout's)."
+    ),
+    status: bool = typer.Option(False, "--status", help="Only show the render's state and progress."),
+    pull: bool = typer.Option(False, "--pull", help="While rendering: fetch the chapters finished so far."),
+    restart: bool = typer.Option(
+        False, "--restart", help="Sync and launch again after a failure, a stop, or a finished render."
+    ),
+    stop: bool = typer.Option(False, "--stop", help="Stop the render on the box."),
+    wait: bool = typer.Option(
+        False, "--wait", help="Stay connected, reporting every --interval seconds; fetch the render when it's done."
+    ),
+    interval: int = typer.Option(300, "--interval", help="Seconds between --wait reports."),
+    no_git: bool = typer.Option(False, "--no-git", help="Don't clone or update the box's checkout."),
+    log_lines: int = typer.Option(12, "--log-lines", help="How much of the job's log to show."),
+):
+    """Render Stage 4 on a GPU box over SSH, e.g. a DGX Spark or a cloud instance.
+
+    Run it once the LLM stages are done here (the launcher with --skip-tts),
+    then as often as you like — this machine can shut down in between. Each
+    run does what the book's state calls for: the first clones or updates
+    the box's checkout, mirrors the book's 00-04 artifacts and the voicebank
+    there, and starts Stage 4 detached; later runs show its progress, and
+    once it's done fetch 05_audio so Stage 5 and 6 run here. Exit code: 0
+    when the render is here, 3 while it renders, 1 when it failed or was
+    stopped (--restart to launch again).
+    """
+    from lnvox.remote import Options, RemoteError
+    from lnvox.remote import remote_tts as run_remote
+
+    settings = Settings()
+    try:
+        code = run_remote(
+            book_id,
+            artifacts_dir=settings.artifacts_dir,
+            voicebank=settings.voicebank,
+            host=host,
+            repo=remote_dir,
+            branch=branch,
+            options=Options(
+                status=status, pull=pull, restart=restart, stop=stop, wait=wait,
+                interval=interval, git=not no_git, log_lines=log_lines,
+            ),
+            say=lambda m: console.print(m, markup=False, highlight=False),
+        )
+    except RemoteError as e:
+        console.print(f"[red]{e}[/]", highlight=False)
+        raise typer.Exit(1)
+    except KeyboardInterrupt:
+        console.print("[dim]Left it rendering; run the command again to check on it.[/]")
+        raise typer.Exit(3)
+    raise typer.Exit(code)
+
+
 @app.command(name="s5")
 def stage5(
     book_id: str,
@@ -1861,6 +1931,13 @@ def voice_cast(
         "their clip from this volume's existing 04_voice_assignments.json. "
         "Entries marked \"locked\": true are still kept.",
     ),
+    seed: str = typer.Option(
+        "",
+        "--seed",
+        envvar="LNVOX_CAST_SEED",
+        help="Varies the order fresh casts see the voicebank in, for another draw "
+        "of voices (default: one fixed per book and character, so re-casts repeat).",
+    ),
 ):
     """LLM-match each character to a voicebank clip; write 04_voice_assignments.json.
 
@@ -2061,6 +2138,7 @@ def voice_cast(
         existing=existing,
         narrator_clip_override=narrator_clip,
         on_character_done=_progress,
+        seed=seed,
     )
 
     out_path = out_dir / "04_voice_assignments.json"

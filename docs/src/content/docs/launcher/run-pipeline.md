@@ -33,6 +33,7 @@ The internals — each shell function, the retry wrapper and the server lifecycl
 | `--max-model-len <N>` | the serve script's | Context window, for the serve script **and** the client's output budgets: exported as `LNVOX_LLM_MAX_LEN`, `LNVOX_LLM_MAX_MODEL_LEN` and `LNVOX_LLM__MAX_MODEL_LEN`. Must be a positive integer (exit 2 otherwise). mlx-lm has no such knob. |
 | `--skip-llm` | off | Skip ingest, s1–s3 and voice cast (assume done). |
 | `--skip-tts` | off | Skip s4. |
+| `--remote-tts <host>` | — | Render s4 on another machine over SSH with [`lnvox remote-tts`](/guides/remote-tts/): the first run launches it there (or queues it behind another book) and exits 0; run again with `--skip-llm` to check on it, and once it's done to fetch `05_audio` and go on with s5/s6 here. Dramabox only; contradicts `--skip-tts`. |
 | `--staged-tts` | on (`$LNVOX_S4_STAGED`, default `1`) | Render s4 with the staged Dramabox pipeline. Dramabox only. Set `LNVOX_S4_STAGED=0` for the monolithic path (refused on Apple Silicon — see [Apple Silicon](/guides/apple-silicon/)). |
 | `--tts-backend <name>` | `dramabox` (`$LNVOX_TTS_BACKEND`) | `dramabox` (per beat → `05_audio/`) or `vibevoice` (multi-speaker sessions → `05_audio_v2/`; s5 mixes with `--v2`, s6 is skipped). |
 | `--skip-mix` | off | Skip s5. |
@@ -114,6 +115,7 @@ Sleeps 5 s (managed server only) so VRAM is actually released, then one of:
 
 | Condition | Env prep | Command |
 | --- | --- | --- |
+| `--remote-tts <host>` | on the box | `uv run lnvox remote-tts <book> --host <host>` ([guide](/guides/remote-tts/)). Exit 3 — launched, queued or still rendering — ends the launcher with exit 0 and a reminder to come back; exit 0 — the render is fetched — goes on to the mix; anything else is the launcher's exit status. No 5 s wait |
 | `--tts-backend vibevoice` | `prepare_vibevoice_env` | `MAX_ATTEMPTS=$MAX_RETRIES LNVOX_TTS_BACKEND=vibevoice ./scripts/s4_retry.sh <book>` |
 | dramabox, staged (default) | `prepare_tts_env` | `uv run lnvox s4 <book> --staged` — no outer retry; the staged driver owns crash recovery. A failure aborts the launcher (exit 1, or 2 for a refusal) |
 | dramabox, `LNVOX_S4_STAGED=0` | `prepare_tts_env` | `MAX_ATTEMPTS=$MAX_RETRIES ./scripts/s4_retry.sh <book>` |

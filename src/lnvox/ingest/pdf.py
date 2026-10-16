@@ -3,7 +3,7 @@
 Writes the layout `lnvox ingest` reads — the same contract as `ingest-epub`:
 
     <output_dir>/
-        01-atomic-explosives.txt     (first line = chapter title)
+        01-the-first-lecture.txt     (first line = chapter title)
         02-...
         images/cover.jpg             (the cover page's image)
         .epub_meta.json              (title, authors, cover, chapter → page /
@@ -147,8 +147,8 @@ def _running_keys(pages: list[list[str]]) -> set[str]:
     """Keys of lines that recur at the page edges: running heads and feet.
 
     Counted per chapter, since a book's recto head is usually the chapter
-    title. Digits are ignored by the key, so "12 THE OPEN MIND" and
-    "THE OPEN MIND 13" count as one head.
+    title. Digits are ignored by the key, so "12 COLLECTED LECTURES"
+    and "COLLECTED LECTURES 13" count as one head.
     """
     counts: dict[str, int] = {}
     for lines in pages:
@@ -173,7 +173,7 @@ def _trim_edges(lines: list[str], running: set[str]) -> tuple[list[str], int | N
 
 
 # A bookmark title often carries a number or a date the page doesn't print:
-# "I. Atomic Explosives (May 1946)" over a page headed "Atomic Explosives".
+# "I. The First Lecture (May 1950)" over a page headed "The First Lecture".
 _TITLE_NUMBERING_RE = re.compile(r"^\s*(?:chapter\s+)?(?:[ivxlcdm]+|\d+)[.:)\-]?\s+", re.IGNORECASE)
 _TITLE_TRAILER_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
@@ -181,7 +181,7 @@ _TITLE_TRAILER_RE = re.compile(r"\s*\([^)]*\)\s*$")
 def _drop_title_lines(lines: list[str], title: str) -> list[str]:
     """Drop the chapter title printed at the top of its first page.
 
-    Fuzzy, so an OCR'd "Atomie Explosives" still matches the title, and the
+    Fuzzy, so an OCR'd "The Flrst Lecture" still matches the title, and the
     title may wrap over several lines. Matched with and without the title's
     leading numbering and trailing parenthetical.
     """
@@ -291,7 +291,7 @@ _FIG_LINE_RE = re.compile(rf"(?:\s*{_FIG_OPEN}[^{_FIG_CLOSE}]*{_FIG_CLOSE})+\s*"
 class Fragment(NamedTuple):
     """A run of text pypdf reports under one font state."""
 
-    font: str  # PostScript name, subset prefix stripped ("StoneSerif-Italic")
+    font: str  # PostScript name, subset prefix stripped ("SourceSerif-Italic")
     size: float  # effective size, points
     x: float  # start of the run
     y: float  # baseline
@@ -317,7 +317,7 @@ _NOTE_MARKER_RE = re.compile(
 
 
 def _family(font: str) -> str:
-    """'StoneSerif-Italic', 'TimesNewRomanPS-BoldMT', 'Arial,Bold' → the family."""
+    """'SourceSerif-Italic', 'TimesNewRomanPS-BoldMT', 'Arial,Bold' → the family."""
     return _FONT_SUFFIX_RE.sub("", re.split(r"[-,]", font, maxsplit=1)[0])
 
 
@@ -730,13 +730,13 @@ def _split_marks(body: str) -> tuple[list[str], list[_Mark]]:
 
 # A marker the first pass skips, safe to take once its note's number is known
 # and it sits between its neighbours' markers: after any sentence end
-# ("middle C.1 Engineers", "G#.7 In", "AP. 26 If", "table 9.1. 5 In"), or
-# after a closing quote mid-sentence ("“unsettled yearning” 9 can be").
+# ("the letter A.1 Others", "F#.7 In", "the US. 26 If", "table 3.1. 5 In"),
+# or after a closing quote mid-sentence ("a “quiet ending” 9 can be").
 _LATE_MARKER_RE = re.compile(
     r"(?<=[.?!\"'’”)])[ \t]?(\d{1,3})(?=[ \t]+[\"“(A-Z]|[ \t]*(?:\n|$))"
     r"|(?<=[\"'’”])[ \t]?(\d{1,3})(?=[ \t]+[a-z])"
 )
-# Last resort, after a comma or colon ("research,13 sensory", "humor:14 1.").
+# Last resort, after a comma or colon ("as studies show,13 memory", "these:14 1.").
 _LOOSE_MARKER_RE = re.compile(r"(?<=[,;:])[ \t]?(\d{1,3})(?=[ \t]+[a-z\d]|[ \t]*\n|$)")
 
 
@@ -784,7 +784,7 @@ def _resolve_markers(body: str, notes: dict | None, used: set[int]) -> tuple[str
 
 
 _LABEL_RE = re.compile(r"(figure|fig\.|table|example|plate|map|chart)s?\s+(\d+(?:\.\d+)*[a-z]?)", re.IGNORECASE)
-# A mention in the text: "Figure 2.1", "figures 4.1 and 4.2", "Tables 14.3a–14.3b".
+# A mention in the text: "Figure 2.1", "figures 4.1 and 4.2", "Tables 3.2a–3.2b".
 _REFERENCE_RE = re.compile(
     r"\b(figures?|figs?\.|tables?|examples?|plates?|maps?|charts?)\s+"
     r"(\d+(?:\.\d+)*[a-z]?(?:\s*(?:,|and|&|or|to|-|–)\s*\d+(?:\.\d+)*[a-z]?)*)",

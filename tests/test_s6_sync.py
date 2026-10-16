@@ -74,31 +74,31 @@ def test_shadow_keeps_single_spaces_around_inline_elements():
     # text nodes; the gap between nodes must not double the space after it,
     # or the beat's verbatim span never matches exactly.
     soup = BeautifulSoup(
-        '<html><body><p>It was universal.<a epub:type="noteref" href="#n1"></a> Ronald '
-        "knew it as <i>declination</i> too.</p></body></html>",
+        '<html><body><p>The gate was shut.<a epub:type="noteref" href="#n1"></a> Nobody '
+        "knew it was <i>locked</i> too.</p></body></html>",
         "html.parser",
     )
     shadow, segments, _ = _build_shadow(soup)
-    assert "it was universal. ronald knew it as declination too." in shadow, shadow
+    assert "the gate was shut. nobody knew it was locked too." in shadow, shadow
     # The dropped space is simply not mapped: offsets still point into the node.
     seg = segments[1]
-    assert str(seg.node)[seg.norm_to_orig[0]] == "R"
+    assert str(seg.node)[seg.norm_to_orig[0]] == "N"
 
 
 def test_place_at_anchor_follows_the_beat_that_reads_the_marker():
     seq = [("b0", 3, 0.0, 4.0), ("b1", 3, 4.5, 9.0), ("b2", 4, 10.0, 12.0)]
     spans = {
-        "b0": "Surprising people for fun appears to be a cross-cultural universal.",
-        "b1": "Ronald Simons has documented many instances of “recreational” surprise.",
-        "b2": "Most cultures have games of surprise.",
+        "b0": "The keepers watched the gate from dusk until the small hours.",
+        "b1": "Nobody came, and the lantern’s “last light” burned until dawn.",
+        "b2": "At noon the traveller left the city.",
     }
-    anchor = {"paragraph": 3, "text": "appears to be a cross-cultural universal."}
+    anchor = {"paragraph": 3, "text": "watched the gate from dusk until the small hours."}
     assert place_at_anchor(anchor, seq, spans) == ("b0", "b1", 4.5)
     # The paragraph's last beat: shown as it ends — no later beat in the paragraph.
-    anchor = {"paragraph": 3, "text": "many instances of “recreational” surprise."}
+    anchor = {"paragraph": 3, "text": "the lantern’s “last light” burned until dawn."}
     assert place_at_anchor(anchor, seq, spans) == ("b1", "b2", 10.0)
     # Not in that paragraph's beats → None, so the caller places by paragraph.
-    assert place_at_anchor({"paragraph": 4, "text": "cross-cultural universal."}, seq, spans) is None
+    assert place_at_anchor({"paragraph": 4, "text": "until the small hours."}, seq, spans) is None
     assert place_visual_element(3, seq) == ("b1", "b2", 10.0)
 
 

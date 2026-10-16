@@ -46,7 +46,8 @@ _SKIP_STEM_PATTERNS = (
     re.compile(r"^toc", re.IGNORECASE),
     re.compile(r"^tocimg", re.IGNORECASE),
     re.compile(r"^copyright", re.IGNORECASE),
-    re.compile(r"^signup", re.IGNORECASE),
+    re.compile(r"^(?:newsletter[_-]?)?sign[_-]?up", re.IGNORECASE),
+    re.compile(r"^newsletter", re.IGNORECASE),
     re.compile(r"^insert\d+", re.IGNORECASE),
     re.compile(r"^bonus\d+", re.IGNORECASE),
     re.compile(r"^color\d+", re.IGNORECASE),
@@ -54,7 +55,7 @@ _SKIP_STEM_PATTERNS = (
 
 # Recognise chapter base names so chapter1.xhtml + chapter1_1.xhtml are merged.
 # A chapter's continuation files: `chapter1_1`, or a letter suffix
-# (`chapter007b`, `chapter003d` — Yen Press splits a chapter at each
+# (`chapter007b`, `chapter003d` — some publishers split a chapter at each
 # illustration, mid-scene).
 _CHAPTER_BASE_RE = re.compile(
     r"^(chapter\d+|prologue|epilogue|afterword|interlude\d+|intro|preface)(?:_\d+|[a-z])?$",

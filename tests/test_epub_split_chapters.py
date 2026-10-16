@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from lnvox.ingest.epub import _resolve_href, _split_page_sections, extract_epub
+from lnvox.ingest.epub import _is_skip, _resolve_href, _split_page_sections, extract_epub
 from lnvox.ingest.text import ingest_folder
 
 
@@ -245,7 +245,7 @@ def test_chapter_files_pad_to_the_count_and_sort_numerically(tmp_path):
 
 
 def test_letter_suffixed_parts_merge_into_their_chapter(tmp_path):
-    """Yen Press splits a chapter at each illustration — chapter003,
+    """Some publishers split a chapter at each illustration — chapter003,
     chapter003b, chapter003d — mid-scene; they're one chapter, like the
     `_1` parts."""
     pages = [
@@ -303,6 +303,14 @@ def test_reextract_ignores_sidecar_paths_outside_the_folder(tmp_path):
     )
     extract_epub(_build_epub(tmp_path, _TWO_CHAPTER_PAGE), out, progress=lambda _m: None)
     assert victim.exists()
+
+
+def test_publisher_newsletter_pages_are_skipped():
+    # A sign-up page is back matter, whatever the publisher calls its file.
+    for stem in ("signup", "newslettersignup", "Newsletter_Signup", "newsletter"):
+        assert _is_skip(stem), stem
+    for stem in ("chapter001", "signature", "afterword"):
+        assert not _is_skip(stem), stem
 
 
 # ---- image references ---------------------------------------------------------------

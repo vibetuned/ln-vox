@@ -45,7 +45,7 @@ uv run lnvox ingest-pdf <PDF_PATH> <OUTPUT_DIR> [OPTIONS]
 | Argument / option | Default | Meaning |
 | --- | --- | --- |
 | `PDF_PATH` | required |  |
-| `OUTPUT_DIR` | required | Destination folder (e.g. novels/open-mind/volume-01) |
+| `OUTPUT_DIR` | required | Destination folder (e.g. novels/my-book/volume-01) |
 | `--chapter` `TEXT` (repeatable) | — | One chapter as FIRST-LAST:Title (1-based, inclusive pages; the title is optional). Repeat per chapter. Default: the PDF's bookmarks, else the whole document as one chapter. |
 | `--pages` `TEXT` | — | Without --chapter: read only pages FIRST-LAST (skip front/back matter). |
 | `--title` `TEXT` | — | Book title for the EPUB (default: the PDF's metadata, else its file name). |
@@ -269,6 +269,29 @@ uv run lnvox sample <BOOK_ID> [OPTIONS]
 | `--title` `TEXT` | — | Title for the sample. If 06_final/<title>.m4b exists, that mix is sliced; otherwise the one sync_manifest.json was timed against. |
 | `--novels-root` `PATH` | `novels` |  |
 
+### `lnvox remote-tts`
+
+Render Stage 4 on a GPU box over SSH, e.g. a DGX Spark or a cloud instance.
+
+```bash
+uv run lnvox remote-tts <BOOK_ID> [OPTIONS]
+```
+
+| Argument / option | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_ID` | required |  |
+| `--host` `TEXT` | — | SSH host of the render box: an ~/.ssh/config alias or user@host, with key login. Remembered per book; default $LNVOX_REMOTE_HOST. |
+| `--remote-dir` `TEXT` | — | The ln-vox checkout on the box, relative to its home or absolute (default: ln-vox; cloned when missing). |
+| `--branch` `TEXT` | — | Branch the box checks out (default: this checkout's). |
+| `--status` | off | Only show the render's state and progress. |
+| `--pull` | off | While rendering: fetch the chapters finished so far. |
+| `--restart` | off | Sync and launch again after a failure, a stop, or a finished render. |
+| `--stop` | off | Stop the render on the box. |
+| `--wait` | off | Stay connected, reporting every --interval seconds; fetch the render when it's done. |
+| `--interval` `INTEGER` | `300` | Seconds between --wait reports. |
+| `--no-git` | off | Don't clone or update the box's checkout. |
+| `--log-lines` `INTEGER` | `12` | How much of the job's log to show. |
+
 ## `lnvox voice` — Voicebank management & casting
 
 ### `lnvox voice seed-cv`
@@ -312,6 +335,7 @@ uv run lnvox voice cast <BOOK_ID> [OPTIONS]
 | `--top-n` `INTEGER` | `3` | Number of candidates to rank per character |
 | `--narrator-clip` `TEXT` | — | Voicebank clip id to use for the Narrator (overrides auto-cast + any prior-volume reuse, but not a Narrator marked "locked": true in this volume's 04_voice_assignments.json). An id not in the voicebank exits 2 before anything is cast. |
 | `--fresh` | off | Re-cast characters with no prior-volume match instead of keeping their clip from this volume's existing 04_voice_assignments.json. Entries marked "locked": true are still kept. |
+| `--seed` `TEXT` | `` | Varies the order fresh casts see the voicebank in, for another draw of voices (default: one fixed per book and character, so re-casts repeat). |
 
 ### `lnvox voice audit`
 

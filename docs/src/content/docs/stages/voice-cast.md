@@ -11,15 +11,16 @@ Stage V picks a reference clip from the voicebank for every character in `01_cha
 ## Command
 
 ```bash
-uv run lnvox voice cast <book_id> [--top-n 3] [--narrator-clip <clip_id>] [--fresh]
+uv run lnvox voice cast <book_id> [--top-n 3] [--narrator-clip <clip_id>] [--fresh] [--seed <text>]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `BOOK_ID` | required | `<series>/<volume-NN>` or a flat id. |
-| `--top-n` | `3` | Number of candidates the ranking LLM returns per character. The first is assigned; the rest are kept in `ranked` for hand review. |
+| `--top-n` | `3` | Number of candidates the ranking LLM returns per character. The first that no other character has is assigned (else the first); all are kept in `ranked` for hand review. |
 | `--narrator-clip` | none | Voicebank clip id for the Narrator. Overrides both the auto-cast and any prior-volume Narrator, but not a Narrator marked `"locked": true` in this volume's `04_voice_assignments.json` (a warning says the flag was ignored). Checked against the bank before anything is cast. |
 | `--fresh` | off | Drop this volume's **unlocked** existing assignments: characters without a prior-volume match are re-cast by the LLM instead of keeping their clip. Locked entries are still kept, and prior-volume reuse still applies. |
+| `--seed <text>` | `$LNVOX_CAST_SEED`, else none | Varies the order in which a fresh cast sees the voicebank — another draw of voices. Without it the order is fixed per book and character, so a re-cast repeats itself. Use with `--fresh` to re-roll a volume's first appearances. |
 
 Environment: `LNVOX_VOICEBANK` selects the bank (default `voicebank`), `LNVOX_ARTIFACTS_DIR` the artifacts root, and the `LNVOX_LLM_*` variables the LLM endpoint (see [environment](/reference/environment/)).
 
@@ -80,7 +81,16 @@ For each character, the first rule that applies decides (details on the [matcher
 4. A usable **unlocked** entry in this volume's own casting → kept, no LLM call.
 5. Gender `nonbinary` / `unknown` → left unassigned (s4 renders descriptor-only).
 6. Narrator otherwise → fixed `female / adult` target with `england` clips first, one ranking call at most.
-7. Everyone else → LLM target inference (gender, age band, accent / timbre / manner keywords) → hard filter on gender + age band → accent-first ordering, capped at 60 candidates → LLM ranking → the top pick **among the candidates offered**. Invented ids are dropped; if none is left, the first candidate is taken and `audit_note` says so.
+7. Everyone else → LLM target inference (gender, age band, accent / timbre / manner keywords) → hard filter on gender + age band → [the free clips in this character's own order](#variety) → accent-first ordering, capped at 24 candidates → LLM ranking → the best-ranked pick **among the candidates offered** that no other character has. Invented ids are dropped; if none is left, the first candidate is taken and `audit_note` says so.
+
+### Variety
+
+The ranking LLM knows a clip only by its accent, one sample sentence and its length. It has favourites — clips whose sentence suits "a man in his forties" wherever they sit in the list — and among the rest it goes by position. With every character seeing the bank in manifest order, cut to the first 60, the same few voices won again and again, a favourite for four characters of one book. Now each fresh cast (the auto-cast Narrator included):
+
+- **leaves out the clips another character keeps** — prior volumes', this volume's current casting, `--narrator-clip`, and each clip assigned earlier in the run — while at least `--top-n` free ones remain; past that it offers them after the free ones and takes the best-ranked free clip it can;
+- **shuffles** what's left in an order of its own — seeded by `--seed`, the book id and the character's name, so a re-run repeats it and another seed draws again — and offers a random **24** of them (accent matches first), so a favourite is often simply not on the list.
+
+A clip is shared only when the bank has no free one of that gender and age. Several characters **can** still have one voice on purpose: lock the same clip on each (the Studio, ComfyUI's Set Voice, or `"locked": true` in the JSON) — locks, `--narrator-clip` and prior-volume matches are never moved. Characters who share scenes and still sound alike are what the [casting audit](/stages/voice-audit/) reports, and `--audit-cast fix` repairs.
 
 ### Cross-volume reuse
 

@@ -1,6 +1,7 @@
 """LLM-driven character → voice clip casting."""
 
 import json
+import random
 import re
 from typing import Iterable
 
@@ -177,6 +178,10 @@ class PriorCastIndex:
     def __len__(self) -> int:
         return len(self._by_key)
 
+    def clip_ids(self) -> set[str]:
+        """Every clip a prior volume assigned."""
+        return {entry.assigned_clip_id for entry, _ in self._by_key.values() if entry.assigned_clip_id}
+
     def lookup(
         self, name: str, aliases: Iterable[str] = (), gender: str = ""
     ) -> CharacterCasting | None:
@@ -245,6 +250,37 @@ def _soft_filter_by_accent(
     preferred = [c for c in candidates if c.accent.lower() in wanted]
     rest = [c for c in candidates if c.accent.lower() not in wanted]
     return (preferred + rest)[:max_keep]
+
+
+def _vary(
+    candidates: list[VoiceClip], seed: str, taken: set[str], min_free: int = 1
+) -> list[VoiceClip]:
+    """The candidates in an order of this character's own — without the
+    clips another character keeps, while at least `min_free` others remain.
+
+    The ranking LLM knows a clip only by its accent and one sample sentence.
+    It has favourites — clips whose sentence suits "a man in his forties"
+    wherever they sit in the list — and between the rest it goes by position.
+    In the manifest's fixed order, every character of one gender and age drew
+    from the same few voices, a favourite several times in one book. So each
+    character gets a seeded shuffle (seed, book and name: stable across
+    re-runs, `--seed` for another draw), cut to `max_candidates_per_char` by
+    the caller — a favourite is often simply not on offer — and a taken clip
+    is offered again only when the bank runs out of free ones (then after
+    them). The accent preference still applies on top
+    (`_soft_filter_by_accent`).
+    """
+    order = list(candidates)
+    random.Random(seed).shuffle(order)
+    free = [c for c in order if c.id not in taken]
+    if len(free) >= min_free:
+        return free
+    return free + [c for c in order if c.id in taken]
+
+
+def _first_free(choices: list[_RankedChoice], taken: set[str]) -> _RankedChoice:
+    """The best-ranked choice no other character has, else the best."""
+    return next((rc for rc in choices if rc.clip_id not in taken), choices[0])
 
 
 def _offered_choices(
@@ -331,11 +367,12 @@ def cast_book(
     *,
     profiles: VoiceProfileList | None = None,
     top_n: int = 3,
-    max_candidates_per_char: int = 60,
+    max_candidates_per_char: int = 24,
     prior_index: PriorCastIndex | None = None,
     existing: BookCasting | None = None,
     narrator_clip_override: str | None = None,
     on_character_done=None,
+    seed: str = "",
 ) -> BookCasting:
     """Cast each character to a voicebank clip.
 
@@ -364,6 +401,10 @@ def cast_book(
             written for a different clip never does.
         narrator_clip_override: Explicit clip id for the Narrator. Overrides
             both the LLM auto-cast AND any prior-volume Narrator assignment.
+        seed: Varies a fresh cast's candidate order (see `_vary`). A fresh
+            cast prefers clips no other character has — in this volume, a
+            prior one or the override — and reuses one only when none fits;
+            locked, override and inherited assignments may share a clip.
 
     Raises:
         ValueError: `narrator_clip_override` is not in the voicebank. Checked
@@ -463,6 +504,13 @@ def cast_book(
         return ""
 
     castings: list[CharacterCasting] = []
+    # Clips other characters keep: earlier volumes', this volume's current
+    # casting, the override — and each one assigned below.
+    taken: set[str] = prior_index.clip_ids() if prior_index else set()
+    if existing is not None:
+        taken |= {c.assigned_clip_id for c in existing.castings if c.assigned_clip_id}
+    if narrator_clip_override:
+        taken.add(narrator_clip_override)
 
     def _emit(
         character: Character,
@@ -481,6 +529,8 @@ def cast_book(
         if note and not casting.audit_note:
             casting.audit_note = note
         castings.append(casting)
+        if casting.assigned_clip_id:
+            taken.add(casting.assigned_clip_id)
         if on_character_done:
             on_character_done(character, casting)
 
@@ -625,6 +675,7 @@ def cast_book(
             if not candidates:
                 relaxation = "any clip"
                 candidates = list(voicebank.clips)
+            candidates = _vary(candidates, f"{seed}|{book_id}|Narrator", taken, top_n)
 
             soft = _soft_filter_by_accent(
                 candidates, primary, max_keep=max_candidates_per_char
@@ -650,7 +701,7 @@ def cast_book(
                     fallback, fb_note = _fallback_choice(ranked, soft)
                     ranked_choices = [fallback]
                     note = "; ".join(filter(None, (note, fb_note)))
-                assigned_clip = clip_by_id[ranked_choices[0].clip_id]
+                assigned_clip = clip_by_id[_first_free(ranked_choices, taken).clip_id]
 
             descriptor = (
                 descriptor_from_clip(assigned_clip)
@@ -679,7 +730,7 @@ def cast_book(
             voice_descriptor=(prof.voice_descriptor if prof else ""),
             profile_accent=(prof.accent if prof else "any"),
         )
-        hard = _hard_filter(voicebank, target)
+        hard = _vary(_hard_filter(voicebank, target), f"{seed}|{book_id}|{character.name}", taken, top_n)
         soft = _soft_filter_by_accent(hard, target, max_keep=max_candidates_per_char)
         ranked = rank_candidates(client, character, target, soft, top_n=top_n)
         ranked_choices = _offered_choices(ranked, soft)
@@ -687,7 +738,7 @@ def cast_book(
             fallback, fb_note = _fallback_choice(ranked, soft)
             ranked_choices = [fallback]
             note = "; ".join(filter(None, (note, fb_note)))
-        assigned = ranked_choices[0].clip_id if ranked_choices else ""
+        assigned = _first_free(ranked_choices, taken).clip_id if ranked_choices else ""
 
         # For the Narrator (auto-cast path), lock in a clip-derived descriptor
         # so s3 doesn't compose a free-text one that contradicts the chosen

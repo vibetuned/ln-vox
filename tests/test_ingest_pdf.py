@@ -193,8 +193,8 @@ def test_font_filter_keeps_the_running_text_and_its_paragraphs():
 
 def test_font_filter_details():
     # Font names: the family, whatever the style suffix.
-    assert {pdf._family(n) for n in ("StoneSerif-Italic", "TimesNewRomanPSMT", "TimesNewRomanPS-BoldMT")} == {
-        "StoneSerif",
+    assert {pdf._family(n) for n in ("SourceSerif-Italic", "TimesNewRomanPSMT", "TimesNewRomanPS-BoldMT")} == {
+        "SourceSerif",
         "TimesNewRoman",
     }
     assert pdf._family("Arial,Bold") == "Arial"
@@ -202,11 +202,11 @@ def test_font_filter_details():
     assert filter_page([F("Sans-Semibold", 11.0, 72, 500, "The Lantern Book")], "Serif", 9.0).strip() == ""
     # Body-size note markers go; abbreviations, years and pitch names stay.
     page = [F("Serif", 9.0, 72, 500, t) for t in (
-        "It was universal. 4 Most agreed (in the 1960s). 12 Then came Op. 27 No. 2,\n",
+        "It was settled. 4 Most agreed (in the 1960s). 12 Then came Op. 27 No. 2,\n",
         "played at p. 12 in 1946. 12 people heard the C4 and the B3. Or so.” 9\n",
     )]
     assert filter_page(page, "Serif", 9.0) == (
-        "It was universal. Most agreed (in the 1960s). Then came Op. 27 No. 2,\n"
+        "It was settled. Most agreed (in the 1960s). Then came Op. 27 No. 2,\n"
         "played at p. 12 in 1946. 12 people heard the C4 and the B3. Or so.”\n"
     )
 
@@ -261,22 +261,22 @@ def test_table_band_runs_from_its_label_down():
 def test_markers_are_claimed_by_notes_or_put_back():
     notes = {4: "n4", 5: "n5", 6: "n6"}
     body = (
-        f"It was universal.{MO}4{MC} Most agreed.{MO} 12{MC} Nobody objected.\n\n"
-        f"The tone was middle C.5 Engineers say so. {FO}p7f0{FC}"
+        f"It was settled.{MO}4{MC} Most agreed.{MO} 12{MC} Nobody objected.\n\n"
+        f"The mark was letter A.5 Others say so. {FO}p7f0{FC}"
     )
     used: set[int] = set()
     body, restored = pdf._resolve_markers(body, notes, used)
     # 4 claimed; 12 has no note, so it was text; 5 found late between its
-    # neighbours ("C." is no lowercase word); 6 appears nowhere.
+    # neighbours ("A." is no lowercase word); 6 appears nowhere.
     assert (used, restored) == ({4, 5}, 1)
     paragraphs, marks = pdf._split_marks(body)
     assert paragraphs == [
-        "It was universal. Most agreed. 12 Nobody objected.",
-        "The tone was middle C. Engineers say so.",
+        "It was settled. Most agreed. 12 Nobody objected.",
+        "The mark was letter A. Others say so.",
     ]
     assert [(m.kind, m.paragraph, m.offset, m.payload.strip()) for m in marks] == [
-        ("note", 0, len("It was universal."), "4"),
-        ("note", 1, len("The tone was middle C."), "5"),
+        ("note", 0, len("It was settled."), "4"),
+        ("note", 1, len("The mark was letter A."), "5"),
         ("figure", 1, len(paragraphs[1]), "p7f0"),
     ]
     # No notes parsed: markers just go.
@@ -285,10 +285,10 @@ def test_markers_are_claimed_by_notes_or_put_back():
 
 def test_first_mentions_and_labels():
     mentions = pdf._first_mentions(
-        ["Nothing here.", "See figure 2.1 and tables 3.1–3.2.", "Table 14.3a shows it; figure 2.1 again."]
+        ["Nothing here.", "See figure 2.1 and tables 3.1–3.2.", "Table 4.2a shows it; figure 2.1 again."]
     )
-    assert mentions == {("figure", "2.1"): 1, ("table", "3.1"): 1, ("table", "3.2"): 1, ("table", "14.3a"): 2}
-    assert pdf._label_key("Table 14.3a") == ("table", "14.3a")
+    assert mentions == {("figure", "2.1"): 1, ("table", "3.1"): 1, ("table", "3.2"): 1, ("table", "4.2a"): 2}
+    assert pdf._label_key("Table 4.2a") == ("table", "4.2a")
     assert pdf._label_key("Fig. 2") == ("figure", "2")
 
 
@@ -305,7 +305,7 @@ NOTES_PAGES = [
         F("Serif", 8.0, 72, 410, "3. A note that continues over the page\n"),
     ]),
     (11, [
-        F("Sans-Semibold", 8.0, 72, 606, "382 Notes\n"),
+        F("Sans-Semibold", 8.0, 72, 606, "212 Notes\n"),
         F("Serif", 8.0, 72, 570, "break, citing a list:\n"),
         F("Serif", 8.0, 72, 558, "12. and more of note 3.\n"),
         F("Serif", 8.0, 72, 540, "11. A stray note, numbered wrong in print.\n"),

@@ -50,6 +50,13 @@
 #     --skip-llm               Skip the LLM phase: ingest, s1..s3 + voice cast
 #                              (assume already done).
 #     --skip-tts               Skip s4 (assume already rendered).
+#     --remote-tts <host>      Render s4 on another machine over SSH (a DGX
+#                              Spark, a cloud box) with `lnvox remote-tts`:
+#                              the first run launches it there and stops;
+#                              run again (with --skip-llm) to see its
+#                              progress, or — once it's done — fetch
+#                              05_audio and go on with s5/s6 here. Another
+#                              book rendering there? This one is queued.
 #     --staged-tts             Run s4 via the staged pipeline (DESIGN.md §15):
 #                              checkpointed single-model phases with built-in
 #                              crash resume. The DEFAULT ($LNVOX_S4_STAGED,
@@ -134,6 +141,7 @@ LLM_MODEL="${LNVOX_LLM__MODEL:-${LNVOX_LLM_MODEL:-}}"
 MAX_MODEL_LEN=""
 SKIP_LLM=0
 SKIP_TTS=0
+REMOTE_TTS=""
 STAGED_TTS="${LNVOX_S4_STAGED:-1}"
 # Records whether staging was *asked for* (env var set or flag passed), as
 # opposed to inherited from the default above — vibevoice ignores the
@@ -175,6 +183,7 @@ while [ $# -gt 0 ]; do
         --stop-after-audit) STOP_AFTER_AUDIT=1; shift ;;
         --skip-llm)      SKIP_LLM=1;        shift   ;;
         --skip-tts)      SKIP_TTS=1;        shift   ;;
+        --remote-tts)    REMOTE_TTS="$2";   shift 2 ;;
         --staged-tts)    STAGED_TTS=1; STAGED_TTS_EXPLICIT=1; shift ;;
         --tts-backend)   TTS_BACKEND="$2";  shift 2 ;;
         --skip-mix)      SKIP_MIX=1;        shift   ;;
@@ -222,6 +231,15 @@ case "$TTS_BACKEND" in
 esac
 if [ "$TTS_BACKEND" = "vibevoice" ] && [ -n "${STAGED_TTS_EXPLICIT:-}" ] && [ "$STAGED_TTS" = "1" ]; then
     echo "ERROR: --staged-tts is Dramabox-only (DESIGN.md §16.2); vibevoice uses the monolithic path + retry loop." >&2
+    usage 2
+fi
+
+if [ -n "$REMOTE_TTS" ] && [ "$SKIP_TTS" -eq 1 ]; then
+    echo "ERROR: --remote-tts and --skip-tts contradict each other." >&2
+    usage 2
+fi
+if [ -n "$REMOTE_TTS" ] && [ "$TTS_BACKEND" != "dramabox" ]; then
+    echo "ERROR: --remote-tts renders with Dramabox (staged); --tts-backend $TTS_BACKEND runs here only." >&2
     usage 2
 fi
 
@@ -1006,6 +1024,20 @@ check_s4_retry() {
 
 if [ "$SKIP_TTS" -eq 1 ]; then
     banner "Skipping TTS phase (--skip-tts)"
+elif [ -n "$REMOTE_TTS" ]; then
+    # Stage 4 on another machine (lnvox/remote.py). Exit 0: the render is
+    # here, mix it; 3: launched, queued or still rendering — come back later.
+    banner "Stage 4: TTS on $REMOTE_TTS (lnvox remote-tts)"
+    uv run lnvox remote-tts "$BOOK_ID" --host "$REMOTE_TTS"
+    remote_rc=$?
+    if [ "$remote_rc" -eq 3 ]; then
+        banner "Stage 4 is on $REMOTE_TTS — this machine can shut down"
+        echo "Run this command again with --skip-llm to check on it; once it's done that"
+        echo "fetches 05_audio and goes on with the mix and sync here."
+        exit 0
+    elif [ "$remote_rc" -ne 0 ]; then
+        exit "$remote_rc"
+    fi
 else
     # Even after we kill vLLM, give the GPU a moment to release VRAM before
     # Dramabox tries to claim it. Auto-managed lifecycle, but the kernel-level

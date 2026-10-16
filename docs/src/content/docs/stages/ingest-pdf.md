@@ -17,15 +17,15 @@ sidebar:
 It reads only the PDF's **text layer**. A scan without OCR has none — run it through OCR first (e.g. `ocrmypdf in.pdf out.pdf`); a scanner's own OCR layer, like Acrobat Paper Capture, works as is. The launcher never runs it: extract once, then run the launcher (or [`lnvox ingest`](/stages/ingest/)) on the folder.
 
 ```bash
-uv run --with "pypdf[image]" lnvox ingest-pdf book.pdf novels/open-mind/volume-01 \
-    --chapter "5-12:Atomic Explosives" \
-    --chapter "13-20:Atomic Weapons and American Policy" \
-    --title "The Open Mind" --author "J. Robert Oppenheimer"
+uv run --with "pypdf[image]" lnvox ingest-pdf book.pdf novels/my-essays/volume-01 \
+    --chapter "5-12:The First Lecture" \
+    --chapter "13-20:The Second Lecture" \
+    --title "Collected Lectures" --author "A. Author"
 
-./scripts/run_pipeline.sh open-mind/volume-01 --mode lecture --book-title "The Open Mind"
+./scripts/run_pipeline.sh my-essays/volume-01 --mode lecture --book-title "Collected Lectures"
 ```
 
-The launcher finds `epubs/open-mind/volume-01.epub` on its own, so the run ends with the m4b (cover embedded) **and** `07_sync/` — the synced EPUB plus `sync_manifest.json` for the reader.
+The launcher finds `epubs/my-essays/volume-01.epub` on its own, so the run ends with the m4b (cover embedded) **and** `07_sync/` — the synced EPUB plus `sync_manifest.json` for the reader.
 
 pypdf and Pillow (the `image` extra, for the cover) aren't locked dependencies — adding one re-resolves the whole lock, including the vLLM nightly — so the command runs them as an overlay with `uv run --with`. Without pypdf it exits 2 with that hint; without Pillow it skips the cover and says so. Rendering — the whole cover page, figures, notes — also needs **pypdfium2**, another overlay: `uv run --with "pypdf[image]" --with pypdfium2 lnvox ingest-pdf …`. Without it the cover falls back to the page's largest image, and figures and note images are skipped with a message.
 
@@ -50,8 +50,8 @@ Without `--chapter`, the PDF's **top-level bookmarks** become chapters, each run
 
 Each chapter's pages are cleaned of what a narrator must not read, then re-flowed:
 
-1. **Page edges.** Lines that recur at the top or bottom two lines of a page — on at least 2 pages and 20% of the chapter's pages — are running heads or feet and are dropped. Matching ignores digits and case, so `12 THE OPEN MIND` and `The Open Mind 13` are one head; detection is per chapter, because a book's recto head is usually the chapter title. Page numbers, lone roman numerals and scan specks (no two letters in a row) are dropped from the edges too.
-2. **The chapter title** printed at the top of its first page is dropped — fuzzy-matched, so an OCR'd `Atomie Explosives` still matches `Atomic Explosives`, and it may wrap over several lines. A bookmark title's leading numbering and trailing parenthetical are optional in the match: `I. Atomic Explosives (May 1946)` matches a page headed just `Atomic Explosives`.
+1. **Page edges.** Lines that recur at the top or bottom two lines of a page — on at least 2 pages and 20% of the chapter's pages — are running heads or feet and are dropped. Matching ignores digits and case, so `12 COLLECTED LECTURES` and `Collected Lectures 13` are one head; detection is per chapter, because a book's recto head is usually the chapter title. Page numbers, lone roman numerals and scan specks (no two letters in a row) are dropped from the edges too.
+2. **The chapter title** printed at the top of its first page is dropped — fuzzy-matched, so an OCR'd `The Flrst Lecture` still matches `The First Lecture`, and it may wrap over several lines. A bookmark title's leading numbering and trailing parenthetical are optional in the match: `I. The First Lecture (May 1950)` matches a page headed just `The First Lecture`.
 3. **Line breaks → paragraphs.** Words split across lines are re-joined: a soft hyphen always, a plain `-` when the next line starts lowercase. A line that ends a sentence and is shorter than 85% of the median line ends a paragraph. Ligatures (`ﬁ`, `ﬂ`, …) become letters; rule-line debris glued to a line start (`------ - ---there`) is removed.
 4. **Missing pages.** When the printed page numbers jump (63 → 66), a paragraph break keeps the sentence fragments on either side apart instead of gluing them into one.
 
@@ -61,9 +61,9 @@ Pages with no text are listed in the output. A PDF with no text at all is refuse
 
 A publisher's digital edition has a real font on every glyph, which tells the running text apart from everything a narrator must skip. `--font-filter` reads each text run's font, size and position (pypdf's `visitor_text`) instead of the page's plain text:
 
-- **The body font** is the family and size carrying the most characters across the extracted pages. The output names it — `font filter: body text is StoneSerif 9 pt (94% of the characters)` — and warns when no font reaches half the text, which usually means a scan's OCR layer: don't use the filter there.
+- **The body font** is the family and size carrying the most characters across the extracted pages. The output names it — `font filter: body text is SourceSerif 9 pt (94% of the characters)` — and warns when no font reaches half the text, which usually means a scan's OCR layer: don't use the filter there.
 - **Taken out of the text:** figures and tables — from the text before a `Figure 2.1` / `Table 3` / `Example 4` label (axis labels, cells set ahead of it) through its caption until the running text resumes — and running heads, folios, figure lettering, and any other text in another family at another size. Figures and tables come back as pictures; see below.
-- **Note markers** are taken out: a superscript number set smaller, and the more common kind set at body size and only raised, which pypdf can't see — digits right after a sentence ends (`universal. 4 Ronald`, `areas.4 Most`, `“…”13 Even`). The sentence must end with a lowercase word, a closing quote or a bracket, so `Op. 27 No. 2`, `p. 12` and pitch names like `C4` are left alone. Once the notes section is read, every marker must be claimed by a note — see below.
+- **Note markers** are taken out: a superscript number set smaller, and the more common kind set at body size and only raised, which pypdf can't see — digits right after a sentence ends (`the gate. 4 Nobody`, `the night.4 Most`, `“…”13 Then`). The sentence must end with a lowercase word, a closing quote or a bracket, so `Op. 27 No. 2`, `p. 12` and pitch names like `C4` are left alone. Once the notes section is read, every marker must be claimed by a note — see below.
 - **Kept:** the body font in any style (italic, bold); text inline on a body line (a `#` from a symbol font, a term set in the sans); the body family at a smaller size — block quotes, epigraphs.
 - **Section headings** — a line in another family at body size or larger, on a page with running text — become a paragraph of their own; a heading set in two styles or wrapped over two lines is rejoined. Display lines on a page with no running text (a half-title) are dropped.
 - **Paragraphs** start where a line is indented from its page's margin, where the text switches between body and block-quote size, and at a numbered item (`3. `) after a sentence end — on top of the line-length rule above, which misses a paragraph whose last line runs nearly full.
@@ -75,19 +75,19 @@ The other cleanup steps (running heads by repetition, the chapter title, hyphena
 With `--font-filter`, what the text loses comes back for the reader — in the EPUB, in the m4b and, after Stage 6, in `sync_manifest.json` at its playback time. The progress log sums it up:
 
 ```text
-  notes: 406 in 18 group(s), pages 396-423
-  figures: 127 rendered — 123 placed before their first mention, 4 where printed
-  notes: 405 of 405 tied to their markers; 1 marker-like number(s) left in the text
+  notes: 212 in 12 group(s), pages 301-318
+  figures: 64 rendered — 61 placed before their first mention, 3 where printed
+  notes: 212 of 212 tied to their markers; 1 marker-like number(s) left in the text
 ```
 
-**Figures and tables** are rendered from the page at 216 dpi and trimmed to their ink, as `images/figure-2-1.png`, `images/table-14-3a.png`, … The crop follows the caption. A figure's caption sits under its drawing, so the picture runs from the nearest text above — running text, another figure, the running head — down to the caption's last line; a table's caption heads it, so the picture runs from the label down to the next text. On a page with several figures, lettering and cells go to the caption on their drawing's side, whatever order the PDF lists them in, and a table continued over a page break becomes one picture. Each is placed **before the paragraph that first mentions it** (`Figure 2.1 provides…`, `figures 4.1 and 4.2`, `Tables 14.3a–14.3b`), so the reader shows it as the narrator gets to it — else after the paragraph it interrupted in print. In the EPUB it is a `<figure>` with the picture and its label and caption as `alt` text. The sidecar's `images` lists it after the cover, so Stage 5 embeds it in the m4b and Stage 6 times it like any illustration (`images[]` and `visual_elements[]` of kind `image`, with `alt`).
+**Figures and tables** are rendered from the page at 216 dpi and trimmed to their ink, as `images/figure-2-1.png`, `images/table-3-2a.png`, … The crop follows the caption. A figure's caption sits under its drawing, so the picture runs from the nearest text above — running text, another figure, the running head — down to the caption's last line; a table's caption heads it, so the picture runs from the label down to the next text. On a page with several figures, lettering and cells go to the caption on their drawing's side, whatever order the PDF lists them in, and a table continued over a page break becomes one picture. Each is placed **before the paragraph that first mentions it** (`Figure 2.1 provides…`, `figures 4.1 and 4.2`, `Tables 3.2a–3.2b`), so the reader shows it as the narrator gets to it — else after the paragraph it interrupted in print. In the EPUB it is a `<figure>` with the picture and its label and caption as `alt` text. The sidecar's `images` lists it after the cover, so Stage 5 embeds it in the m4b and Stage 6 times it like any illustration (`images[]` and `visual_elements[]` of kind `image`, with `alt`).
 
-**Endnotes** are read from the notes section — the `Notes` bookmark, or `--notes` — whose group headers (`Preface`, `Chapter 4`) pair with the chapters (`4 Auditory Learning`). A note runs from its `N.` at the margin over indented paragraphs and page breaks; a misnumbered note set off by the space between notes stays a note of its own. Each marker in the text must be claimed by its chapter's note of that number; a marker no note claims was a number after all and goes back into the text (`Haydn's string quartet opus 33, no. 2`). A note still unclaimed is looked for between its neighbours' markers, in the forms the first pass skips — after a capital (`middle C.1 Engineers`), a number (`table 9.1. 5 In`), a comma (`research,13 sensory`). Every note becomes:
+**Endnotes** are read from the notes section — the `Notes` bookmark, or `--notes` — whose group headers (`Preface`, `Chapter 4`) pair with the chapters (`4 The Middle Years`). A note runs from its `N.` at the margin over indented paragraphs and page breaks; a misnumbered note set off by the space between notes stays a note of its own. Each marker in the text must be claimed by its chapter's note of that number; a marker no note claims was a number after all and goes back into the text (`the quartet opus 12, no. 2 (in G)`). A note still unclaimed is looked for between its neighbours' markers, in the forms the first pass skips — after a capital (`the letter A.1 Others`), a number (`table 3.1. 5 In`), a comma (`as studies show,13 memory`). Every note becomes:
 
 - a `footnote` visual element in the sidecar: its rendered image (`src`), its text as `html` and plain `text`, its number (`label`) and an `anchor` — the words just before its marker. [Stage 6](/stages/s6-sync/) places it right after the beat that reads those words, so the reader app shows the note as that sentence ends;
 - in the EPUB, an empty `noteref` link where the marker stood — a stylesheet draws the number, so the paragraph's text runs on unbroken for the sync — and an endnote at the chapter's end that links back.
 
-Validated on a 477-page MIT Press edition (19 chapters): 127 figures and tables rendered, all 405 notes tied to their markers. Against an unfiltered extraction the text lost only figures, tables, markers and running heads — no prose. A simulated render (silent audio through the real Stage 5 and Stage 6) matched 3741/3741 beats `span-exact`, embedded the cover and the 127 figures in the m4b, and timed every picture and note in reading order.
+Validated on a born-digital academic book of nearly 500 pages: over a hundred figures and tables rendered, every one of its ~400 endnotes tied to its marker. Against an unfiltered extraction the text lost only figures, tables, markers and running heads — no prose. A simulated render (silent audio through the real Stage 5 and Stage 6) matched every beat `span-exact`, embedded the cover and all the figures in the m4b, and timed every picture and note in reading order.
 
 ## Cover and EPUB
 
