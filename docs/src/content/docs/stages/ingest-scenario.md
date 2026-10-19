@@ -35,7 +35,8 @@ if [ "$MODE" = "scenario" ]; then
     # lets that through when a complete prior ingest exists.
     if [ -n "$SCENARIO_FILE" ]; then
         banner "Stage 0: ingest-scenario (structure + characters)"
-        run_step ensure_vllm "Stage 0 (ingest-scenario)" uv run lnvox ingest-scenario "$SCENARIO_FILE" --id "$BOOK_ID"
+        run_step ensure_vllm "Stage 0 (ingest-scenario)" uv run lnvox ingest-scenario "$SCENARIO_FILE" --id "$BOOK_ID" \
+                ${TITLE_GIVEN:+--title} ${TITLE_GIVEN:+"$TITLE_GIVEN"}
     else
         banner "Stage 0: ingest-scenario skipped ($BOOK_ART/00_script.json + 01_characters.json exist)"
     fi
@@ -43,7 +44,7 @@ if [ "$MODE" = "scenario" ]; then
 
 `$BOOK_ART` is `${LNVOX_ARTIFACTS_DIR:-artifacts}/<book_id>`, the directory the CLI writes to (as long as the variable is exported: the launcher doesn't read `.env`).
 
-- It runs only with `--mode scenario` and `--scenario-file <path>`. The launcher passes no `--title`, `--language` or `--no-cache`, so the title comes from the file name and the language is `fr`.
+- It runs only with `--mode scenario` and `--scenario-file <path>`. The launcher passes `--book-title` on as `--title` when you give one (`TITLE_GIVEN` is `--book-title` before it defaults to the book id), so the play and the `.m4b` share a title. Without it, the title comes from the file name. It passes no `--language` or `--no-cache`, so the language is `fr`.
 - **Without `--scenario-file`**, Stage 0 is skipped and the existing ingest is reused, but only a **complete** one: both `00_script.json` and `01_characters.json` must exist under `$BOOK_ART` (`00_text.jsonl` is reused alongside). Argument parsing refuses to start (usage, exit 2) otherwise:
 
   ```bash title="scripts/run_pipeline.sh"

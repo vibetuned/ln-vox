@@ -183,7 +183,11 @@ class PriorCastIndex:
         return {entry.assigned_clip_id for entry, _ in self._by_key.values() if entry.assigned_clip_id}
 
     def lookup(
-        self, name: str, aliases: Iterable[str] = (), gender: str = ""
+        self,
+        name: str,
+        aliases: Iterable[str] = (),
+        gender: str = "",
+        shared_words: Iterable[str] = (),
     ) -> CharacterCasting | None:
         """Most recent prior casting for this identity, or None.
 
@@ -192,7 +196,15 @@ class PriorCastIndex:
         agreement instead: s1 sometimes attaches a companion's name as an
         alias, and a cross-gender "match" through such an alias is exactly how
         one character steals another's voice.
+
+        `shared_words` are the words that also name another character of the
+        current cast (see `shared_name_words`). An alias-mediated match on one
+        of them alone is skipped: a family name or a common given name ("Vane"
+        for both Aldric Vane and Mira Vane) can't tell those characters apart,
+        and the gender check doesn't help when they share a gender.
+
         """
+        shared = set(shared_words)
         for k, cur_canonical in self._keys(name, aliases):
             hit = self._by_key.get(k)
             if hit is None:
@@ -200,9 +212,28 @@ class PriorCastIndex:
             entry, prior_canonical = hit
             if cur_canonical and prior_canonical:
                 return entry
+            if k in shared:
+                continue
             if gender in ("male", "female") and entry.target.gender == gender:
                 return entry
         return None
+
+
+
+def shared_name_words(cast: Iterable[Character]) -> dict[str, set[str]]:
+    """Character name → the single words of its names and aliases that also
+    appear in another character's (a family name, a shared given name)."""
+    owners: dict[str, set[str]] = {}
+    words_of: dict[str, set[str]] = {}
+    for c in cast:
+        words = {w for nm in (c.name, *c.aliases) for w in _norm_name(nm).split()}
+        words_of[c.name] = words
+        for w in words:
+            owners.setdefault(w, set()).add(c.name)
+    return {
+        name: {w for w in words if owners[w] - {name}}
+        for name, words in words_of.items()
+    }
 
 
 def infer_target(
@@ -253,7 +284,11 @@ def _soft_filter_by_accent(
 
 
 def _vary(
-    candidates: list[VoiceClip], seed: str, taken: set[str], min_free: int = 1
+    candidates: list[VoiceClip],
+    seed: str,
+    taken: set[str],
+    min_free: int = 1,
+    here: set[str] = frozenset(),
 ) -> list[VoiceClip]:
     """The candidates in an order of this character's own — without the
     clips another character keeps, while at least `min_free` others remain.
@@ -269,18 +304,32 @@ def _vary(
     is offered again only when the bank runs out of free ones (then after
     them). The accent preference still applies on top
     (`_soft_filter_by_accent`).
+
+    `here` (a subset of `taken`) are the clips of characters in this volume.
+    Once a long series has used up a gender and age band, a fresh cast
+    shares a clip with someone from an earlier volume — never with a
+    character the reader meets in the same book, unless nothing else is left.
     """
     order = list(candidates)
     random.Random(seed).shuffle(order)
     free = [c for c in order if c.id not in taken]
     if len(free) >= min_free:
         return free
-    return free + [c for c in order if c.id in taken]
+    earlier = [c for c in order if c.id in taken and c.id not in here]
+    if len(free) + len(earlier) >= min_free:
+        return free + earlier
+    return free + earlier + [c for c in order if c.id in here]
 
 
-def _first_free(choices: list[_RankedChoice], taken: set[str]) -> _RankedChoice:
-    """The best-ranked choice no other character has, else the best."""
-    return next((rc for rc in choices if rc.clip_id not in taken), choices[0])
+def _first_free(
+    choices: list[_RankedChoice], taken: set[str], here: set[str] = frozenset()
+) -> _RankedChoice:
+    """The best-ranked choice no other character has, else the best one no
+    character of this volume has, else the best."""
+    return next(
+        (rc for rc in choices if rc.clip_id not in taken),
+        next((rc for rc in choices if rc.clip_id not in here), choices[0]),
+    )
 
 
 def _offered_choices(
@@ -403,8 +452,9 @@ def cast_book(
             both the LLM auto-cast AND any prior-volume Narrator assignment.
         seed: Varies a fresh cast's candidate order (see `_vary`). A fresh
             cast prefers clips no other character has — in this volume, a
-            prior one or the override — and reuses one only when none fits;
-            locked, override and inherited assignments may share a clip.
+            prior one or the override — and reuses one only when none fits,
+            an earlier volume's before this volume's; locked, override and
+            inherited assignments may share a clip.
 
     Raises:
         ValueError: `narrator_clip_override` is not in the voicebank. Checked
@@ -503,6 +553,7 @@ def cast_book(
             return descriptor_from_clip(clip_by_id[entry.assigned_clip_id])
         return ""
 
+    shared_words = shared_name_words(cast)
     castings: list[CharacterCasting] = []
     # Clips other characters keep: earlier volumes', this volume's current
     # casting, the override — and each one assigned below.
@@ -511,6 +562,22 @@ def cast_book(
         taken |= {c.assigned_clip_id for c in existing.castings if c.assigned_clip_id}
     if narrator_clip_override:
         taken.add(narrator_clip_override)
+    # Of those, the clips of this volume's characters — including a recurring
+    # character's inherited clip before its turn in the loop comes. A
+    # character of unknown gender inherits nothing, but its clip is still
+    # kept off other characters, so both genders are tried.
+    here: set[str] = set()
+    if existing is not None:
+        here |= {c.assigned_clip_id for c in existing.castings if c.assigned_clip_id}
+    if narrator_clip_override:
+        here.add(narrator_clip_override)
+    if prior_index is not None:
+        for c in cast:
+            genders = (c.gender,) if c.gender in ("male", "female") else ("male", "female")
+            for g in genders:
+                hit = prior_index.lookup(c.name, c.aliases, g, shared_words.get(c.name, ()))
+                if hit is not None and hit.assigned_clip_id:
+                    here.add(hit.assigned_clip_id)
 
     def _emit(
         character: Character,
@@ -531,12 +598,14 @@ def cast_book(
         castings.append(casting)
         if casting.assigned_clip_id:
             taken.add(casting.assigned_clip_id)
+            here.add(casting.assigned_clip_id)
         if on_character_done:
             on_character_done(character, casting)
 
     for character in cast:
+        words = shared_words.get(character.name, ())
         own = (
-            own_index.lookup(character.name, character.aliases, character.gender)
+            own_index.lookup(character.name, character.aliases, character.gender, words)
             if own_index
             else None
         )
@@ -596,7 +665,7 @@ def cast_book(
         # Beats this volume's own unlocked entry: that is what keeps a voice
         # continuous across the series.
         prior = (
-            prior_index.lookup(character.name, character.aliases, character.gender)
+            prior_index.lookup(character.name, character.aliases, character.gender, words)
             if prior_index
             else None
         )
@@ -675,7 +744,7 @@ def cast_book(
             if not candidates:
                 relaxation = "any clip"
                 candidates = list(voicebank.clips)
-            candidates = _vary(candidates, f"{seed}|{book_id}|Narrator", taken, top_n)
+            candidates = _vary(candidates, f"{seed}|{book_id}|Narrator", taken, top_n, here)
 
             soft = _soft_filter_by_accent(
                 candidates, primary, max_keep=max_candidates_per_char
@@ -701,7 +770,7 @@ def cast_book(
                     fallback, fb_note = _fallback_choice(ranked, soft)
                     ranked_choices = [fallback]
                     note = "; ".join(filter(None, (note, fb_note)))
-                assigned_clip = clip_by_id[_first_free(ranked_choices, taken).clip_id]
+                assigned_clip = clip_by_id[_first_free(ranked_choices, taken, here).clip_id]
 
             descriptor = (
                 descriptor_from_clip(assigned_clip)
@@ -730,7 +799,9 @@ def cast_book(
             voice_descriptor=(prof.voice_descriptor if prof else ""),
             profile_accent=(prof.accent if prof else "any"),
         )
-        hard = _vary(_hard_filter(voicebank, target), f"{seed}|{book_id}|{character.name}", taken, top_n)
+        hard = _vary(
+            _hard_filter(voicebank, target), f"{seed}|{book_id}|{character.name}", taken, top_n, here
+        )
         soft = _soft_filter_by_accent(hard, target, max_keep=max_candidates_per_char)
         ranked = rank_candidates(client, character, target, soft, top_n=top_n)
         ranked_choices = _offered_choices(ranked, soft)
@@ -738,7 +809,7 @@ def cast_book(
             fallback, fb_note = _fallback_choice(ranked, soft)
             ranked_choices = [fallback]
             note = "; ".join(filter(None, (note, fb_note)))
-        assigned = _first_free(ranked_choices, taken).clip_id if ranked_choices else ""
+        assigned = _first_free(ranked_choices, taken, here).clip_id if ranked_choices else ""
 
         # For the Narrator (auto-cast path), lock in a clip-derived descriptor
         # so s3 doesn't compose a free-text one that contradicts the chosen

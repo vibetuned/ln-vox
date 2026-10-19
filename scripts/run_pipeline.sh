@@ -291,6 +291,9 @@ if [ "$MODE" = "lecture" ] && [ "$NO_NORMALIZE" -eq 1 ] && [ -n "$NARRATOR_CLIP"
     NEED_LLM=0
 fi
 
+# The title as given: scenario mode hands it to ingest-scenario, whose own
+# default (the script's file name) beats the book id.
+TITLE_GIVEN="$BOOK_TITLE"
 BOOK_TITLE="${BOOK_TITLE:-$BOOK_ID}"
 NOVEL_DIR="$NOVELS_ROOT/$BOOK_ID"
 
@@ -913,7 +916,8 @@ else
         # lets that through when a complete prior ingest exists.
         if [ -n "$SCENARIO_FILE" ]; then
             banner "Stage 0: ingest-scenario (structure + characters)"
-            run_step ensure_vllm "Stage 0 (ingest-scenario)" uv run lnvox ingest-scenario "$SCENARIO_FILE" --id "$BOOK_ID"
+            run_step ensure_vllm "Stage 0 (ingest-scenario)" uv run lnvox ingest-scenario "$SCENARIO_FILE" --id "$BOOK_ID" \
+                ${TITLE_GIVEN:+--title} ${TITLE_GIVEN:+"$TITLE_GIVEN"}
         else
             banner "Stage 0: ingest-scenario skipped ($BOOK_ART/00_script.json + 01_characters.json exist)"
         fi

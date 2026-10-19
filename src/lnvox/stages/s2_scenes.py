@@ -5,6 +5,7 @@ from lnvox.ingest.text import Chapter
 from lnvox.llm.chunker import Chunk, chunk_text, split_paragraphs
 from lnvox.llm.client import LLMClient
 from lnvox.llm.schemas import (
+    Beat,
     ChapterBoundaries,
     ChapterScenes,
     CharacterList,
@@ -233,6 +234,45 @@ def _tag_scene_beats(
     )
 
 
+def _tag_in_halves(
+    client: LLMClient,
+    boundary: SceneBoundary,
+    paragraphs: list[str],
+    *,
+    cast_json: str,
+    depth: int = 0,
+) -> list[Beat]:
+    """Beats for one scene's paragraphs; if the reply never validates, the
+    two halves tagged apart (down to 1/8 of the scene).
+
+    The quantized model sometimes loops on one scene — `{}` pairs until the
+    token limit — and does so again on every retry of that prompt, so the
+    whole volume stopped there. The same text in two shorter calls gets
+    through, and the halves' beats join in order: a scene is contiguous
+    paragraphs, and each beat carries its own source span.
+    """
+    try:
+        return _tag_scene_beats(
+            client, boundary, "\n\n".join(paragraphs), cast_json=cast_json
+        ).beats
+    except ValueError as e:
+        if len(paragraphs) < 2 or depth >= 3:
+            raise
+        print(
+            f"  [s2] {boundary.scene_id}: no valid beats for "
+            f"{len(paragraphs)} paragraph(s) ({str(e).splitlines()[0][:80]}) — "
+            f"tagging the two halves apart"
+        )
+    mid = len(paragraphs) // 2
+    return [
+        beat
+        for half in (paragraphs[:mid], paragraphs[mid:])
+        for beat in _tag_in_halves(
+            client, boundary, half, cast_json=cast_json, depth=depth + 1
+        )
+    ]
+
+
 def segment_chapter(
     client: LLMClient, chapter: Chapter, cast: CharacterList
 ) -> ChapterScenes:
@@ -269,9 +309,7 @@ def segment_chapter(
         if not scene_text.strip():
             continue
         b.scene_id = scene_id
-        beats = _tag_scene_beats(
-            client, b, scene_text, cast_json=cast_json
-        ).beats
+        beats = _tag_in_halves(client, b, scene_paras, cast_json=cast_json)
         # Backstop for the silent-failure variant: the LLM returned valid JSON
         # with an empty beats list for a non-empty scene. This used to silently
         # cache as a degenerate chapter and corrupt every subsequent one.

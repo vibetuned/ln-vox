@@ -65,7 +65,7 @@ Regex heuristic for `(gender, age)` from a descriptor such as `"mid-thirties mal
 class PriorCastIndex:
     def __init__(self) -> None
     def add_volume(self, casting: BookCasting, cast: Iterable[Character] = ()) -> None
-    def lookup(self, name: str, aliases: Iterable[str] = (), gender: str = "") -> CharacterCasting | None
+    def lookup(self, name: str, aliases: Iterable[str] = (), gender: str = "", shared_words: Iterable[str] = ()) -> CharacterCasting | None
     def __len__(self) -> int
 ```
 
@@ -99,9 +99,9 @@ Folds one volume's assignments in. Call it oldest → newest; later calls overwr
 Walks the current character's keys in priority order and returns the first acceptable hit:
 
 - **Canonical on both sides** (the current key comes from the current name and the stored key came from the prior entry's name): trusted as-is, regardless of gender.
-- **Anything alias-mediated** (either side): accepted only if `gender` is `"male"` or `"female"` and equals the prior entry's `target.gender`. Otherwise the walk continues with the next key.
+- **Anything alias-mediated** (either side): skipped when the key is one of `shared_words`; otherwise accepted only if `gender` is `"male"` or `"female"` and equals the prior entry's `target.gender`. When a key is rejected, the walk continues with the next one.
 
-Returns `None` when no key is acceptable. The gender guard exists because Stage 1 sometimes lists a companion's name among a character's aliases; a cross-gender match through such an alias is how one character steals another's voice.
+Returns `None` when no key is acceptable. The gender guard exists because Stage 1 sometimes lists a companion's name among a character's aliases; a cross-gender match through such an alias is how one character steals another's voice. The `shared_words` guard covers the same-gender case: Stage 1 also lists a bare family name as an alias ("Vane" for Aldric Vane). A later character called Vane, cast alongside Aldric Vane, would otherwise inherit his voice through that alias. `cast_book` passes each character's [`shared_name_words`](#shared_name_words).
 
 | Prior volume | Current volume | Outcome |
 |---|---|---|
@@ -111,8 +111,17 @@ Returns `None` when no key is acceptable. The gender guard exists because Stage 
 | `Aldric` (male), alias `Vane` | `Sera`, alias `Vane`, gender female | no hit: alias key, gender disagrees |
 | `Aldric` (male) | `Aldric`, gender female | hit: canonical on both sides beats gender |
 | two characters aliased `the Captain` | `the Captain` | no hit: ambiguous key dropped |
+| `Aldric` (male), alias `Vane` | `Vane` (male), cast next to `Aldric`, alias `Aldric Vane` | no hit: `vane` names two current characters |
 
 `len(index)` is the number of keys (the CLI prints it as "N identity keys").
+
+### `shared_name_words`
+
+```python
+def shared_name_words(cast: Iterable[Character]) -> dict[str, set[str]]
+```
+
+Maps each character's name to the single words (normalised like `_keys`) of its name and aliases that also appear in another character's name or aliases in `cast`. For example, a family name or a given name two characters share. `lookup` refuses an alias-mediated match on such a word alone.
 
 [`cast_book`](#cast_book) also builds a second, private index from the volume's own `existing` casting, so an entry is found by the same name, alias and token-order rules after an s1 re-run renames a character.
 
@@ -249,7 +258,7 @@ For each character, the first branch that applies wins. "Own entry" is the chara
 
 1. **Locked own entry.** The own entry has `locked: true` and its clip is in the bank: copied whole (`target`, `ranked`, `locked`, `audit_note`, …) under the current name, with no gender check, since a lock is a deliberate hand edit. A Narrator with an empty `voice_descriptor` gets `descriptor_from_clip(clip)`. No LLM call. A locked entry whose clip is missing from the bank is ignored, and whatever is cast instead gets `audit_note = "voice cast: locked clip <id> is not in the voicebank; re-cast"`.
 2. **Narrator override.** `character.name == "Narrator"` and an override is set. Casting uses the clip directly: `target` = clip's gender, age band and `[accent]`; `candidates_considered=1`; `ranked=[{clip_id, score: 1.0, reason: "Manual --narrator-clip override."}]`; `voice_descriptor=descriptor_from_clip(clip)`. No LLM call.
-3. **Prior reuse.** `prior_index.lookup(name, aliases, gender)` returns an entry whose clip is in the current bank, and the clip's gender matches at least one of the known genders (the current character's, the prior target's). A clip that matches neither, such as a hand-edit that pointed a female character at a male clip, is recast rather than propagated through the series. The prior `target`, `candidates_considered`, `ranked` and `assigned_clip_id` are copied; `voice_descriptor` is the prior's, or for the Narrator `descriptor_from_clip(clip)` when the prior had none. No LLM call.
+3. **Prior reuse.** `prior_index.lookup(name, aliases, gender, shared_words)` returns an entry whose clip is in the current bank, and the clip's gender matches at least one of the known genders (the current character's, the prior target's). A clip that matches neither, such as a hand-edit that pointed a female character at a male clip, is recast rather than propagated through the series. The prior `target`, `candidates_considered`, `ranked` and `assigned_clip_id` are copied; `voice_descriptor` is the prior's, or for the Narrator `descriptor_from_clip(clip)` when the prior had none. No LLM call.
 4. **Unlocked own entry.** Same bank and gender checks as step 3; copied whole like step 1. This is the weakest reuse layer: it only applies when no prior volume matched, so continuity chains win but a first-appearance character is not re-rolled on a re-run. No LLM call.
 5. **Gender outside the bank.** `character.gender` is not `male`/`female` (`nonbinary`, `unknown`). Written with a placeholder `male / adult` target, no candidates and `assigned_clip_id=""`. s4 renders such characters descriptor-only. No LLM call.
 6. **Narrator auto-cast.** No target inference (inferring from the synthetic description tends to drift). Target is `female / adult / [england]`, where the accent is only an ordering preference: the hard filter never looks at it. Candidates come from a relaxation ladder: female + adult, then any female clip, then every clip. The soft filter puts `england` clips first and caps at 60. One candidate → assigned without the LLM (`reason: "Sole candidate (<rung>)."`, rung `female/adult, england first`, `relaxed age (female/any age)` or `any clip`); more → one `rank_candidates` call, keeping the [offered](#_offered_choices) choices and taking the first, else the [fallback](#_fallback_choice). `voice_descriptor = descriptor_from_clip(assigned)`.

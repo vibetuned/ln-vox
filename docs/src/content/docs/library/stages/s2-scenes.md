@@ -17,6 +17,7 @@ Stage 2 turns each chapter into scenes, and each scene into an ordered list of n
 | `_detect_boundaries` | function | Pass 2a for one chunk; returns chapter-global `SceneBoundary` ranges |
 | `_tile_boundaries` | function | Repairs 2a's ranges so the chapter's scenes cover every paragraph exactly once |
 | `_tag_scene_beats` | function | Pass 2b for one scene; returns `SceneBeats` |
+| `_tag_in_halves` | function | Pass 2b with a fallback: a scene whose reply never validates is tagged in halves |
 | `_build_alias_map` / `_normalize_speakers` | functions | Rewrite dialogue speakers that exactly match a cast alias |
 | `_looks_broken` | function | Detects degenerate cached results (a scene with zero beats) |
 | `BOUNDARY_SYSTEM`, `BEATS_SYSTEM` | constants | System prompts for 2a and 2b |
@@ -69,7 +70,7 @@ Segments one chapter. The steps are:
    - it assigns `scene_id = "<chapter_id>_s<N>"` sequentially, overwriting whatever the model returned;
    - it slices `paragraphs[start_paragraph - 1 : end_paragraph]` and joins them with `\n\n`;
    - it skips the scene if that text is empty (the number is not consumed);
-   - it calls `_tag_scene_beats`. If the model returns **zero beats** for non-empty text, it raises `RuntimeError("s2: scene … returned 0 beats … likely a stalled LLM …")`.
+   - it calls `_tag_in_halves`, which calls `_tag_scene_beats`. If the model returns **zero beats** for non-empty text, it raises `RuntimeError("s2: scene … returned 0 beats … likely a stalled LLM …")`.
 6. **Speaker normalisation.** `_normalize_speakers` rewrites dialogue speakers that exactly match a cast alias.
 
 The persisted `Scene` keeps `scene_id`, `location_hint`, `start_paragraph`, `end_paragraph` and `beats`. The 2a `cast` list is used only in the prompt and is not stored.
@@ -139,6 +140,23 @@ Pass 2b for one scene. It renders `scene_beats.jinja` (cast, `scene_id`, `locati
 - every beat has `source_span`: the verbatim, contiguous slice of the scene text, including the quote marks and the dropped "she said" tag. Read top to bottom, the spans should rebuild the scene.
 
 The budget is `budget_for(desired=max(4096, min(32000, int(len(scene_text) * 2.0) + 1024)), floor=4096)`: the scene text is in the prompt, so on a smaller context the 32 000 cap alone would ask for more than fits and return a 400. Beats JSON carries the source twice, measured at about 5.2 times the scene length in characters. If a completion is still cut off (`finish_reason=length`), `LLMClient.structured` grows the budget by 1.5 times on the next attempt. Exceptions propagate.
+
+### `_tag_in_halves`
+
+```python
+def _tag_in_halves(
+    client: LLMClient,
+    boundary: SceneBoundary,
+    paragraphs: list[str],
+    *,
+    cast_json: str,
+    depth: int = 0,
+) -> list[Beat]
+```
+
+Calls `_tag_scene_beats` on the scene's paragraphs, joined by blank lines. If that raises `ValueError` (the client's "failed schema validation" after all its attempts), it prints `[s2] <scene_id>: no valid beats for N paragraph(s) (…) — tagging the two halves apart`, splits the paragraphs at the middle, and tags each half the same way. It recurses to depth 3, so the smallest piece is about 1/8 of the scene. The halves' beats are concatenated in order; this works because a scene is contiguous paragraphs and each beat carries its own `source_span`. A single paragraph, or depth 3, re-raises.
+
+This exists because the quantized model sometimes loops on one scene, emitting `{}` pairs until `finish_reason=length`, and loops again on every retry of the same prompt. The launcher's whole-stage retries then failed on the same scene, which stopped the volume. Shorter prompts get through. Other exceptions (transport errors, timeouts) are not caught.
 
 ### `_build_alias_map` / `_normalize_speakers`
 

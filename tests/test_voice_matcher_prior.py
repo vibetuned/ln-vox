@@ -6,7 +6,7 @@ All character names below are invented — no real book content.
 from lnvox.llm.schemas import Character
 import json
 
-from lnvox.voices.matcher import PriorCastIndex, _vary, cast_book
+from lnvox.voices.matcher import PriorCastIndex, _vary, cast_book, shared_name_words
 from lnvox.voices.schema import (
     BookCasting,
     CharacterCasting,
@@ -168,6 +168,50 @@ def test_companion_alias_cannot_steal_a_name_key():
     # With unknown gender, an alias-mediated match is never trusted: the
     # stolen key resolves to nothing rather than to the wrong voice.
     assert idx.lookup("Aldric", gender="unknown") is None
+
+
+def test_a_shared_family_name_cannot_carry_a_voice_to_a_namesake():
+    # s1 lists a bare family name among a character's aliases ("Vane" for
+    # Aldric Vane). A later volume's "Vane" — another character, cast next to
+    # Aldric Vane — must not inherit his voice through it: the gender check
+    # can't tell two men apart.
+    idx = PriorCastIndex()
+    idx.add_volume(
+        _volume("s/volume-01", [_casting("Aldric", "m1")]),
+        [_char("Aldric", aliases=["Vane"])],
+    )
+    cast = [_char("Aldric", aliases=["Aldric Vane"]), _char("Vane", aliases=["Vane Oro"])]
+    shared = shared_name_words(cast)
+    assert shared["Vane"] == {"vane"}
+    assert idx.lookup("Vane", ["Vane Oro"], "male", shared["Vane"]) is None
+    hit = idx.lookup("Aldric", ["Aldric Vane"], "male", shared["Aldric"])
+    assert hit is not None and hit.assigned_clip_id == "m1"
+    # With no namesake in the cast the bare-name alias still bridges.
+    assert idx.lookup("Vane", gender="male").assigned_clip_id == "m1"
+
+
+def test_cast_book_casts_a_namesake_fresh():
+    vb = Voicebank(clips=[
+        _clip("m1"), _clip("m2"), _clip("f_nar", gender="female", age="adult"),
+    ])
+    idx = PriorCastIndex()
+    idx.add_volume(
+        _volume("s/volume-01", [
+            _casting("Aldric", "m1"),
+            _casting("Narrator", "f_nar", gender="female", age="adult"),
+        ]),
+        [_char("Aldric", aliases=["Vane"])],
+    )
+    client = StubClient(VoiceTarget(gender="male", age_band="teen"), "m2")
+    result = cast_book(
+        client,
+        "s/volume-02",
+        [_char("Aldric", aliases=["Aldric Vane"]), _char("Vane", aliases=["Vane Oro"])],
+        vb,
+        prior_index=idx,
+    )
+    by_name = {c.character_name: c.assigned_clip_id for c in result.castings}
+    assert by_name == {"Aldric": "m1", "Vane": "m2", "Narrator": "f_nar"}
 
 
 def test_cast_book_reuses_prior_without_llm():
@@ -436,6 +480,26 @@ def test_a_clip_is_shared_only_when_the_bank_runs_out():
     result = cast_book(FirstOfferedClient(VoiceTarget(gender="male", age_band="teen")), "b", _boys(3), bank)
     clips = [c.assigned_clip_id for c in result.castings if c.character_name != "Narrator"]
     assert sorted(clips[:2]) == ["m1", "m2"] and clips[2] in ("m1", "m2")
+
+
+def test_a_spent_bank_shares_an_earlier_volumes_clip_not_this_ones():
+    # A long series used up the band: m1 and m2 belong to earlier volumes,
+    # m3 to a recurring character listed AFTER the newcomers. Neither
+    # newcomer may take m3, nor the clip the other newcomer just took.
+    bank = Voicebank(clips=[_clip("m1"), _clip("m2"), _clip("m3")])
+    prior = PriorCastIndex()
+    prior.add_volume(_volume("s/volume-01", [
+        _casting("Old Knight", "m1"), _casting("Old Squire", "m2"), _casting("Brann", "m3"),
+    ]))
+    client = FirstOfferedClient(VoiceTarget(gender="male", age_band="teen"))
+    result = cast_book(
+        client, "s/volume-02", [_char("Newcomer A"), _char("Newcomer B"), _char("Brann")],
+        bank, prior_index=prior, top_n=1,
+    )
+    clips = {c.character_name: c.assigned_clip_id for c in result.castings}
+    assert clips["Brann"] == "m3"
+    assert sorted([clips["Newcomer A"], clips["Newcomer B"]]) == ["m1", "m2"]
+    assert all("m3" not in offered for offered in client.offered[:2])
 
 
 def test_clips_of_earlier_volumes_and_locks_are_kept_free():

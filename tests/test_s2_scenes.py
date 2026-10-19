@@ -127,6 +127,39 @@ def test_overlap_paragraphs_are_voiced_once():
     assert _voiced_paragraphs(result) == [1, 2, 3, 4, 5, 6, 7]
 
 
+class _LoopingClient(_StubClient):
+    """Fails schema validation on any scene text longer than two paragraphs,
+    the way the quantized model loops on one long scene."""
+
+    def structured(self, *, system, user, schema, max_tokens=None, **_):
+        if schema is SceneBeats and len(re.findall(r"Paragraph number \d+\.", user)) > 2:
+            self.calls.append((schema.__name__, len(system) + len(user), max_tokens))
+            raise ValueError("LLM returned content that failed schema validation")
+        return super().structured(system=system, user=user, schema=schema, max_tokens=max_tokens)
+
+
+def test_a_scene_the_model_loops_on_is_tagged_in_halves():
+    client = _LoopingClient(scenes=[(1, 7)])
+    result = s2_scenes.segment_chapter(client, _chapter(7), CharacterList(characters=[]))
+    assert _voiced_paragraphs(result) == [1, 2, 3, 4, 5, 6, 7]
+    assert [(s.start_paragraph, s.end_paragraph) for s in result.scenes] == [(1, 7)]
+
+
+def test_a_paragraph_the_model_never_tags_still_fails():
+    class Hopeless(_StubClient):
+        def structured(self, *, system, user, schema, max_tokens=None, **_):
+            if schema is SceneBeats:
+                raise ValueError("LLM returned content that failed schema validation")
+            return super().structured(system=system, user=user, schema=schema, max_tokens=max_tokens)
+
+    try:
+        s2_scenes.segment_chapter(Hopeless(scenes=[(1, 3)]), _chapter(3), CharacterList(characters=[]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected the validation error to propagate")
+
+
 def test_budgets_fit_a_small_served_context():
     # ~20K chars in one scene: the old fixed beats budget (32K tokens) plus the
     # prompt overflowed a 12K context; budget_for clamps it.

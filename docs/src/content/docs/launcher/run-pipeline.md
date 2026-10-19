@@ -25,7 +25,7 @@ The internals — each shell function, the retry wrapper and the server lifecycl
 | `--narrator-clip <id>` | — | Voicebank clip id for the Narrator. Optional when a prior volume already has one — it's inherited. |
 | `--audit-cast <mode>` | `report` (`$LNVOX_AUDIT_CAST`) | Casting audit after voice cast: `report`, `fix` (auto-reassign) or `off`. See [voice audit](/stages/voice-audit/). |
 | `--stop-after-audit` | off | Stop right after the casting audit, before s3 — the hand-casting checkpoint ([guide](/guides/casting/)). |
-| `--book-title <title>` | the book id | Title of the final `.m4b`. |
+| `--book-title <title>` | the book id | Title of the final `.m4b`. In scenario mode it is also the play's title (`ingest-scenario --title`), which otherwise comes from the script's file name. |
 | `--novels-root <path>` | `novels` | Where the chapter `.txt` folders live. Passed to both s5 (embedded pictures) and s6 (alignment), so the two always read the same folder. |
 | `--vllm-url <url>` | — | Use an already-running OpenAI-compatible server at this URL; skips auto start/stop and env prep. The name is historical — it works with any backend. Without it the server URL is resolved from the environment (see [Environment](#environment)). |
 | `--llm-backend <name>` | `llama` (`$LNVOX_LLM_BACKEND`) | `llama` (llama.cpp, any OS), `vllm` (Linux + CUDA) or `mlx` (Apple Silicon). |

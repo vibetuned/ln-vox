@@ -48,7 +48,7 @@ There is a full example on the [library page](/library/stages/s2-scenes/#output-
 1. **Paragraphs.** The chapter text is split on blank lines, once. Paragraph numbers are 1-indexed positions in that list, for the whole chapter.
 2. **Chunks.** Chapters over 30 000 characters are cut into paragraph-aligned chunks. At each cut the LLM picks the cleanest break among 6 candidate paragraphs, falling back to the middle one on error.
 3. **Pass 2a: boundaries.** Per chunk, the model sees locally numbered paragraphs `[1]…[N]` and returns scene ranges. The code clamps them into `1..N` and offsets them by the chunk's first paragraph, which makes them chapter-global. An empty answer makes the whole chunk one scene. The chapter's ranges are then repaired to tile every paragraph exactly once: gaps are folded into the earlier scene, overlaps trimmed, and the head and tail covered. Each repair is logged as `[s2] <chapter>: scene ranges — <note>`.
-4. **Pass 2b: beats.** Per scene, only that scene's paragraphs go to the model. It returns beats in which dialogue `text` has quotes and "she said" tags removed, while `source_span` copies the exact source slice, tags and quote marks included. Scene ids are renumbered `<chapter_id>_s1…sN`. A non-empty scene that comes back with zero beats raises, so the retry can restart the server.
+4. **Pass 2b: beats.** Per scene, only that scene's paragraphs go to the model. It returns beats in which dialogue `text` has quotes and "she said" tags removed, while `source_span` copies the exact source slice, tags and quote marks included. Scene ids are renumbered `<chapter_id>_s1…sN`. A non-empty scene that comes back with zero beats raises, so the retry can restart the server. A scene whose reply never validates (the model looping until the token limit) is tagged in two halves instead, down to 1/8 of the scene; their beats join in order.
 5. **Speaker cleanup.** Dialogue speakers that exactly (case-insensitively) match a cast alias are rewritten to the canonical name. s3 later does the fuzzier folding (leading articles, `the narrator`).
 
 ## Debugging bad segmentation
@@ -60,6 +60,7 @@ There is a full example on the [library page](/library/stages/s2-scenes/#output-
 | "he said" read in a character's voice | The model left the attribution tag inside dialogue `text` | Check the beat's `text` against its `source_span`. Re-segment the chapter |
 | Low exact-match rate in s6 | `source_span` drift: the model paraphrased the span instead of copying it | Re-segment the worst chapters, or try a stronger model |
 | `s2: scene … returned 0 beats … likely a stalled LLM` | The server stopped producing output mid-chapter | The launcher retries automatically. By hand, restart the server and re-run |
+| `[s2] <scene>: no valid beats for N paragraph(s) … tagging the two halves apart` | The model looped on that scene (`finish_reason=length`, repeated `{}` pairs) | Nothing: the halves are tagged apart. Check the scene's beats if the halves also fail |
 
 ### Checking scene ranges
 
