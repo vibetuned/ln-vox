@@ -59,6 +59,8 @@ uv run lnvox ingest-pdf <PDF_PATH> <OUTPUT_DIR> [OPTIONS]
 | `--notes` `TEXT` | — | With --font-filter: the endnotes section's pages FIRST-LAST (default: the 'Notes' bookmark). |
 | `--no-notes` | off | With --font-filter: leave the endnotes out. |
 | `--no-figures` | off | With --font-filter: drop figures and tables without rendering them. |
+| `--drop-pattern` `TEXT` (repeatable) | — | A regular expression removed from every paragraph — book-specific furniture such as margin page references (e.g. 'p[.] [A-Z][0-9]+'). Repeat for several. |
+| `--rewrite` `TEXT` (repeatable) | — | REGEX=>TEXT: replace every match in every paragraph (re.sub syntax; a blank line in TEXT starts a new paragraph). Repeat for several; applied after --drop-pattern. |
 
 ### `lnvox ingest`
 

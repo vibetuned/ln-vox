@@ -22,6 +22,17 @@ You MUST NOT:
 - Change the sentence order or merge/split sentences.
 
 If a passage already reads cleanly, return it UNCHANGED.
+{% if language is defined and language and language != "en" %}
+
+LANGUAGE: the passages are in {{ language_name }}. Respell them IN {{ language_name|upper }},
+exactly as a {{ language_name }} reader says them aloud — never translate a single
+word. The examples above are English; apply the same rules in {{ language_name }}.
+{% if language == "fr" %}
+For French: 1973 → "mille neuf cent soixante-treize"; 3e → "troisième";
+XIXe siècle → "dix-neuvième siècle"; 42 % → "quarante-deux pour cent";
+p. ex. → "par exemple"; c.-à-d. → "c'est-à-dire"; M. → "monsieur".
+{% endif %}
+{% endif %}
 
 ---
 You are given a numbered list of passages. Return JSON with one entry per

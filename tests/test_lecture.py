@@ -482,6 +482,33 @@ def test_place_visual_element_front_and_end():
     assert after == "b1" and before is None and trigger == 10.0
 
 
+class _PromptCapture(_Normalizer):
+    """The stub normalizer, rendering the real template so the prompt can be read."""
+
+    def __init__(self):
+        super().__init__()
+        self.prompts: list[str] = []
+
+    def render(self, template, **kw):
+        from lnvox.llm.client import _jinja
+
+        self.prompts.append(_jinja.get_template(template).render(**kw))
+        return kw["passages"]
+
+
+def test_normalize_prompt_follows_the_book_language():
+    ch = Chapter(chapter_id="01", title="T", text="En 1973, il partit.")
+    english, french = _PromptCapture(), _PromptCapture()
+    lecture.direct_chapter(ch, "adult, male", client=english)
+    lecture.direct_chapter(ch, "adult, male", client=french, language="fr")
+    assert "LANGUAGE:" not in english.prompts[0]  # English prompts are unchanged
+    assert "Respell them IN FRENCH" in french.prompts[0]
+    assert "mille neuf cent soixante-treize" in french.prompts[0]
+    other = _PromptCapture()
+    lecture.direct_chapter(ch, "adult, male", client=other, language="pt-BR")
+    assert "in Portuguese" in other.prompts[0] and "For French" not in other.prompts[0]
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

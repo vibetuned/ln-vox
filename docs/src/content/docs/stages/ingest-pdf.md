@@ -43,6 +43,8 @@ pypdf and Pillow (the `image` extra, for the cover) aren't locked dependencies �
 | `--font-filter` | off | For a born-digital PDF: keep only the running text, told apart by its font, and take out its figures, tables and endnotes for the reader app. See [Born-digital PDFs](#born-digital-pdfs---font-filter). |
 | `--notes FIRST-LAST` | the `Notes` bookmark | With `--font-filter`: the pages of the endnotes section. They are never narrated. |
 | `--no-notes` / `--no-figures` | — | With `--font-filter`: leave the endnotes out (markers are still removed) / drop figures and tables without rendering them. |
+| `--drop-pattern REGEX` | — | Remove every match of this regular expression from every paragraph: book-specific furniture such as margin references to another edition's pages (`p\. [A-Z]\d+`). Repeat for several. |
+| `--rewrite 'REGEX=>TEXT'` | — | Replace every match in every paragraph (`re.sub`, so `\1` and `\n` work in `TEXT`). A blank line (`\n\n`) in the result starts a new paragraph, and a paragraph left empty is dropped. Repeat for several; they run in order, after `--drop-pattern`. See [Book-specific cleanup](#book-specific-cleanup). |
 
 Without `--chapter`, the PDF's **top-level bookmarks** become chapters, each running to the page before the next one (nested bookmarks are ignored). Without bookmarks the whole document — or `--pages` — is one chapter, named after the title.
 
@@ -54,8 +56,23 @@ Each chapter's pages are cleaned of what a narrator must not read, then re-flowe
 2. **The chapter title** printed at the top of its first page is dropped — fuzzy-matched, so an OCR'd `The Flrst Lecture` still matches `The First Lecture`, and it may wrap over several lines. A bookmark title's leading numbering and trailing parenthetical are optional in the match: `I. The First Lecture (May 1950)` matches a page headed just `The First Lecture`.
 3. **Line breaks → paragraphs.** Words split across lines are re-joined: a soft hyphen always, a plain `-` when the next line starts lowercase. A line that ends a sentence and is shorter than 85% of the median line ends a paragraph. Ligatures (`ﬁ`, `ﬂ`, …) become letters; rule-line debris glued to a line start (`------ - ---there`) is removed.
 4. **Missing pages.** When the printed page numbers jump (63 → 66), a paragraph break keeps the sentence fragments on either side apart instead of gluing them into one.
+5. **Tables of contents.** A paragraph of contents entries (dot leaders ending in a page number: two or more, or one in a short paragraph) is dropped, with a `Contents` / `Table des matières` / `Sommaire` heading right before it. LaTeX books print such a mini contents at the head of every chapter, in the body font.
+6. **Typography.** LaTeX's ellipsis, which extracts as three spaced periods (`. . .`), becomes `…`. Control characters (a maths glyph with no Unicode mapping extracts as NUL, which the EPUB's XML can't carry) are removed.
 
-Pages with no text are listed in the output. A PDF with no text at all is refused (exit 2) before anything is written.
+Pages with no text are listed in the output.
+
+### Book-specific cleanup
+
+Some furniture belongs to one edition only, so no default rule should guess at it. `--drop-pattern` and `--rewrite` apply your own regular expressions to the final paragraphs. They run after note markers are resolved, so a marker no note claims (put back as text) is covered too, and they change the chapter files and the EPUB alike, which keeps Stage 6 aligned. Examples (invented):
+
+| Furniture | Option |
+| --- | --- |
+| Margin references to the typescript, `… the gate p. K4 stood …` | `--drop-pattern '\bp\.\s?[A-Z]\s?\d+\b'` |
+| Page footnotes kept in the body: a body `12(*) Or so …` after a sentence becomes its own paragraph | `--rewrite '(?:^\|(?<=[.!?] ))\d{1,4}\(\*+\)\s*(?=[A-Z])=>\n\nNote: '` |
+| …then the calls `(*)` left in the running text go | `--rewrite '\s?\(\*+\)=>'` |
+| Layout debris as whole paragraphs (`⋄` separators, shredded display maths): 12 characters or fewer, no word of 5 letters | `--rewrite '^(?!.*[^\W\d_]{5}).{0,12}$=>'` |
+
+Check the result with the counts you care about before rendering. A rule that drops short paragraphs is safe in a monograph and wrong in a novel, whose `Oui.` is dialogue. A PDF with no text at all is refused (exit 2) before anything is written.
 
 ## Born-digital PDFs (`--font-filter`)
 

@@ -93,6 +93,42 @@ def test_clean_chapter_removes_page_furniture_and_rebuilds_paragraphs():
     )
 
 
+def test_contents_ellipses_and_drop_patterns():
+    # LaTeX: a per-chapter mini contents in the body font, \ldots as ". . .",
+    # and (book-specific) margin references dropped by a pattern.
+    H, P = pdf.HEADING, pdf.PARAGRAPH
+    pages = [
+        f"{H}Contents\n"
+        f"{P}1.1. The night watch . . . . . . . . . . 12 1.2. Dawn . . . . . . . . . . 15\n"
+        f"{P}The keepers waited p. K4 by the gate. . . and nobody came.\n"
+        f"{P}They counted. . . 12 lanterns, no more.\n"
+    ]
+    assert clean_chapter(pages, drop=[r"\bp\. [A-Z]\d+\b"]) == (
+        "The keepers waited by the gate… and nobody came.\n\n"
+        "They counted… 12 lanterns, no more."  # an ellipsis is not a leader
+    )
+    # Without the pattern the reference stays; a lone entry is still contents.
+    lone = [f"{P}Note 3 . . . . . . . . . . . . 234\n{P}The gate stood open.\n"]
+    assert clean_chapter(lone) == "The gate stood open."
+    assert "p. K4" in clean_chapter(pages)
+
+
+def test_rewrites_can_start_a_paragraph():
+    # Page footnotes kept in the body: "(*)" calls in the text, and a body
+    # "12(*) …" glued after the paragraph it fell under.
+    P = pdf.PARAGRAPH
+    pages = [f"{P}The gate stood open(*) all night. 12(*) Or so the keepers said.\n"]
+    rewrites = [(r"(?<!\d)\(\*+\)", ""), (r"\s*\b\d{1,4}\(\*+\)\s*", "\n\nNote : ")]
+    assert clean_chapter(pages, rewrite=rewrites) == (
+        "The gate stood open all night.\n\nNote : Or so the keepers said."
+    )
+
+
+def test_control_characters_are_stripped():
+    # An unmapped maths glyph extracts as NUL, which the EPUB's XML can't hold.
+    assert clean_chapter([f"{pdf.PARAGRAPH}Let X\x00→ Y be a map.\n"]) == "Let X→ Y be a map."
+
+
 def test_ocr_title_scan_specks_and_rule_debris():
     pages = [
         (

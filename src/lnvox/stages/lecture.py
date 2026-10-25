@@ -89,7 +89,14 @@ def split_chapter(chapter: Chapter) -> list[DirectedBeat]:
     return beats
 
 
-def _normalize_beats(client, beats: list[DirectedBeat]) -> None:
+# Language names for the normalize prompt; other codes are named as-is.
+_LANGUAGE_NAMES = {
+    "en": "English", "fr": "French", "es": "Spanish", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "ja": "Japanese",
+}
+
+
+def _normalize_beats(client, beats: list[DirectedBeat], language: str = "en") -> None:
     """Speech-normalize each beat's `text` in place (best-effort, batched).
 
     When a batch's answer is bad or unparseable, those beats keep
@@ -97,13 +104,24 @@ def _normalize_beats(client, beats: list[DirectedBeat]) -> None:
     reading, never a dropped beat. A transport error (server down) is
     re-raised instead: degrading would cache every remaining chapter
     un-normalized and the launcher's `ensure_vllm` retry would never run.
+
+    `language` is the book's language code: a non-English book is respelled
+    in its own language (the prompt's examples are English, and the model
+    would otherwise read French years out in English words).
     """
+    code = (language or "en").split("-")[0].lower()
+    language_name = _LANGUAGE_NAMES.get(code, language)
     for start in range(0, len(beats), _NORMALIZE_BATCH):
         batch = beats[start : start + _NORMALIZE_BATCH]
         passages = "\n".join(
             f"[{i}] {b.source_span}" for i, b in enumerate(batch)
         )
-        user = client.render("lecture_normalize.jinja", passages=passages)
+        user = client.render(
+            "lecture_normalize.jinja",
+            passages=passages,
+            language=code,
+            language_name=language_name,
+        )
         budget = client.budget_for(
             system=NORMALIZE_SYSTEM,
             user=user,
@@ -129,13 +147,18 @@ def _normalize_beats(client, beats: list[DirectedBeat]) -> None:
 
 
 def direct_chapter(
-    chapter: Chapter, descriptor: str, *, client=None, normalize: bool = True
+    chapter: Chapter,
+    descriptor: str,
+    *,
+    client=None,
+    normalize: bool = True,
+    language: str = "en",
 ) -> ChapterDirected:
     """Build a single-scene ChapterDirected for one chapter."""
     beats = split_chapter(chapter)
     normalized = normalize and client is not None
     if normalized and beats:
-        _normalize_beats(client, beats)
+        _normalize_beats(client, beats, language)
     for b in beats:
         b.direction = descriptor
         b.prompt = format_prompt(descriptor, b.text)
@@ -170,6 +193,7 @@ def run(
     casting: Optional[BookCasting] = None,
     client=None,
     normalize: bool = True,
+    language: str = "en",
     on_chapter_done: Callable[[ChapterDirected], None] | None = None,
 ) -> list[ChapterDirected]:
     """Direct every chapter → ``03_directed/<chapter_id>.json``. Idempotent.
@@ -232,7 +256,7 @@ def run(
                 dirty = True
         if result is None:
             result = direct_chapter(
-                chapter, descriptor, client=client, normalize=normalize
+                chapter, descriptor, client=client, normalize=normalize, language=language
             )
             dirty = True
         if dirty:

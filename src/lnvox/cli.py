@@ -308,6 +308,22 @@ def ingest_pdf(
     no_figures: bool = typer.Option(
         False, "--no-figures", help="With --font-filter: drop figures and tables without rendering them."
     ),
+    drop_pattern: Optional[list[str]] = typer.Option(
+        None,
+        "--drop-pattern",
+        help=(
+            "A regular expression removed from every paragraph — book-specific furniture such as "
+            "margin page references (e.g. 'p[.] [A-Z][0-9]+'). Repeat for several."
+        ),
+    ),
+    rewrite: Optional[list[str]] = typer.Option(
+        None,
+        "--rewrite",
+        help=(
+            "REGEX=>TEXT: replace every match in every paragraph (re.sub syntax; a blank "
+            "line in TEXT starts a new paragraph). Repeat for several; applied after --drop-pattern."
+        ),
+    ),
 ):
     """Stage 0a: Extract a PDF into the novels/-folder layout, plus an EPUB.
 
@@ -339,6 +355,25 @@ def ingest_pdf(
     if specs and page_range:
         console.print("[red]--pages only applies without --chapter (the chapters name their pages).[/]")
         raise typer.Exit(2)
+    import re
+
+    for pattern in drop_pattern or []:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            console.print(f"[red]--drop-pattern {pattern!r}: {e}[/]")
+            raise typer.Exit(2)
+    rewrites = []
+    for spec in rewrite or []:
+        pattern, sep, replacement = spec.partition("=>")
+        try:
+            if not sep:
+                raise re.error("expected REGEX=>TEXT")
+            re.compile(pattern)
+        except re.error as e:
+            console.print(f"[red]--rewrite {spec!r}: {e}[/]")
+            raise typer.Exit(2)
+        rewrites.append((pattern, replacement))
     if cover_page < 0:
         console.print("[red]--cover-page must be a page number, or 0 for no cover.[/]")
         raise typer.Exit(2)
@@ -364,6 +399,8 @@ def ingest_pdf(
             notes_pages=notes_range,
             notes=not no_notes,
             figures=not no_figures,
+            drop_patterns=drop_pattern or (),
+            rewrites=rewrites,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )
     except ImportError:
@@ -651,6 +688,15 @@ def stage_lecture(
             f"Run `lnvox voice cast {book_id} --narrator-clip …` for a real voice.[/]"
         )
 
+    # The book's language (ingest's 00_book_meta.json) keeps the normalize
+    # pass from respelling a French book's numbers in English.
+    import json as _json
+
+    meta_file = out_dir / "00_book_meta.json"
+    language = "en"
+    if meta_file.exists():
+        language = _json.loads(meta_file.read_text(encoding="utf-8")).get("language") or "en"
+
     client = None
     if not no_normalize:
         client = LLMClient()
@@ -676,6 +722,7 @@ def stage_lecture(
         casting=casting,
         client=client,
         normalize=not no_normalize,
+        language=language,
         on_chapter_done=_progress,
     )
 

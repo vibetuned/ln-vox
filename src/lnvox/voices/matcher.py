@@ -62,6 +62,7 @@ def _derive_narrator_demographics(voice_descriptor: str) -> tuple[str, str]:
 # Common Voice accent code → English adjective for descriptor text.
 _ACCENT_ADJ: dict[str, str] = {
     "us": "American",
+    "france": "French",
     "england": "British",
     "scotland": "Scottish",
     "wales": "Welsh",

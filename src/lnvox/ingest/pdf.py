@@ -213,8 +213,56 @@ def _join(buf: str, line: str) -> str:
     return f"{buf} {line}"
 
 
-def clean_chapter(pages: list[str], title: str = "") -> str:
-    """One chapter's raw page texts → narration-ready paragraphs."""
+# A table-of-contents entry: a dot leader (". . . ." or "....") and a page
+# number. LaTeX's per-chapter mini contents come out in the body font.
+_LEADER_RE = re.compile(r"(?:\.[  ]?){4,}\s*\d+")
+_CONTENTS_HEADING_RE = re.compile(
+    r"(?:table of )?contents|table des mati[eè]res|sommaire|[ií]ndice|inhalt(?:sverzeichnis)?",
+    re.IGNORECASE,
+)
+# LaTeX's \ldots, extracted as three spaced periods.
+_SPACED_ELLIPSIS_RE = re.compile(r"\.(?:[  ]\.){2}")
+# C0 controls: a maths glyph with no Unicode mapping comes out as NUL, which
+# XML (the EPUB) can't carry.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _edit_paragraphs(
+    paragraphs: list[str], drop: Iterable[str] = (), rewrite: Iterable[tuple[str, str]] = ()
+) -> list[str]:
+    """Each `drop` regex removed, then each `(regex, replacement)` of
+    `rewrite` applied (`re.sub`), in every paragraph. A blank line in a
+    result starts a new paragraph; paragraphs left empty go."""
+    edits = [(pattern, " ") for pattern in drop] + list(rewrite)
+    if not edits:
+        return paragraphs
+    for pattern, replacement in edits:
+        paragraphs = [re.sub(pattern, replacement, p) for p in paragraphs]
+    split = (re.sub(r"\s+", " ", q).strip() for p in paragraphs for q in p.split("\n\n"))
+    return [q for q in split if q]
+
+
+def _is_contents(paragraph: str) -> bool:
+    """A paragraph of table-of-contents entries, not prose."""
+    leaders = _LEADER_RE.findall(paragraph)
+    return len(leaders) >= 2 or (bool(leaders) and len(paragraph) < 150)
+
+
+def clean_chapter(
+    pages: list[str],
+    title: str = "",
+    drop: Iterable[str] = (),
+    rewrite: Iterable[tuple[str, str]] = (),
+) -> str:
+    """One chapter's raw page texts → narration-ready paragraphs.
+
+    Table-of-contents paragraphs (dot leaders and page numbers) are left
+    out with a "Contents" heading right before them, LaTeX's spaced ". . ."
+    becomes "…", and each `drop` regex is removed from every paragraph
+    (book-specific furniture such as margin references). Each `rewrite`
+    is a `(regex, replacement)` for `re.sub`; a blank line in the result
+    starts a new paragraph.
+    """
     raw = [_page_lines(p) for p in pages]
     running = _running_keys(raw)
     trimmed, numbers = [], []
@@ -264,8 +312,19 @@ def clean_chapter(pages: list[str], title: str = "") -> str:
             if bare.endswith(_SENTENCE_END) and len(bare) < 0.85 * width:
                 flush()
     flush()
-    cleaned = (re.sub(r"\s+", " ", _SENTINELS.sub("", p)).strip() for p in paragraphs)
-    return "\n\n".join(p for p in cleaned if p)
+    cleaned = [
+        re.sub(r"\s+", " ", _CONTROL_RE.sub("", _SENTINELS.sub("", p))).strip() for p in paragraphs
+    ]
+    cleaned = _edit_paragraphs(cleaned, drop, rewrite)
+    kept: list[str] = []
+    for p in cleaned:
+        if _is_contents(p):
+            if kept and _CONTENTS_HEADING_RE.fullmatch(kept[-1]):
+                kept.pop()
+            continue
+        if p:
+            kept.append(_SPACED_ELLIPSIS_RE.sub("…", p))
+    return "\n\n".join(kept)
 
 
 # ----- font-aware body filter (born-digital PDFs) ---------------------------------
@@ -873,6 +932,8 @@ def extract_pdf(
     notes_pages: tuple[int, int] | None = None,
     notes: bool = True,
     figures: bool = True,
+    drop_patterns: Iterable[str] = (),
+    rewrites: Iterable[tuple[str, str]] = (),
     progress: Callable[[str], None] = print,
 ) -> PdfMeta:
     """Chapters (+ cover, + sync EPUB) from a PDF. `title` / `authors`
@@ -1045,6 +1106,9 @@ def extract_pdf(
         used = used_by_group.setdefault(key, set())
         body, restored = _resolve_markers(body, chapter_notes, used)
         n_restored += restored
+        # After the markers: one the notes don't claim goes back in as text,
+        # and the book's own patterns must see it there.
+        body = "\n\n".join(_edit_paragraphs(body.split("\n\n"), drop_patterns, rewrites))
         paragraphs, marks = _split_marks(body)
 
         filename = f"{chapter_id}-{_slugify(ch_title)}.txt"
