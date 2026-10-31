@@ -1789,6 +1789,31 @@ def voice_seed_cv(
         "--max-candidates",
         help="--rank-by-quality: speakers to probe (default: max-speakers x 6).",
     ),
+    only_new: bool = typer.Option(
+        False,
+        "--only-new",
+        help=(
+            "Grow the bank: skip speakers it already has (their WAVs are never "
+            "rewritten) and count --max-speakers as NEW voices. DESIGN.md §19.6."
+        ),
+    ),
+    fill_thin: bool = typer.Option(
+        False,
+        "--fill-thin",
+        help=(
+            "Implies --only-new. Give new voices to the bank's smallest "
+            "gender/age buckets first, keeping only clips that clear "
+            "9 kHz / 32 dB (probe AND built clip). DESIGN.md §19.6."
+        ),
+    ),
+    probe_all: bool = typer.Option(
+        False,
+        "--probe-all",
+        help=(
+            "--fill-thin: probe every candidate, not just 5x each bucket's "
+            "share. Much slower; finds every clean voice in the corpus."
+        ),
+    ),
 ):
     """Populate the voicebank from a locally-extracted Common Voice tarball.
 
@@ -1805,6 +1830,18 @@ def voice_seed_cv(
     )
 
     try:
+        from collections import Counter as _Counter
+
+        growing = only_new or fill_thin
+        exclude = {c.id for c in existing.clips} if growing else None
+        bucket_counts = (
+            _Counter((c.gender, c.age_band) for c in existing.clips) if fill_thin else None
+        )
+        if growing:
+            console.print(
+                f"[dim]Growing the bank: adding up to {max_speakers} new voice(s); "
+                f"the {len(existing.clips)} existing clip(s) are left untouched.[/]"
+            )
         new_vb = seed_from_common_voice(
             vb_dir,
             cv_root=cv_root,
@@ -1815,6 +1852,9 @@ def voice_seed_cv(
             accents=accent or None,
             rank_by_quality=rank_by_quality,
             max_candidates=max_candidates,
+            exclude_ids=exclude,
+            fill_thin_from=bucket_counts,
+            probe_all=probe_all,
             progress=lambda m: console.print(f"[dim]{m}[/]"),
         )
     except (RuntimeError, FileNotFoundError, ValueError) as e:
@@ -1824,7 +1864,10 @@ def voice_seed_cv(
     # Merge with existing (keep existing clips not from this run).
     existing_ids = {c.id for c in new_vb.clips}
     kept = [c for c in existing.clips if c.id not in existing_ids]
-    merged = type(new_vb)(clips=new_vb.clips + kept)
+    # Growing appends: existing books were cast against this bank, and keeping
+    # its order stable keeps any re-cast as close to the original as possible.
+    clips = kept + new_vb.clips if (only_new or fill_thin) else new_vb.clips + kept
+    merged = type(new_vb)(clips=clips)
     voice_manifest.save(vb_dir, merged)
 
     console.print(

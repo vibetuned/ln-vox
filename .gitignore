@@ -34,6 +34,7 @@ cache/
 voicebank/
 voicebank-fr/
 voicebank-demo/
+voicebank-merged/
 
 # Downloaded datasets — multi-GB, never commit
 data/

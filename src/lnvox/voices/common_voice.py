@@ -23,8 +23,9 @@ speaker. Demographic metadata (age / gender / accents) is preserved.
 from __future__ import annotations
 
 import csv
-from collections import defaultdict
-from collections.abc import Collection
+import json
+from collections import Counter, defaultdict
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from lnvox.voices.schema import VoiceClip, Voicebank
@@ -340,7 +341,7 @@ def build_speaker_clip(
         )
 
     first_row = rows[0]
-    clip_id = f"cv_{speaker_id[:12]}"
+    clip_id = clip_id_for(speaker_id)
     rel_clip = Path("clips") / f"{clip_id}.wav"
     (voicebank_dir / "clips").mkdir(parents=True, exist_ok=True)
     sf.write(str(voicebank_dir / rel_clip), merged, output_sr, subtype="PCM_16")
@@ -382,12 +383,63 @@ def _net_votes(row: dict) -> int:
     return int(row.get("up_votes") or 0) - int(row.get("down_votes") or 0)
 
 
+# Bump when probe_recording_quality changes what it measures; old caches are
+# then ignored (§19.6).
+_PROBE_CACHE_VERSION = 1
+_PROBE_CACHE_SAVE_EVERY = 250
+
+
+class _ProbeCache:
+    """Probe results by corpus MP3 filename, kept in `<bank>/cv_probes.json`
+    so growth runs re-probe nothing they have heard before (§19.6)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.entries: dict[str, dict | None] = {}
+        self._unsaved = 0
+        try:
+            data = json.loads(path.read_text())
+            if data.get("version") == _PROBE_CACHE_VERSION:
+                self.entries = dict(data["probes"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+
+    def probe(self, mp3: Path) -> dict | None:
+        if mp3.name not in self.entries:
+            if not mp3.exists():
+                return None  # a partial extraction may be completed later
+            self.entries[mp3.name] = probe_recording_quality(mp3)
+            self._unsaved += 1
+            if self._unsaved >= _PROBE_CACHE_SAVE_EVERY:
+                self.save()
+        return self.entries[mp3.name]
+
+    def save(self) -> None:
+        if not self._unsaved:
+            return
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps({"version": _PROBE_CACHE_VERSION, "probes": self.entries}))
+        tmp.replace(self.path)
+        self._unsaved = 0
+
+
+def _probe_speaker(rows: list[dict], clips_src: Path, cache: _ProbeCache) -> dict | None:
+    """The first readable of a speaker's top-voted three utterances (rows
+    already ordered by net votes)."""
+    for row in rows[:3]:
+        measured = cache.probe(clips_src / row["path"])
+        if measured:
+            return measured
+    return None
+
+
 def _rank_speakers_by_quality(
     by_speaker: dict[str, list[dict]],
     *,
     clips_src: Path,
     max_speakers: int,
     max_candidates: int,
+    cache: _ProbeCache,
     progress,
 ) -> list[str]:
     """Order speakers best-recording-first, subject to bucket quotas (§19.3).
@@ -405,11 +457,7 @@ def _rank_speakers_by_quality(
     scored: list[dict] = []
     for i, cid in enumerate(candidates):
         rows = sorted(by_speaker[cid], key=_net_votes, reverse=True)
-        measured = None
-        for row in rows[:3]:  # first readable of the top-voted three
-            measured = probe_recording_quality(clips_src / row["path"])
-            if measured:
-                break
+        measured = _probe_speaker(rows, clips_src, cache)
         if not measured:
             continue
         first = rows[0]
@@ -457,6 +505,148 @@ def _rank_speakers_by_quality(
     return [c["client_id"] for c in picked] + [c["client_id"] for c in backfill]
 
 
+def clip_id_for(speaker_id: str) -> str:
+    """The voicebank id a Common Voice speaker's clip is stored under."""
+    return f"cv_{speaker_id[:12]}"
+
+
+# (gender, age_band) buckets in a fixed order — the deterministic tie-break.
+_BUCKETS: tuple[tuple[str, str], ...] = tuple(
+    (g, a) for g in ("female", "male") for a in ("teen", "young_adult", "adult", "elder")
+)
+
+# Floor a --fill-thin voice must clear on its probe AND on its built clip
+# (§19.6) — the casting audit's relaxed replacement floor (voices/audit.py).
+FILL_THIN_MIN_BANDWIDTH = 9000.0
+FILL_THIN_MIN_SNR = 32.0
+# Each under-filled bucket probes up to this many times its provisional quota.
+_PROBE_MULTIPLE = 5
+
+
+def _passes_floor(metrics: dict | None) -> bool:
+    return (
+        bool(metrics)
+        and metrics["bandwidth"] >= FILL_THIN_MIN_BANDWIDTH
+        and metrics["snr"] >= FILL_THIN_MIN_SNR
+    )
+
+
+def _bucket_of(rows: list[dict]) -> tuple[str, str]:
+    """A speaker's bucket, read exactly as build_speaker_clip will record it
+    (rows ordered by net votes, first row wins)."""
+    first = max(rows, key=_net_votes)  # first of equals, as a stable sort gives
+    return (
+        _GENDER_MAP[(first.get("gender") or "").strip()],
+        _AGE_MAP[(first.get("age") or "").strip()],
+    )
+
+
+def water_fill(
+    existing: Mapping[tuple[str, str], int],
+    available: Mapping[tuple[str, str], int],
+    n_new: int,
+) -> dict[tuple[str, str], int]:
+    """Per-bucket intake that raises the smallest buckets first (§19.6).
+
+    Each new voice goes to the bucket with the fewest voices so far (existing
+    plus allocated) among those that still have a candidate. Stops early when
+    every bucket's candidates are spent.
+    """
+    alloc = {b: 0 for b in _BUCKETS}
+    for _ in range(max(0, n_new)):
+        open_buckets = [b for b in _BUCKETS if alloc[b] < available.get(b, 0)]
+        if not open_buckets:
+            break
+        b = min(open_buckets, key=lambda b: (existing.get(b, 0) + alloc[b], _BUCKETS.index(b)))
+        alloc[b] += 1
+    return {b: n for b, n in alloc.items() if n}
+
+
+def _select_to_fill_thin(
+    by_speaker: dict[str, list[dict]],
+    *,
+    clips_src: Path,
+    n_new: int,
+    existing_buckets: Mapping[tuple[str, str], int],
+    cache: _ProbeCache,
+    progress,
+    probe_all: bool = False,
+) -> dict[tuple[str, str], list[str]]:
+    """Each bucket's candidates that clear the floor, best-first.
+
+    Probing is stratified: a provisional water-fill against the raw pool sizes
+    says how many voices each bucket could take, and each bucket probes up to
+    _PROBE_MULTIPLE times that — in fixed corpus order, so runs repeat. A bucket
+    that needs nothing isn't probed at all. Only candidates clearing the floor
+    count as available; the build loop hands slots out from these
+    (_thinnest_first).
+    """
+    pools: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for cid in sorted(by_speaker):
+        pools[_bucket_of(by_speaker[cid])].append(cid)
+    provisional = water_fill(existing_buckets, {b: len(v) for b, v in pools.items()}, n_new)
+    if probe_all:
+        # Every candidate in every bucket. The provisional quota assumes each
+        # probe is usable; on Common Voice English only ~3.6% of probed
+        # speakers end up as a clip clearing the floor, so 5x a quota leaves
+        # most clean voices unfound — and a crowded bucket the provisional
+        # pass zeroed is never looked at, even after the thin ones run dry.
+        to_probe = [cid for b in _BUCKETS for cid in pools[b]]
+    else:
+        to_probe = [
+            cid for b in _BUCKETS for cid in pools[b][: provisional.get(b, 0) * _PROBE_MULTIPLE]
+        ]
+    probed_buckets = sum(1 for b in _BUCKETS if pools[b]) if probe_all else len(provisional)
+    progress(
+        f"Probing {len(to_probe):,} candidate(s) across {probed_buckets} "
+        f"{'' if probe_all else 'under-filled '}bucket(s)…"
+    )
+    scored: list[tuple[float, str, tuple[str, str]]] = []
+    for i, cid in enumerate(to_probe):
+        rows = sorted(by_speaker[cid], key=_net_votes, reverse=True)
+        measured = _probe_speaker(rows, clips_src, cache)
+        if _passes_floor(measured):
+            scored.append((quality_score(measured), cid, _bucket_of(rows)))
+        if (i + 1) % 250 == 0:
+            progress(f"  probed {i + 1:,}/{len(to_probe):,} → {len(scored):,} clear the floor")
+    cache.save()
+    available: Counter = Counter(b for _, _, b in scored)
+    projected = water_fill(existing_buckets, available, n_new)
+    progress(
+        f"{len(scored):,} of {len(to_probe):,} probed candidate(s) clear "
+        f"{FILL_THIN_MIN_BANDWIDTH / 1000:.0f} kHz / {FILL_THIN_MIN_SNR:.0f} dB; "
+        "projected intake if every build succeeds: "
+        + _bucket_summary(projected)
+    )
+    scored.sort(key=lambda t: -t[0])
+    queues: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for _, cid, b in scored:
+        queues[b].append(cid)
+    return dict(queues)
+
+
+def _bucket_summary(counts: Mapping[tuple[str, str], int]) -> str:
+    return ", ".join(f"{g[0]}/{a}+{counts[(g, a)]}" for g, a in _BUCKETS if counts.get((g, a)))
+
+
+def _thinnest_first(
+    queues: Mapping[tuple[str, str], list[str]],
+    existing: Mapping[tuple[str, str], int],
+    filled: Counter,
+):
+    """Yield candidates one at a time from whichever bucket is smallest *now*
+    — existing voices plus those written so far — among buckets with an
+    untried candidate (§19.6). The caller bumps `filled` after each clip it
+    keeps; a failed build just asks again, so its slot goes to the same
+    bucket while it has candidates and to the next-thinnest after."""
+    remaining = {b: list(q) for b, q in queues.items() if q}
+    while remaining:
+        b = min(remaining, key=lambda b: (existing.get(b, 0) + filled[b], _BUCKETS.index(b)))
+        yield remaining[b].pop(0)
+        if not remaining[b]:
+            del remaining[b]
+
+
 def seed_from_common_voice(
     voicebank_dir: Path,
     *,
@@ -469,6 +659,9 @@ def seed_from_common_voice(
     accents: Collection[str] | None = None,
     rank_by_quality: bool = False,
     max_candidates: int | None = None,
+    exclude_ids: Collection[str] | None = None,
+    fill_thin_from: Mapping[tuple[str, str], int] | None = None,
+    probe_all: bool = False,
     progress=print,
 ) -> Voicebank:
     """Build a Voicebank from a locally-extracted Common Voice tarball.
@@ -489,6 +682,15 @@ def seed_from_common_voice(
             quotas so casting buckets stay covered.
         max_candidates: How many speakers to probe when ranking. Defaults to
             `max_speakers * 6`.
+        exclude_ids: Clip ids already in the target bank. Those speakers are
+            never selected and their WAVs never rewritten (§19.6); with it,
+            `max_speakers` counts NEW voices.
+        fill_thin_from: The target bank's current per-(gender, age_band)
+            counts. Selects by water-filling the smallest buckets, with a
+            quality floor on both the probe and the built clip (§19.6).
+        probe_all: With `fill_thin_from`, probe every candidate instead of a
+            multiple of each bucket's provisional quota — slower, but finds
+            every voice in the corpus that clears the floor.
         progress: Callable for status messages.
     """
     wanted_accents: set[str] | None = None
@@ -561,6 +763,15 @@ def seed_from_common_voice(
             f"{'/'.join(sorted(wanted_accents))} in {tsv_path.name}."
         )
 
+    if exclude_ids:
+        excluded = {cid for cid in by_speaker if clip_id_for(cid) in exclude_ids}
+        for cid in excluded:
+            del by_speaker[cid]
+        progress(
+            f"Excluding {len(excluded):,} speaker(s) already in the bank; "
+            f"{len(by_speaker):,} new candidate(s) remain"
+        )
+
     # ---------- pass 2: build a ref clip per speaker ----------
 
     clips_dst = voicebank_dir / "clips"
@@ -572,22 +783,44 @@ def seed_from_common_voice(
 
     # Iterate in a stable order so reruns produce the same selection.
     speaker_ids = sorted(by_speaker.keys())
-    if rank_by_quality:
+    fill_thin = fill_thin_from is not None
+    filled: Counter = Counter()
+    cache = _ProbeCache(voicebank_dir / "cv_probes.json")
+    if fill_thin:
+        queues = _select_to_fill_thin(
+            by_speaker,
+            clips_src=clips_src,
+            n_new=max_speakers,
+            existing_buckets=fill_thin_from,
+            cache=cache,
+            progress=progress,
+            probe_all=probe_all,
+        )
+        speaker_ids = _thinnest_first(queues, fill_thin_from, filled)
+    elif rank_by_quality:
         speaker_ids = _rank_speakers_by_quality(
             by_speaker,
             clips_src=clips_src,
             max_speakers=max_speakers,
             max_candidates=max_candidates or max_speakers * 6,
+            cache=cache,
             progress=progress,
         )
+        cache.save()
 
     def _count_missing() -> None:
         nonlocal skipped_missing
         skipped_missing += 1
 
+    rejected_after_build = 0
     for speaker_id in speaker_ids:
         if len(out) >= max_speakers:
             break
+        if exclude_ids is not None:
+            # Belt and braces: --only-new must never write over an existing clip.
+            target = voicebank_dir / "clips" / f"{clip_id_for(speaker_id)}.wav"
+            if target.exists():
+                raise RuntimeError(f"refusing to overwrite existing clip {target}")
 
         clip = build_speaker_clip(
             speaker_id,
@@ -603,6 +836,15 @@ def seed_from_common_voice(
         if clip is None:
             skipped_short += 1
             continue
+        if fill_thin:
+            # The probe heard one utterance; the clip stitches several, which
+            # can be worse. Hold the finished clip to the same floor (§19.6).
+            built = voicebank_dir / clip.clip_path
+            if not _passes_floor(probe_recording_quality(built)):
+                built.unlink(missing_ok=True)
+                rejected_after_build += 1
+                continue
+            filled[_bucket_of(by_speaker[speaker_id])] += 1
 
         out.append(clip)
         if len(out) % 10 == 0:
@@ -611,6 +853,14 @@ def seed_from_common_voice(
     progress(
         f"Done. {len(out)} speaker clip(s) written. "
         f"Skipped {skipped_short} for insufficient duration, "
-        f"{skipped_missing} for missing/unreadable MP3s."
+        f"{skipped_missing} for missing/unreadable MP3s"
+        + (f", {rejected_after_build} whose built clip failed the floor." if fill_thin else ".")
     )
+    if fill_thin:
+        progress(f"  intake: {_bucket_summary(filled) or 'none'}")
+        if len(out) < max_speakers:
+            progress(
+                f"  {max_speakers - len(out)} short of the {max_speakers} requested: "
+                "every clean candidate was tried"
+            )
     return Voicebank(clips=out)

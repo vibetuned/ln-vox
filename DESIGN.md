@@ -2912,3 +2912,68 @@ has no 12-minute window holding three. The old fallback then maximised
 pictures outright and chose a two-voice window over the six-voice arrival of
 the Sphere. Selection is now tiered: pairs whose window has ≥ 3 pictures,
 else ≥ 1, else any — ranked by distinct voices within the tier.
+
+### 19.6 Growing an existing bank (`--only-new`, `--fill-thin`)
+
+Re-running the seeder with a bigger `--max-speakers` does not grow a bank — it
+re-probes the same fixed-order slice of the corpus, re-selects the speakers
+that won last time, and **rewrites their WAVs in place** under ids existing
+castings point at. Two flags make growth safe and useful:
+
+- `--only-new` skips every speaker whose clip id is already in the target bank,
+  so existing clips are never re-selected or rewritten, and `--max-speakers`
+  counts *new* voices. New clips are appended after the existing ones in the
+  manifest.
+- `--fill-thin` (implies `--only-new`) spends the intake where the bank is
+  short. Each new voice goes to whichever (gender, age_band) bucket is
+  currently smallest — existing clips plus what has been allocated — among
+  buckets that still have a clean candidate ("water-filling"). A bank skewed
+  159 young men to 24 female elders levels the rare buckets first and gives the
+  majority bucket nothing.
+
+Two quality rules apply to `--fill-thin` intake only:
+
+- A candidate must clear the audit's relaxed floor (≥ 9 kHz, ≥ 32 dB) on its
+  probe utterance to be eligible at all. Rarity is not a reason to admit a
+  muffled voice.
+- The **built** clip is re-measured. The probe hears one utterance; the clip
+  concatenates several, which can be worse (the first quality-ranked seed
+  predicted ~350 clean clips from probes and delivered 185). A built clip
+  that fails the floor (or comes out shorter than `min_seconds`) is deleted
+  and its slot is handed out again — see below.
+
+Probing is stratified: each bucket probes up to five times its provisional
+quota, in the corpus's fixed order (deterministic), and buckets that need
+nothing are not probed at all.
+
+**Allocation is incremental.** The per-bucket counts printed after probing
+are a projection, not quotas. The build loop runs the water-fill one voice at
+a time against what has actually been *written*: take the thinnest bucket
+that still has an untried clean candidate, build its best, and on failure
+choose again. A failed build therefore goes to the next-best voice of the
+same bucket while it has one, and to the next-thinnest bucket after that.
+Fixing quotas up front strands slots: the exhaustive pass of 2026-10-31
+planned 400 slots from probe counts, lost 174 builds (132 below the floor, 42
+too short), and finished 158 short while ~350 clean candidates sat untried
+in buckets whose quota was already met.
+
+**Probe cache.** Probing dominates a growth run (~9,300 probes for an
+exhaustive US + England pass). Every probe result is kept in
+`<bank>/cv_probes.json`, keyed by the corpus MP3 filename (Common Voice never
+reuses one), unreadable results included, and saved every 250 probes so an
+interrupted run keeps its work. Later runs probe only utterances they have
+not heard. The file carries a `version`; changing what
+`probe_recording_quality` measures means bumping it, which discards the
+cache. It is a working file, not part of the bank — nothing at cast or
+render time reads it, and it stays out of a shipped bank.
+
+**Yield, measured (2026-10-31).** On Common Voice 25.0 English, US + England,
+only **3.6%** of probed speakers end up as a clip clearing 9 kHz / 32 dB (66
+from 1,827 probes; another 32 built clips failed the floor after passing their
+probe). The 5× probe multiple assumed far more, so `--probe-all` probes every
+candidate. At that floor the corpus is finite: female teens and female elders
+were exhausted by the first `--fill-thin` run — every eligible speaker probed,
+every clean one admitted. After the exhaustive pass and an incremental +92 run
+(225 failed builds, every slot passed on), voicebank-demo stands at 800 and only
+young adult men have clean, buildable candidates left: the +92 went entirely to
+that bucket.
